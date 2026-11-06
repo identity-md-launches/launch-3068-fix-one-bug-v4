@@ -1,0 +1,22 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+ffi = false
+fs_permissions = []
+
+[fuzz]
+runs = 256
+
+[fmt]
+line_length = 120
+
+[lint]
+# The checker validates every action of every command, so its reverts are inside loops by design.
+# It is a pure, off-chain shape check: no caller can be made to pay for another's failing entry.
+exclude_lints = ["require-revert-in-loop"]
