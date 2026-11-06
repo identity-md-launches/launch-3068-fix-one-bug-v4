@@ -4,8 +4,116 @@ Corrected `encodeV4Swap()` and `buildCalldata()` for a two-swap Uniswap V4 round
 (USDG → PONS → USDG) through the Universal Router `0x8876789976dEcBfCbBbe364623C63652db8C0904`
 on chain 4663, with the evidence for the fix.
 
-The deliverable is [`js/v4-arb-encoder.js`](js/v4-arb-encoder.js): plain JavaScript, ethers v5,
-no other dependency.
+The deliverables are [`index.html`](index.html) and [`js/v4-arb-encoder.js`](js/v4-arb-encoder.js):
+plain JavaScript and the existing vendored ethers v5, with no install or CDN required.
+
+## Permit2 follow-up: using the page
+
+The supplied repository contained the corrected encoder but **no HTML file**. This follow-up adds
+a root `index.html` using that encoder; it does not replace a supplied UI or change any Solidity,
+build configuration, dependencies, token, router, or pool.
+
+Serve the repository root as static files (for example, `python3 -m http.server 8080 --bind 127.0.0.1`)
+and open `http://127.0.0.1:8080` in a browser with an EIP-1193 wallet. For hosting, publish the root
+page and the `js/` directory together, preserving their relative paths. No frontend build is needed.
+
+1. Select **Robinhood Chain, chain ID 4663**, in the wallet and click **CONNECT WALLET**.
+   The reference wallet in the assignment is `0xd064E892A3BBb758053922C80098b7f4130444c6`.
+   The actual connected account is always the approval owner, transaction sender, and recipient;
+   nothing is sent to a hardcoded beneficiary. A wrong chain stops the flow.
+2. The input is `ethers.utils.parseUnits("0.01", 6)` = **10,000 USDG base units**.
+   The default PONS bridge amount is the explicitly permitted **fixed test amount**,
+   `ethers.utils.parseUnits("0.001", 18)` = **1,000,000,000,000,000 base units**. This is not a
+   quote. For other testing, enter swap 1's current quoted output minus your chosen slippage.
+   The minimum USDG return defaults to **0 for testing** and can be raised in the page.
+3. Click **APPROVE PERMIT2 (one-time)**. After checking the tokens' ERC20 allowances to Permit2,
+   the page calls `Permit2.approve(token, router, amount, expiration)` for USDG and then PONS
+   through the wallet's `eth_sendTransaction`. Each receipt must have status 1 before the next
+   transaction is requested. The limits are **100 times the selected test amounts**: initially
+   1 USDG and 0.1 PONS. Expiration is the latest block timestamp plus **30 days**, in seconds.
+   Sufficient existing Permit2 allowances are skipped. These approvals are reusable, not perpetual:
+   repeat only when needed after depletion, expiry, revocation, or an increase in the test amount.
+4. Click **BUILD CALLDATA & DRY RUN**. The page uses `buildCalldata()` through `prepareSwap()`
+   with the amounts above, the connected recipient and a **20-minute deadline**. It checks both
+   allowance layers and calls the router with `eth_call` from that account. It displays the exact
+   bytes and enables sending only on success. The atomic helper remains available, but cannot
+   accept the requested zero minimum because it has no settlement action for a loss.
+5. Click **SEND TRANSACTION**. The page rechecks the account, chain, allowances and deadline,
+   repeats `eth_call` with the same transaction, and only then requests `eth_sendTransaction`.
+   It reports confirmation only after a successful receipt. A rejection, revert, or failed dry run
+   stops the flow. There is no force-send path. Amount edits, account/chain changes and disconnects
+   invalidate a previous dry run. Buttons are locked during an operation to prevent duplicate sends.
+
+Approvals are separate transactions: if USDG succeeds and PONS fails, USDG's allowance remains.
+Retrying skips sufficient approvals. Receipt polling stops after two minutes; a timeout does **not**
+cancel a pending transaction. The activity log retains its hash so the operator can check the wallet
+or explorer before retrying. A wallet change during a pending transaction also does not cancel it.
+
+### Both allowance layers are required
+
+| Layer | Transaction destination | Approved spender | Needed for |
+|---|---|---|---|
+| ERC20 `approve(address,uint256)` | USDG / PONS token | Permit2 | Permit2 pulling tokens from the owner |
+| Permit2 `approve(address,address,uint160,uint48)` | Permit2 | Universal Router | Router instructing Permit2 to pull those tokens |
+
+The page implements the second layer requested in this follow-up. The reference wallet already had
+the first layer for both tokens when checked. If another wallet lacks it, the page stops with the
+token name and Permit2 address; its operator must first approve each token **to Permit2** using
+that token's verified contract interface. Approving tokens directly to the router is ineffective.
+The page never silently requests additional ERC20 approvals or unlimited allowances.
+
+The ABI is checked against [Uniswap's AllowanceTransfer reference](https://developers.uniswap.org/docs/protocols/permit2/concepts/allowance-transfer).
+`amount` is a `uint160`, expiration is a `uint48` Unix timestamp in seconds, and the approve selector
+is `0x87517c45`. Values outside those widths are rejected before a wallet request.
+
+### JavaScript wallet API
+
+`V4ArbEncoder.approvePermit2(token, spender, amount, expiration)` is the requested four-argument
+browser function. It connects to `window.ethereum`, submits to the pinned Permit2 address and
+resolves to the successful receipt. It rejects on wallet errors, invalid parameters, expired
+positive approvals, wrong network, missing code, a reverted receipt, or a confirmation timeout.
+
+For a sequence, use one `V4ArbEncoder.createWalletClient(provider, options?)` instance, as the page
+does. Its `approvePermit2()` has the same four arguments. Other methods are `connect()`,
+`timestamp()`, `checkTokenAllowances(usdgIn, ponsAmount)`,
+`approveBothPermit2(usdgLimit, ponsLimit, expiration)`, `checkAllowances(usdgIn, ponsAmount, validUntil?)`,
+`prepareSwap({ usdgIn, ponsAmount, minUsdgOut, deadline? })`, `sendSwap(prepared)`, and `destroy()`.
+`prepareSwap()` performs the build and dry run, and `sendSwap()` only accepts the most recent
+prepared object, once. Returned transaction fields are frozen. `destroy()` detaches wallet listeners.
+Options are `onStatus(message)`, `pollIntervalMs` (1000 by default) and `receiptTimeoutMs` (120000).
+The page uses defaults; tests use a short polling interval.
+
+To revoke a Permit2 allowance, the wallet owner can call
+`approvePermit2(token, ROUTER, 0, 0)` for each token. Zero here explicitly revokes permission;
+it is not an unknown deployment value. The underlying ERC20 allowance is independent and must be
+revoked separately if desired. The generic approval helper supports the full uint160 range;
+only the UI chooses the bounded, reusable limits described above.
+
+### Follow-up verification
+
+- **Offline:** 18 original JavaScript encoding cases, 43 Permit2/wallet cases and 8 UI event-handler
+  cases. The tests load the actual page scripts, decode approval and swap calldata, confirm sequential
+  receipts, and exercise partial completion, rejections, reverted receipts, pending timeouts,
+  wrong networks, changed accounts, allowance expiry/depletion, missing ERC20 allowance, bad input,
+  insufficient quoted output, stale deadlines and failed simulations. The UI harness is a minimal
+  DOM, not a browser extension or rendering test. Mock RPC success is not evidence of AMM liquidity.
+- **Foundry:** `forge build`, all 37 existing `forge test` cases (including 4 fuzz tests, 256 runs
+  each with the assignment's seed), and `forge fmt --check`, using pinned solc 0.8.26.
+- **Deployed-code integration, 2026-11-06:** verified chain ID, nonempty code at Permit2/router/tokens,
+  and token symbols/decimals over the public RPC. Both Permit2 router allowances for the reference
+  wallet were `(amount=0, expiration=0)`; both ERC20 allowances to Permit2 were sufficient.
+  An Anvil fork of block **107746080**, hash
+  `0x6a6fbd7f7b556c02319d3579555ef3457bad7e7530d5a114b19dae1c8d161f3c`, then used the actual
+  deployed contracts and wallet client. With the reference account impersonated **only locally**
+  and 1 local ETH assigned for gas, USDG approval → successful receipt → PONS approval → successful
+  receipt → 2,116-byte `buildCalldata` → `eth_call` → `eth_sendTransaction` succeeded. The swap
+  receipt had status 1 and used 212,833 gas. No token balances or Permit2 slots were overridden.
+  USDG decreased by 10,000 base units and PONS increased: the second pool returned no USDG at this
+  state. This verifies execution, **not a profitable round trip**. The RPC/fork check is supplemental;
+  none of the delivered automated tests require a network or a fork.
+
+Nothing was broadcast to Robinhood Chain and no private key was used. The following historical
+analysis documents the earlier encoder repair; its block-specific observations are not live quotes.
 
 ## What was wrong
 
@@ -87,8 +195,8 @@ spent. This goes beyond the two functions the brief asked for; use it or ignore 
 ## Using it
 
 ```html
-<script src="vendor/ethers-5.7.2.umd.min.js"></script>  <!-- any ethers v5 build -->
-<script src="v4-arb-encoder.js"></script>
+<script src="js/vendor/ethers-5.7.2.umd.min.js"></script>
+<script src="js/v4-arb-encoder.js"></script>
 <script>
   const { buildCalldata, ROUTER, POOL_A, POOL_B } = V4ArbEncoder;
 
@@ -100,11 +208,11 @@ spent. This goes beyond the two functions the brief asked for; use it or ignore 
     buyPool: POOL_A,                             // default
     sellPool: POOL_B,                            // default
   });
-  await signer.sendTransaction({ to: ROUTER, data });
+  // Encoding only. Use the page/client flow above to check allowances, simulate and submit.
 </script>
 ```
 
-In Node it is `const E = require("./js/v4-arb-encoder.js")` with `ethers@5` installed.
+In Node it is `const E = require("./js/v4-arb-encoder.js")`; it loads the vendored ethers v5 directly.
 
 | Function | Returns |
 |---|---|
@@ -115,8 +223,8 @@ In Node it is `const E = require("./js/v4-arb-encoder.js")` with `ethers@5` inst
 
 Amounts are base units (`BigNumber`, string or number). `deadline` defaults to max `uint256`, as
 in the brief. `recipient`, `amountOutMinimum` and `minUsdgOut` have no default: pass `0` for a
-minimum only if any price is acceptable. I did not have the original HTML file, so these
-signatures are mine; adapt the call sites to them.
+minimum only if any price is acceptable. The follow-up page uses these signatures and supplies
+a finite deadline instead of the pure encoder's unlimited default.
 
 ## Things outside the encoding that will still stop or spoil the transaction
 
@@ -145,8 +253,12 @@ These were visible on chain while testing. None of them is fixed by an encoder.
 
 | Path | What it is |
 |---|---|
-| `js/v4-arb-encoder.js` | the deliverable |
+| `index.html` | wallet UI with sequential Permit2 approval, simulation and submission |
+| `js/v4-arb-encoder.js` | corrected encoder and Permit2 wallet client |
 | `js/test/encoder.test.js` | offline test of the deliverable, 18 cases |
+| `js/test/permit2.test.js` | approval and transaction-flow success/failure tests, 43 cases |
+| `js/test/ui.test.js` | actual page script event-handler tests, 8 cases |
+| `js/test/mock-wallet.js` | stateful EIP-1193 test double, with delayed receipt/allowance updates |
 | `js/vendor/ethers-5.7.2.umd.min.js` | ethers v5, vendored so the test runs without a network |
 | `src/V4SwapCalldata.sol` | the same encoder in Solidity, internal and pure |
 | `src/V4SwapCalldataCheck.sol` | an offline shape check that applies the router's length rules |
@@ -159,9 +271,10 @@ JavaScript produces those bytes, the Foundry tests assert the Solidity produces 
 
 ```sh
 forge build
-forge test
+FOUNDRY_FUZZ_SEED=0x7363613b963c638bcd9c7841cc95581055d780db0b15e0e3b05aeed7bb796d4e forge test
 forge fmt --check
 node js/test/encoder.test.js
+node --test js/test/permit2.test.js js/test/ui.test.js
 ```
 
 ## How this was verified, and what was not
@@ -195,6 +308,20 @@ node js/test/encoder.test.js
 
 ## Deployment parameters
 
+The follow-up page uses these existing deployments, without creating contracts:
+
+| Parameter | Value |
+|---|---|
+| Chain ID | 4663 (`0x1237`), inherited from the original encoder and verified over RPC |
+| Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` |
+| Router / Permit2 spender | `0x8876789976dEcBfCbBbe364623C63652db8C0904` |
+| USDG | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`, 6 decimals |
+| PONS | `0x39dbed3a2bd333467115de45665cc57f813c4571`, 18 decimals |
+| Pool A / B | Existing encoder defaults, fee/spacing 3000/60 and 30000/600, no hooks |
+| Sender / recipient / allowance owner | Connected wallet (reference wallet listed above) |
+| RPC | The browser wallet's provider; no API key or external RPC embedded in the page |
+| Static hosting | Root `index.html`, `js/v4-arb-encoder.js`, and `js/vendor/ethers-5.7.2.umd.min.js` |
+
 Nothing here is deployed. The Solidity libraries have only internal functions, hold no state and
 no funds, have no owner and take no constructor arguments. The addresses in the code are the ones
 given in the brief (router, PONS, USDG), each confirmed to have code on chain 4663, with
@@ -204,6 +331,9 @@ given in the brief (router, PONS, USDG), each confirmed to have code on chain 46
 
 Whoever sends the transaction is responsible for:
 
+- selecting the target chain and account, paying ETH gas, and reviewing wallet requests;
+- maintaining both ERC20 allowances to Permit2 and Permit2 allowances to the router; expiry and
+  confirmation do not revoke the separate ERC20 allowance;
 - granting, and later revoking, the Permit2 allowances for USDG and PONS (not needed for
   `buildAtomicCalldata()`);
 - quoting swap 1 immediately before sending and choosing `ponsAmount` and `minUsdgOut`; these two
@@ -213,3 +343,9 @@ Whoever sends the transaction is responsible for:
 - setting a real `deadline` if a stuck transaction should expire; the default never does;
 - simulating with `eth_call` before sending, and reviewing this code before using it with
   meaningful funds. Passing tests are not an audit.
+
+The page automates the allowance checks, finite deadline and simulation but cannot guarantee that
+prices, liquidity or allowances stay unchanged between the last dry run and mining. A confirmed
+receipt means EVM execution succeeded, not that a zero-minimum test made a profit. Static host
+deployment, real wallet approvals/swaps, allowance revocation and any independent security review
+remain the operator's responsibility.

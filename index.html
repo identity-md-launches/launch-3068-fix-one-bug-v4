@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>USDG / PONS · V4 swap test</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #101721; color: #e7edf5; }
+    body { max-width: 860px; margin: 0 auto; padding: 32px 20px 60px; line-height: 1.55; }
+    h1 { margin-bottom: 0; font-size: 2rem; }
+    h2 { font-size: 1.1rem; margin-top: 0; }
+    .muted, small { color: #a9b9cc; }
+    section { background: #182331; border: 1px solid #344356; border-radius: 12px; padding: 22px; margin-top: 20px; }
+    .notice { border-left: 4px solid #f3be57; padding-left: 16px; }
+    .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 18px; }
+    label { display: block; }
+    input { box-sizing: border-box; width: 100%; margin-top: 6px; padding: 10px; background: #101721; color: inherit;
+      border: 1px solid #687e98; border-radius: 6px; font: inherit; }
+    button { padding: 12px 16px; border: 0; border-radius: 6px; background: #83dfbd; color: #12221c;
+      cursor: pointer; font-weight: 700; margin: 6px 8px 6px 0; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button:focus-visible, input:focus-visible, summary:focus-visible { outline: 3px solid #f3be57; outline-offset: 3px; }
+    code, pre { overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
+    pre { max-height: 300px; overflow: auto; padding: 14px; background: #101721; border-radius: 6px; font-size: .85rem; }
+    dl { display: grid; grid-template-columns: 100px 1fr; gap: 8px; }
+    dd { margin: 0; min-width: 0; }
+    .error { color: #ffb4a9; }
+    .success { color: #83dfbd; }
+  </style>
+</head>
+<body>
+  <header>
+    <p class="muted">ROBINHOOD CHAIN · 4663</p>
+    <h1>USDG → PONS → USDG</h1>
+    <p>Approve Permit2, dry run the round trip, then review the swap in your wallet.</p>
+  </header>
+  <p class="notice"><strong>Small-amount test.</strong> The default minimum return is 0 USDG, so the swap may
+    return nothing. A successful dry run does not show profit or guarantee execution at the same price.</p>
+
+  <section aria-labelledby="wallet-heading">
+    <h2 id="wallet-heading">1. Connect your wallet</h2>
+    <button id="connect" type="button">CONNECT WALLET</button>
+    <p id="account">Not connected. Select Robinhood Chain in your wallet.</p>
+    <small>The connected account pays, receives both swaps, and owns the allowances.</small>
+  </section>
+
+  <section aria-labelledby="amount-heading">
+    <h2 id="amount-heading">2. Choose the test amounts</h2>
+    <div class="fields">
+      <label>USDG input (6 decimals)<input id="usdg-in" value="0.01" readonly></label>
+      <label>PONS to sell (18 decimals)<input id="pons-amount" value="0.001" inputmode="decimal" autocomplete="off"></label>
+      <label>Minimum USDG return<input id="min-usdg-out" value="0" inputmode="decimal" autocomplete="off"></label>
+    </div>
+    <p class="muted">0.001 PONS is a fixed test amount, not a live quote. You can enter swap 1's quoted output
+      minus slippage here. Swap 1 must buy at least this much PONS; swap 2 sells this amount.
+      Extra PONS stays in your wallet.</p>
+    <p id="approval-limits"></p>
+    <button id="approve-permit2" type="button" disabled>APPROVE PERMIT2 (one-time)</button>
+    <small>USDG first, then PONS, with each receipt confirmed before continuing. Existing sufficient allowances
+      are skipped. “One-time” lasts until the limits are spent, revoked, or expire after 30 days.</small>
+    <p class="muted">Prerequisite: both tokens must allow Permit2 to spend them through their ERC20 allowance.
+      An ERC20 approval directly to the router does not satisfy this. The page checks both layers.</p>
+  </section>
+
+  <section aria-labelledby="swap-heading">
+    <h2 id="swap-heading">3. Simulate and send</h2>
+    <p>Pool A: fee 3000 / tick spacing 60. Pool B: fee 30000 / tick spacing 600. Both have no hook.
+      The swap deadline is 20 minutes from the latest block.</p>
+    <button id="dry-run" type="button" disabled>BUILD CALLDATA &amp; DRY RUN</button>
+    <button id="send" type="button" disabled>SEND TRANSACTION</button>
+    <p id="status" role="status" aria-live="polite">Connect to begin.</p>
+    <details><summary>Calldata sent to the router</summary><pre id="calldata">Not built yet.</pre></details>
+    <details><summary>Contract addresses</summary>
+      <dl>
+        <dt>Permit2</dt><dd><code id="permit2-address"></code></dd>
+        <dt>Router</dt><dd><code id="router-address"></code></dd>
+        <dt>USDG</dt><dd><code id="usdg-address"></code></dd>
+        <dt>PONS</dt><dd><code id="pons-address"></code></dd>
+      </dl>
+    </details>
+    <h3>Activity</h3>
+    <pre id="activity" role="log" aria-live="polite">No transactions submitted.</pre>
+  </section>
+  <noscript><p>JavaScript and an EIP-1193 wallet are required.</p></noscript>
+  <script src="js/vendor/ethers-5.7.2.umd.min.js"></script>
+  <script src="js/v4-arb-encoder.js"></script>
+  <script>
+    "use strict";
+    const E = V4ArbEncoder;
+    const element = (id) => document.getElementById(id);
+    let wallet = null;
+    let account = null;
+    let prepared = null;
+    let busy = false;
+    const activity = [];
+
+    function log(message) {
+      activity.push(message);
+      element("activity").textContent = activity.join("\n");
+    }
+
+    function showStatus(message, error = false) {
+      element("status").textContent = message;
+      element("status").className = error ? "error" : "success";
+    }
+
+    function render() {
+      element("connect").disabled = busy;
+      element("approve-permit2").disabled = busy || !account;
+      element("dry-run").disabled = busy || !account;
+      element("send").disabled = busy || !account || !prepared;
+      element("pons-amount").disabled = busy;
+      element("min-usdg-out").disabled = busy;
+    }
+
+    function clearPrepared() {
+      prepared = null;
+      element("calldata").textContent = "Not built yet.";
+      render();
+    }
+
+    function readAmounts() {
+      const ponsText = element("pons-amount").value.trim();
+      const minText = element("min-usdg-out").value.trim();
+      if (!/^\d+(\.\d{1,18})?$/.test(ponsText)) throw new Error("Enter a PONS amount with up to 18 decimals.");
+      if (!/^\d+(\.\d{1,6})?$/.test(minText)) throw new Error("Enter a USDG minimum with up to 6 decimals.");
+      const ponsAmount = ethers.utils.parseUnits(ponsText, 18);
+      const minUsdgOut = ethers.utils.parseUnits(minText, 6);
+      if (ponsAmount.isZero() || ponsAmount.gte(E.MAX_UINT128)) throw new Error("PONS amount must be positive and below uint128 max.");
+      if (minUsdgOut.gt(E.MAX_UINT128)) throw new Error("USDG minimum exceeds uint128.");
+      return {
+        usdgIn: ethers.utils.parseUnits("0.01", 6),
+        ponsAmount,
+        minUsdgOut,
+      };
+    }
+
+    function updateLimits() {
+      try {
+        const amounts = readAmounts();
+        element("approval-limits").textContent = "Reusable Permit2 limits: 1 USDG and " +
+          ethers.utils.formatUnits(amounts.ponsAmount.mul(100), 18) + " PONS (100 test swaps), expiring in 30 days.";
+      } catch (error) {
+        element("approval-limits").textContent = error.message;
+      }
+    }
+
+    async function runAction(action) {
+      if (busy) return;
+      busy = true;
+      render();
+      try {
+        await action();
+      } catch (error) {
+        clearPrepared();
+        if (!account) element("account").textContent = "Not connected. Select Robinhood Chain and connect again.";
+        const detail = typeof error.data === "string" ? " " + error.data : "";
+        const message = (error.code === 4001 ? "Wallet request rejected. " : "") + error.message + detail;
+        showStatus(message, true);
+        log(message);
+      } finally {
+        busy = false;
+        render();
+      }
+    }
+
+    function walletChanged() {
+      account = null;
+      clearPrepared();
+      element("account").textContent = "Wallet or network changed. Connect again.";
+      showStatus("Wallet or network changed. Pending work stopped; reconnect and dry run again.", true);
+    }
+
+    element("connect").addEventListener("click", () => runAction(async () => {
+      clearPrepared();
+      account = null;
+      element("account").textContent = "Connecting…";
+      if (!wallet) {
+        wallet = E.createWalletClient(window.ethereum, { onStatus: log });
+        if (typeof window.ethereum.on === "function") {
+          ["accountsChanged", "chainChanged", "disconnect"].forEach((event) => window.ethereum.on(event, walletChanged));
+        }
+      }
+      account = await wallet.connect();
+      element("account").textContent = account;
+      showStatus("Connected on Robinhood Chain. Approve Permit2 or dry run with existing allowances.");
+    }));
+
+    element("approve-permit2").addEventListener("click", () => runAction(async () => {
+      clearPrepared();
+      const amounts = readAmounts();
+      showStatus("Checking ERC20 allowances to Permit2…");
+      await wallet.checkTokenAllowances(amounts.usdgIn, amounts.ponsAmount);
+      const expiration = (await wallet.timestamp()) + 30 * 24 * 60 * 60;
+      showStatus("Approve USDG, then PONS in your wallet. Waiting for successful receipts…");
+      await wallet.approveBothPermit2(amounts.usdgIn.mul(100), amounts.ponsAmount.mul(100), expiration);
+      await wallet.checkAllowances(amounts.usdgIn, amounts.ponsAmount, (await wallet.timestamp()) + 1200);
+      showStatus("Both Permit2 allowances are ready. Build calldata and dry run next.");
+    }));
+
+    element("dry-run").addEventListener("click", () => runAction(async () => {
+      clearPrepared();
+      showStatus("Building calldata and running eth_call…");
+      // prepareSwap calls buildCalldata with these amounts and recipient = the connected wallet.
+      prepared = await wallet.prepareSwap(readAmounts());
+      element("calldata").textContent = prepared.transaction.data;
+      showStatus("Dry run succeeded. Send will simulate these same bytes again before requesting your signature.");
+    }));
+
+    element("send").addEventListener("click", () => runAction(async () => {
+      const candidate = prepared;
+      prepared = null;
+      showStatus("Rechecking allowances and eth_call, then waiting for your wallet and receipt…");
+      const receipt = await wallet.sendSwap(candidate);
+      showStatus("Swap confirmed: " + receipt.transactionHash);
+    }));
+
+    ["pons-amount", "min-usdg-out"].forEach((id) => element(id).addEventListener("input", () => {
+      clearPrepared();
+      updateLimits();
+      showStatus("Amounts changed. Build and dry run again before sending.");
+    }));
+    [["permit2-address", E.PERMIT2], ["router-address", E.ROUTER], ["usdg-address", E.USDG], ["pons-address", E.PONS]]
+      .forEach(([id, value]) => { element(id).textContent = value; });
+    updateLimits();
+    render();
+  </script>
+</body>
+</html>
