@@ -188,6 +188,8 @@ class MockWallet extends EventEmitter {
     }
     if (method === "eth_call") {
       const tx = params[0];
+      // The page now defaults to Both. Legacy V4 fixtures have no V3 pools.
+      if (tx.to && lower(tx.to) === lower(E.V3_FACTORY)) return abi.encode(["address"], [ethers.constants.AddressZero]);
       if (lower(tx.to) === lower(E.POOL_MANAGER)) return this.poolManagerCall(tx);
       if (lower(tx.to) === lower(E.PERMIT2)) {
         const [owner, token, spender] = permit.decodeFunctionData("allowance", tx.data);

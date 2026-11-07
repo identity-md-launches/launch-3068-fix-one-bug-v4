@@ -12,6 +12,7 @@ const vm = require("node:vm");
 const { MockWallet, CALLER, OTHER, erc20 } = require("./mock-wallet.js");
 const { ethers } = require("../vendor/ethers-5.7.2.umd.min.js");
 const E = require("../v4-arb-encoder.js");
+const { V3Mock, v3, decodePath } = require("./v3-mock.js");
 
 function node(tag, attributes = {}) {
   return {
@@ -403,7 +404,8 @@ test("Last Swap shows elapsed chain time in green, yellow and red; the price sta
   assert.equal(lastSwap(30000).className, "red");
   assert.equal(rows[0].children[5].textContent, "—");
   assert.match(rows[FEES[3000]].children[2].textContent, /\(tick -292916\)$/);
-  assert.equal(rows[FEES[3000]].children.length, 6);
+  assert.equal(rows[FEES[3000]].children.length, 7); // appended Protocol column
+  assert.equal(rows[FEES[3000]].children[6].textContent, "V4");
 });
 
 test("a pool past Max staleness is marked STALE and leaves the spreads; the field applies at once and a typo keeps the last value", async () => {
@@ -729,4 +731,179 @@ test("provider errors are rendered as text, never interpreted as HTML", async ()
   await element("connect").click();
   assert.equal(element("status").textContent, "<img src=x onerror=alert(1)>");
   assert.equal(element("status").innerHTML, undefined);
+});
+
+function withV3Pools() {
+  const provider = new V3Mock();
+  provider.addV3Swap(3000, -292916);
+  provider.addV3Swap(10000, -292000);
+  return provider;
+}
+
+async function chooseProtocol(page, protocol) {
+  page.element("protocol").value = protocol;
+  page.element("protocol").change(false);
+  await page.until(() => page.timers.length > 0, "protocol restart");
+  await page.flush();
+}
+
+test("Protocol defaults to Both, tags both tables, shows every combination, and restarts on each change", async () => {
+  const provider = withV3Pools();
+  provider.addSwap(3000, 60, -292500);
+  provider.addSwap(500, 10, -293000);
+  const page = await readyPage(provider), { element } = page;
+  assert.equal(element("protocol").value, "Both");
+  assert.equal(element("pools-body").children.length, 9);
+  assert.equal(element("spreads-body").children.length, 6);
+  assert.equal(element("permit2-controls").hidden, false);
+  assert.equal(element("v3-controls").hidden, false);
+  const v3Rows = element("pools-body").children.filter(row => row.children[6].textContent === "V3");
+  assert.deepEqual(v3Rows.map(row => row.children[0].textContent), ["0.30%", "1.00%"]);
+  assert.ok(element("spreads-body").children.some(row => /V3 → V4|V4 → V3/.test(row.children[6].textContent)));
+  await element("spreads-body").children[0].click(); await page.flush();
+  assert.notEqual(element("selected-pools").textContent, "No spread selected.");
+  await chooseProtocol(page, "V3");
+  assert.equal(element("pools-body").children.length, 2);
+  assert.equal(element("spreads-body").children.length, 1);
+  assert.equal(element("selected-pools").textContent, "No spread selected.");
+  assert.equal(element("permit2-controls").hidden, true);
+  assert.equal(element("v3-controls").hidden, false);
+  assert.equal(element("send").disabled, true);
+  await chooseProtocol(page, "V4");
+  assert.equal(element("pools-body").children.length, 7);
+  assert.equal(element("permit2-controls").hidden, false);
+  assert.equal(element("v3-controls").hidden, true);
+  assert.equal(page.timers.length, 1);
+});
+
+test("V3 page quotes both legs without a wallet, approves one token, and sends a protected atomic round trip", async () => {
+  const page = await readyPage(withV3Pools()), { provider, element, flush } = page;
+  await chooseProtocol(page, "V3");
+  await element("spreads-body").children[0].click(); await flush();
+  assert.equal(provider.calls.length, 0);
+  assert.equal(element("bridge-amount").value, "0.04975");
+  assert.match(element("quote-info").textContent, /Return quote: 0.011 USDG/);
+  assert.equal(element("route-warning").hidden, true);
+  await element("connect").click();
+  assert.equal(element("approve-permit2").disabled, true);
+  assert.equal(element("approve-v3-router").disabled, false);
+  await element("approve-v3-router").click();
+  assert.equal(provider.sent.length, 1);
+  await element("approve-v3-router").click();
+  assert.equal(provider.sent.length, 1);
+  await element("dry-run").click();
+  assert.equal(element("send").disabled, false);
+  const [deadline, calls] = v3.decodeFunctionData("multicall", element("calldata").textContent);
+  const [params] = v3.decodeFunctionData("exactInput", calls[0]);
+  assert.deepEqual(decodePath(params[0]).fees, [3000, 10000]);
+  assert.equal(params[3].toString(), "10945"); // UI minimum 0 cannot remove the quote's floor
+  assert.equal(deadline.toNumber(), provider.now + 1200);
+  await element("send").click();
+  assert.match(element("status").textContent, /Swap confirmed/);
+  assert.equal(provider.sent.length, 2);
+  assert.equal(provider.sent[1].to.toLowerCase(), E.V3_ROUTER.toLowerCase());
+  assert.equal(element("send").disabled, true);
+  assert.ok(provider.sent.every(tx => tx.to !== E.PERMIT2));
+});
+
+for (const mode of ["zero", "failed quote", "zero sell", "empty", "unknown"]) {
+  test("V3 page excludes or disables execution for " + mode, async () => {
+    const provider = withV3Pools();
+    if (mode === "zero") provider.quoteZero = true;
+    if (mode === "failed quote") provider.quoteFailure = true;
+    if (mode === "empty") provider.v3Liquidity.set(provider.row().address.toLowerCase(), ethers.BigNumber.from(0));
+    if (mode === "unknown") provider.liquidityFailures.add(provider.row().address.toLowerCase());
+    if (mode === "zero sell") {
+      const original = provider.output.bind(provider);
+      provider.output = (token, amount) => token.toLowerCase() === E.PONS.toLowerCase() ? ethers.BigNumber.from(0) : original(token, amount);
+    }
+    const page = await readyPage(provider), { element, flush } = page;
+    await chooseProtocol(page, "V3");
+    await element("connect").click();
+    if (["empty", "unknown"].includes(mode)) assert.equal(element("spreads-body").children.length, 0);
+    else { await element("spreads-body").children[0].click(); await flush(); }
+    assert.equal(element("approve-v3-router").disabled, true);
+    assert.equal(element("dry-run").disabled, true);
+    assert.equal(element("send").disabled, true);
+    if (mode === "zero") assert.match(element("quote-info").textContent, /Warning: no liquidity/);
+    assert.equal(provider.sent.length, 0);
+  });
+}
+
+function mixedPools(v3First) {
+  const provider = new V3Mock();
+  provider.v3Pools.delete(10000);
+  provider.addV3Swap(3000, v3First ? -293000 : -292000);
+  provider.addSwap(3000, 60, v3First ? -292000 : -293000);
+  provider.setBalance(CALLER, E.PONS, 0);
+  return provider;
+}
+
+for (const v3First of [true, false]) {
+  test("mixed page warns, approves each leg's token, then sequences " + (v3First ? "V3 → V4" : "V4 → V3"), async () => {
+    const page = await readyPage(mixedPools(v3First)), { provider, element, flush } = page;
+    await element("spreads-body").children[0].click(); await flush();
+    assert.equal(element("route-warning").hidden, false);
+    assert.match(element("route-warning").textContent, /2 transactions required/);
+    assert.match(element("route-warning").textContent, v3First ? /V3 buy first, then V4/ : /V4 buy first, then V3/);
+    await element("connect").click();
+    await element("approve-v3-router").click();
+    await element("approve-permit2").click();
+    assert.equal(provider.sent.length, 2);
+    await element("dry-run").click();
+    assert.match(element("status").textContent, /First leg dry run succeeded/);
+    assert.equal(element("send").disabled, false);
+    const txs = JSON.parse(element("calldata").textContent);
+    assert.equal(txs.length, 2);
+    await element("send").click();
+    assert.match(element("status").textContent, /Swap confirmed:.*First leg:/);
+    assert.deepEqual(provider.sent.slice(2).map(tx => tx.to.toLowerCase()), v3First ? [E.V3_ROUTER.toLowerCase(), E.ROUTER.toLowerCase()] : [E.ROUTER.toLowerCase(), E.V3_ROUTER.toLowerCase()]);
+    assert.match(element("activity").textContent, /Mixed leg 1 confirmed:.*\nMixed leg 2 submitted:/);
+  });
+}
+
+test("mixed second-leg rejection leaves bridge funds visible and never repeats the first leg", async () => {
+  const page = await readyPage(mixedPools(true)), { provider, element, flush } = page;
+  await element("spreads-body").children[0].click(); await flush();
+  await element("connect").click();
+  await element("approve-v3-router").click(); await element("approve-permit2").click();
+  await element("dry-run").click();
+  provider.rejectSend = provider.sent.length + 2;
+  await element("send").click();
+  assert.match(element("status").textContent, /Leg 1 confirmed.*Leg 2 did not confirm/);
+  assert.equal(element("bal-a").textContent, "0.05 PONS");
+  assert.equal(element("send").disabled, true);
+  const count = provider.sent.length;
+  await element("send").click();
+  assert.equal(provider.sent.length, count);
+});
+
+test("mixed-only spreads are manual-only even when they are GREEN and auto mode is enabled", async () => {
+  const page = await readyPage(mixedPools(true)), { provider, element, poll, flush } = page;
+  await element("connect").click();
+  element("auto-mode").change(true);
+  await flush(); await poll(); await flush();
+  assert.equal(element("auto-mode").checked, true);
+  assert.equal(provider.sent.length, 0);
+  assert.equal(provider.rpcCalls.filter(c => c.method === "eth_call" && !c.params[0].to).length, 0);
+});
+
+test("V3 auto mode executes only one atomic route while the receipt is pending, with protocol selection locked", async () => {
+  const provider = withV3Pools(); provider.setAllowance(E.USDG, 1000000);
+  const page = await readyPage(provider), { element, until, poll, flush } = page;
+  await chooseProtocol(page, "V3");
+  await element("connect").click();
+  let release;
+  const hold = new Promise(resolve => { release = resolve; });
+  provider.beforeRequest = async call => { if (call.method === "eth_getTransactionReceipt") await hold; };
+  element("auto-mode").change(true);
+  await until(() => provider.sent.length === 1, "V3 automatic submission");
+  assert.equal(element("protocol").disabled, true);
+  assert.equal(element("approve-v3-router").disabled, true);
+  await poll(); await flush();
+  assert.equal(provider.sent.length, 1);
+  release();
+  await until(() => !element("protocol").disabled, "V3 receipt");
+  assert.match(element("status").textContent, /Swap confirmed/);
+  element("auto-mode").change(false);
 });

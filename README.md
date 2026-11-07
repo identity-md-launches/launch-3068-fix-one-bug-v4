@@ -1,4 +1,4 @@
-# V4 swap calldata for the Universal Router on Robinhood Chain
+# V3 + V4 pool monitor and arbitrage on Robinhood Chain
 
 Corrected `encodeV4Swap()` and `buildCalldata()` for a two-swap Uniswap V4 round trip
 (USDG → PONS → USDG) through the Universal Router `0x8876789976dEcBfCbBbe364623C63652db8C0904`
@@ -6,6 +6,177 @@ on chain 4663, with the evidence for the fix.
 
 The deliverables are [`index.html`](index.html) and [`js/v4-arb-encoder.js`](js/v4-arb-encoder.js):
 plain JavaScript and the existing vendored ethers v5, with no install or CDN required.
+
+## Follow-up 4: dual-protocol monitoring and execution
+
+The same page now has **Protocol: V4 / V3 / Both**, default **Both**. Changing it restarts the
+monitor and clears the selected quote and prepared transaction, just like changing the pair.
+The selector is locked during wallet work. V4 keeps its seven tiers and existing encoder,
+router-revert quote, Permit2 APIs, `buildCalldata`, `buildAtomicCalldata`, and transfer section.
+V3 is added to `js/v4-arb-encoder.js`; the deployment path and vendored ethers version are unchanged.
+
+### Decisions resolving the brief's contradictions
+
+The rejected attempt identified ABI mismatches. This implementation resolves them rather than
+requiring new addresses or leaving V3 disabled:
+
+| Open issue | Decision and reason |
+|---|---|
+| `pool.getAmountsIn(uint256)` | The supplied V3 pools do not implement it. Quote the real pool's `swap` inside a reverting **creation `eth_call`**, with an ephemeral authenticated callback. No router, wallet, balance, approval, state override or deployed quoter address is needed. |
+| `router.multiswap(...)` | The supplied router has standard SwapRouter02 `exactInput((bytes,address,uint256,uint256))`, selector `0xb858183f`. Wrap it in `multicall(uint256,bytes[])`, selector `0x5ae401dc`, so the 20-minute deadline is enforced on chain. A two-hop `exactInput` is one atomic transaction. |
+| “Tick from the 7th data word” | Tick is argument 7, but sender and recipient are indexed. Decode tick from **data word 5** of the declared V3 event. The supplied topic is correct. |
+| “115-byte path” | Follow the explicit `abi.encodePacked(tokenIn,uint24(feeA),tokenMid,uint24(feeB),tokenOut)` example: **66 bytes** = 20 + 3 + 20 + 3 + 20. Single-hop paths are 43 bytes. |
+| “V3 first” for every mixed route | Execute **buy first, sell second**, regardless of protocol. Otherwise a V4-buy/V3-sell spread would require prefunded currency0 or trade in the wrong direction. Both orders are tested. |
+| CASHCAT test address omitted | Use the address published by Robinhood only for the optional read-only verification, confirmed through on-chain metadata and the supplied factory. It is not a new deployment parameter or a hardcoded UI pair. |
+
+The standard router interfaces and callback quote mechanism are described in Uniswap's
+[V3SwapRouter](https://github.com/Uniswap/swap-router-contracts/blob/main/contracts/V3SwapRouter.sol),
+[MulticallExtended](https://github.com/Uniswap/swap-router-contracts/blob/main/contracts/base/MulticallExtended.sol),
+and [Quoter](https://github.com/Uniswap/v3-periphery/blob/main/contracts/lens/Quoter.sol).
+These are interface references; this project does not download or depend on them at build time.
+
+### Monitor and display
+
+V3 discovery calls the supplied factory's `getPool` for fees **100, 500, 3000, 10000**, with the
+tokens sorted by BigInt. Zero replies are excluded. Successful discovery is cached until a pair
+or protocol restart, including across a later log-scan failure; it is not repeated each poll.
+An unsuccessful discovery is retried after 60 seconds. Newly created pools therefore require
+**WATCH PAIR** (or a protocol change) to rediscover them.
+
+Each poll reads the latest block once, then one V4 singleton log request if enabled and **one V3
+address-array log request** if enabled and at least one V3 pool exists. Both requests use the same
+window and head. An empty V3 address array is never sent. Each active V3 pool gets a swap-block
+timestamp read and `liquidity()` at that head; zero liquidity means **EMPTY**. A failed health read
+means **UNKNOWN**, and excess elapsed time means **STALE**, using the existing status functions.
+Only OK pools reach spreads. Inactive pools are shown but have no price and get no health reads.
+Latest-block/log errors preserve the last successful table and use the existing 60-second retry;
+individual health failures do not fail the whole poll. Normal cadence remains 30 seconds.
+
+The pools table has an appended Protocol column and V3 fees are shown as 0.01%, 0.05%, 0.30%, 1.00%.
+Prices use the latest swap tick, `1.0001^tick`, scaled by token decimals. The spreads table identifies
+each leg's protocol. **Both shows every pairwise combination** of tradeable pools; single-protocol
+modes retain the top-five presentation. Pool A is always the lower-price buy, Pool B the sell.
+Sorting addresses can change which token is the input: for PONS/WETH, currency1 is **PONS**.
+
+### Quotes, approvals and transactions
+
+`src/V3Quote.sol` supplies the creation-call quote code. Its constructor resolves the pool from
+the fixed factory, checks liquidity, creates a temporary callback receiver and calls the pool's
+real swap. The authenticated callback reverts with input used and output received before payment.
+All temporary creations and pool effects revert. Partial nonzero fills are rejected by the client;
+zero output displays the no-liquidity warning and disables execution. Unexpected replies and RPC
+failures are errors, never estimates from tick prices. **This code is not a contract to deploy.**
+The constructor always reverts, even on successful quotes; no launch manifest is needed.
+
+The quote bytecode is embedded in the existing encoder file. To rebuild it after changing the
+Solidity source, run `forge fmt`, `forge build`, then `node scripts/embed-v3-quote.js`.
+`node scripts/embed-v3-quote.js --check` verifies it matches the pinned compiler's artifact.
+The served page needs no artifact fetch and no network dependency other than RPC.
+
+| Selected route | Approval | Execution |
+|---|---|---|
+| V4 → V4 | Existing two-token Permit2 flow | Unchanged `buildCalldata`, two V4_SWAP commands in one transaction |
+| V3 → V3 | Input token's ERC20 allowance to V3 Router | One two-hop `exactInput` in deadline-bearing `multicall`; the router forwards the full first-hop output |
+| V3 → V4 | currency1 → V3 Router, currency0 → Permit2 | V3 single hop, confirmed receipt, V4 single swap |
+| V4 → V3 | currency1 → Permit2, currency0 → V3 Router | V4 single swap, confirmed receipt, V3 single hop |
+
+**APPROVE V3 ROUTER** checks the direct ERC20 allowance and grants only 100× that leg's input.
+Sufficient limits are skipped. An insufficient nonzero allowance is reset to zero first for tokens
+that require it; every approval receipt must succeed before the next prompt. Empty ERC20 return
+data is supported; `false` is rejected. V3 never needs Permit2. In mixed routes the Permit2 button
+approves only the V4 leg's input, with the same 100× cap and 30-day expiry. Its underlying ERC20
+allowance to Permit2 remains a prerequisite, as before. Both approval controls are visible in Both
+mode; a control irrelevant to the selected route is disabled.
+
+For any route involving V3, both legs are quoted. The bridge display is buy output minus **0.5%**.
+An atomic V3 route quotes the sell with the **full** first-hop output, because that is what the
+router forwards. A mixed route quotes the sell with the protected bridge amount, and leaves any
+extra first-leg output in the wallet. The final minimum is the larger of the user's field and
+the sell quote minus 0.5%; entering zero cannot remove this floor. V4-only's minimum-return
+behavior stays unchanged. A nonzero minimum is not a profit guarantee or a gas-cost allowance.
+
+Mixed routes visibly warn **“2 transactions required”** and are **manual-only**. Preparing them
+checks both approvals and simulates leg 1; leg 2 cannot be simulated with funds that have not yet
+arrived. Sending re-simulates leg 1, waits for its successful receipt, checks the actual increase
+in bridge balance, then rechecks the session, deadline and leg-2 allowance before simulating and
+submitting leg 2. A failure at any stage stops the sequence. If leg 1 confirmed, its hash and the
+remaining bridge balance are shown; restarting the whole route is never automatic. Interrupted
+confirmations retain their pending hash. The common deadline is latest chain timestamp + 1200 s.
+
+Auto mode chooses the best eligible **same-protocol** GREEN spread across both protocols; a higher
+mixed spread cannot trigger two transactions or conceal an eligible atomic opportunity. Existing
+receipt locking, auto-failure handling, wallet-session checks and balance transfers are retained.
+
+### Fixed chain configuration and After launch
+
+| Parameter | Value |
+|---|---|
+| Chain / RPC | 4663 / `https://rpc.mainnet.chain.robinhood.com` |
+| V3 Factory | `0x1f7d7550b1b028f7571e69a784071f0205fd2efa` |
+| V3 SwapRouter02 | `0xcaf681a66d020601342297493863e78c959e5cb2` |
+| V4 PoolManager | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
+| V4 Universal Router | `0x8876789976dEcBfCbBbe364623C63652db8C0904` |
+| Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` |
+| WETH, 18 decimals | `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73` |
+| USDG, 6 decimals | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` |
+| PONS, 18 decimals | `0x39dbed3a2bd333467115de45665cc57f813c4571` |
+
+There is no new owner, recipient, key, deployment, token or external quoter setting to supply.
+The connected wallet is the payer and recipient; pair metadata is read from the selected tokens.
+Serve/publish the same root `index.html`, `js/v4-arb-encoder.js` and existing `js/vendor/` assets
+over HTTP(S). The source, tests and scripts need not be served. No deployment or wallet transaction
+was performed in this assignment.
+
+After publishing, the operator connects an EIP-1193 wallet on 4663, checks token addresses and
+amounts, funds gas and input tokens, approves the appropriate spenders, and reviews the dry run.
+For a failed/interrupted mixed route the operator must inspect both transaction hashes and the
+remaining bridge balance before deciding how to unwind or retry; leg 1 cannot be rolled back.
+Approvals should be revoked when no longer needed. Fee-on-transfer/rebasing tokens are unsupported;
+the balance-increase guard stops a mixed second leg if its funding is short. RPC availability,
+price changes, transaction inclusion and ongoing independent security review remain operational
+responsibilities. The V4 slot0-based EMPTY limitation documented in follow-up 3.5 remains unchanged.
+
+### Follow-up 4 verification
+
+Offline checks (no installed packages, environment-based test configuration or network required):
+
+```sh
+forge build
+FOUNDRY_FUZZ_SEED=0x7f2de0555d9e356f083f3341b9bd4a95f44c5b3fcc0daea7edd349a826cf65c9 forge test
+forge fmt --check
+node scripts/embed-v3-quote.js --check
+node --test js/test/*.test.js
+```
+
+Foundry tests exercise the actual quote callback, both directions, rollback, missing pools, empty
+liquidity, partial fills, invalid callers/deltas and propagated pool failures, including fuzzing.
+JavaScript tests exercise discovery/caching/retry races, log ABI and call counts, all statuses,
+independent path/calldata decoding, approval success/rejection/reversion/timeout, immutable
+preparations, deadline/session/allowance changes, both mixed orders, post-first-leg failures,
+protocol switching, display, locking and atomic-only auto mode. Existing V4 tests remain; the old
+UI fixture gained an empty V3 factory and its column-count assertion now includes Protocol.
+The UI tests execute the actual page script against a small DOM mock, not a real browser extension.
+
+Live read-only observations are in [`artifacts/follow-up4-live.json`](artifacts/follow-up4-live.json)
+and [`artifacts/follow-up4-live-50000.json`](artifacts/follow-up4-live-50000.json), with pinned blocks,
+addresses, raw quote amounts and window sizes. At the 3000-block snapshot `0x677d861`, PONS/WETH
+had active V3 3000/10000 pools and a **0.662% gross spread** (negative after their 1.3% combined fees).
+WETH/USDG had active V3 100/500 pools; PONS/USDG retained its active V4 pool. CASHCAT had no swaps
+in that short window, so its pools correctly appeared inactive. The longer-window snapshot records
+its active pools without changing the default window or inventing a live spread.
+
+Optional reproduction (all calls are read-only; never part of offline tests):
+
+```sh
+node scripts/verify-v3-live.js
+node scripts/verify-v3-live.js 0x020bfC650A365f8BB26819deAAbF3E21291018b4 --window=50000
+```
+
+The optional CASHCAT address is from
+[Robinhood's Cash Cat asset statement](https://robinhood.com/ca/en/support/articles/crypto-asset-statements-cashcat/),
+verified by `symbol()`/`decimals()` and factory discovery on 4663. Activity and spreads vary with
+the head and window; the brief's sample volumes/spreads are not assertions. Live checks confirm
+monitoring and pool quotes, not a funded-wallet execution or an independent security audit.
 
 ## Follow-up 3.5: window, staleness, slot0 check
 

@@ -124,6 +124,161 @@
   var POOL_A = { currency0: PONS, currency1: USDG, fee: 3000, tickSpacing: 60, hooks: NO_HOOKS };
   var POOL_B = { currency0: PONS, currency1: USDG, fee: 30000, tickSpacing: 600, hooks: NO_HOOKS };
 
+  // V3 additions. The supplied deployments use standard SwapRouter02, not multiswap/getAmountsIn.
+  var V3_FACTORY = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa";
+  var V3_ROUTER = "0xcaf681a66d020601342297493863e78c959e5cb2";
+  var WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
+  var V3_FEE_TIERS = [100, 500, 3000, 10000];
+  // Derive the topic from the declared ABI; indexed addresses live in topics, not data words.
+  var V3_SWAP_TOPIC = utils.id("Swap(address,address,int256,int256,uint160,uint128,int24)");
+  var v3FactoryInterface = new utils.Interface(["function getPool(address,address,uint24) view returns (address)"]);
+  var v3PoolInterface = new utils.Interface(["function liquidity() view returns (uint128)"]);
+  var v3RouterInterface = new utils.Interface([
+    "function exactInput(tuple(bytes path,address recipient,uint256 amountIn,uint256 amountOutMinimum) params) payable returns (uint256)",
+    "function multicall(uint256 deadline,bytes[] data) payable returns (bytes[])",
+  ]);
+  var v3TokenInterface = new utils.Interface(["function approve(address spender,uint256 amount) returns (bool)"]);
+  var V3_QUOTE_SELECTOR = utils.id("V3QuoteResult(uint256,uint256)").slice(0, 10);
+  // BEGIN GENERATED V3 QUOTE BYTECODE (scripts/embed-v3-quote.js)
+  var V3_QUOTE_BYTECODE = "0x608060405234801561000f575f80fd5b506040516108d33803806108d383398101604081905261002e91610306565b6001600160a01b038416158061004b57506001600160a01b038316155b806100675750826001600160a01b0316846001600160a01b0316145b8061007957506001600160801b038116155b1561009757604051630951f7bd60e11b815260040160405180910390fd5b6001600160a01b03808416908516105f731f7d7550b1b028f7571e69a784071f0205fd2efa631698ee82836100cc57866100ce565b875b846100d957886100db565b875b6040516001600160e01b031960e085901b1681526001600160a01b0392831660048201529116602482015262ffffff87166044820152606401602060405180830381865afa15801561012f573d5f803e3d5ffd5b505050506040513d601f19601f820116820180604052508101906101539190610360565b90506001600160a01b03811661017c57604051630951f7bd60e11b815260040160405180910390fd5b806001600160a01b0316631a6865026040518163ffffffff1660e01b8152600401602060405180830381865afa1580156101b8573d5f803e3d5ffd5b505050506040513d601f19601f820116820180604052508101906101dc9190610380565b6001600160801b03165f0361021157604051635fe077e360e11b81525f60048201819052602482015260440160405180910390fd5b808260405161021f906102c8565b6001600160a01b03909216825215156020820152604001604051809103905ff08015801561024f573d5f803e3d5ffd5b506040516320e9b73b60e01b81526001600160801b03851660048201526001600160a01b0391909116906320e9b73b906024015f604051808303815f87803b158015610299575f80fd5b505af11580156102ab573d5f803e3d5ffd5b5050505060405163030ad99760e01b815260040160405180910390fd5b6105398061039a83390190565b80516001600160a01b03811681146102eb575f80fd5b919050565b80516001600160801b03811681146102eb575f80fd5b5f805f8060808587031215610319575f80fd5b610322856102d5565b9350610330602086016102d5565b9250604085015162ffffff81168114610347575f80fd5b9150610355606086016102f0565b905092959194509250565b5f60208284031215610370575f80fd5b610379826102d5565b9392505050565b5f60208284031215610390575f80fd5b610379826102f056fe60e060405234801561000f575f80fd5b5060405161053938038061053983398101604081905261002e91610072565b6001600160a01b03821661005557604051630951f7bd60e11b815260040160405180910390fd5b336080526001600160a01b039190911660a052151560c0526100b9565b5f8060408385031215610083575f80fd5b82516001600160a01b0381168114610099575f80fd5b602084015190925080151581146100ae575f80fd5b809150509250929050565b60805160a05160c05161043d6100fc5f395f818160ef0152818161011a01528181610250015261028001525f818160bf015261020f01525f606b015261043d5ff3fe608060405234801561000f575f80fd5b5060043610610034575f3560e01c806320e9b73b14610038578063fa461e331461004d575b5f80fd5b61004b610046366004610316565b610060565b005b61004b61005b366004610343565b610204565b336001600160a01b037f00000000000000000000000000000000000000000000000000000000000000001614158061009f57506001600160801b038116155b156100bd57604051630951f7bd60e11b815260040160405180910390fd5b7f00000000000000000000000000000000000000000000000000000000000000006001600160a01b031663128acb08307f0000000000000000000000000000000000000000000000000000000000000000846001600160801b03167f00000000000000000000000000000000000000000000000000000000000000006101575773fffd8963efd1fc6a506488495d951d5263988d2561015e565b6401000276a45b60405160e086901b6001600160e01b03191681526001600160a01b03948516600482015292151560248401526044830191909152909116606482015260a060848201525f60a482015260c40160408051808303815f875af11580156101c5573d5f803e3d5ffd5b505050506040513d601f19601f820116820180604052508101906101e991906103bf565b505060405163030ad99760e01b815260040160405180910390fd5b336001600160a01b037f0000000000000000000000000000000000000000000000000000000000000000161461024d57604051630951f7bd60e11b815260040160405180910390fd5b5f7f0000000000000000000000000000000000000000000000000000000000000000610279578361027b565b845b90505f7f00000000000000000000000000000000000000000000000000000000000000006102a957856102ab565b845b90505f8212806102ba57505f81135b806102c85750600160ff1b81145b156102e657604051630951f7bd60e11b815260040160405180910390fd5b816102f0826103e1565b604051635fe077e360e11b81526004810192909252602482015260440160405180910390fd5b5f60208284031215610326575f80fd5b81356001600160801b038116811461033c575f80fd5b9392505050565b5f805f8060608587031215610356575f80fd5b8435935060208501359250604085013567ffffffffffffffff81111561037a575f80fd5b8501601f8101871361038a575f80fd5b803567ffffffffffffffff8111156103a0575f80fd5b8760208284010111156103b1575f80fd5b949793965060200194505050565b5f80604083850312156103d0575f80fd5b505080516020909101519092909150565b5f600160ff1b820161040157634e487b7160e01b5f52601160045260245ffd5b505f039056fea2646970667358221220d801d5830da366b26e2ba517b66c12e71d864bec08cc5abe24ed6f3d68bbfe6464736f6c634300081a0033";
+  // END GENERATED V3 QUOTE BYTECODE
+
+  function protocolOf(pool) { return pool.protocol || "V4"; }
+
+  function normaliseProtocol(protocol) {
+    if (["V3", "V4", "Both"].indexOf(protocol) === -1) fail("Protocol must be V3, V4 or Both");
+    return protocol;
+  }
+
+  function v3Fee(fee) {
+    var value = Number(fee);
+    if (V3_FEE_TIERS.indexOf(value) === -1) fail("unsupported V3 fee tier");
+    return value;
+  }
+
+  function formatV3Fee(fee) { return (v3Fee(fee) / 10000).toFixed(2) + "%"; }
+
+  /** Four factory reads per pair, cached by the monitor even if the following log scan fails. */
+  async function discoverV3Pools(request, tokenA, tokenB) {
+    var pair = sortPair(tokenA, tokenB);
+    var pools = await Promise.all(V3_FEE_TIERS.map(async function (fee) {
+      var result = await request("eth_call", [{ to: V3_FACTORY,
+        data: v3FactoryInterface.encodeFunctionData("getPool", [pair.currency0, pair.currency1, fee]) }, "latest"]);
+      var address = v3FactoryInterface.decodeFunctionResult("getPool", result)[0];
+      if (address === ethers.constants.AddressZero) return null;
+      return { protocol: "V3", address: address, poolId: address.toLowerCase(), fee: fee,
+        currency0: pair.currency0, currency1: pair.currency1, tickSpacing: null };
+    }));
+    return pools.filter(function (pool) { return pool !== null; });
+  }
+
+  function decodeV3SwapLog(log) {
+    if (!log || !log.topics || log.topics[0] !== V3_SWAP_TOPIC || log.topics.length !== 3 ||
+      !utils.isHexString(log.data, 160)) fail("not a V3 Swap log");
+    // sender/recipient are indexed. Argument 7 (tick) is DATA word 5, not word 7.
+    var decoded = abi.decode(["int256", "int256", "uint160", "uint128", "int24"], log.data);
+    return { poolId: utils.getAddress(log.address).toLowerCase(),
+      blockNumber: BigNumber.from(log.blockNumber).toNumber(),
+      logIndex: log.logIndex === undefined ? 0 : BigNumber.from(log.logIndex).toNumber(),
+      tick: Number(decoded[4]), sqrtPriceX96: decoded[2], liquidity: decoded[3] };
+  }
+
+  function summariseV3Pools(discovered, logs) {
+    if (!Array.isArray(logs)) fail("eth_getLogs did not return a list");
+    var rows = discovered.map(function (pool) {
+      return Object.assign({}, pool, { swaps: 0, tick: null, price: null, active: false, lastBlock: null, lastIndex: null });
+    });
+    var byId = {};
+    rows.forEach(function (row) { byId[row.poolId] = row; });
+    logs.forEach(function (log) {
+      if (!log || log.removed || !log.address || !log.topics || log.topics[0] !== V3_SWAP_TOPIC) return;
+      var row = byId[log.address.toLowerCase()];
+      if (!row) return;
+      var swap = decodeV3SwapLog(log);
+      row.swaps += 1;
+      row.active = true;
+      if (row.lastBlock === null || swap.blockNumber > row.lastBlock ||
+        (swap.blockNumber === row.lastBlock && swap.logIndex >= row.lastIndex)) {
+        row.lastBlock = swap.blockNumber;
+        row.lastIndex = swap.logIndex;
+        row.tick = swap.tick;
+        row.price = tickToPrice(swap.tick);
+      }
+    });
+    return rows;
+  }
+
+  /** Standard packed V3 path: 20 + hops * 23 bytes (two hops = 66, one hop = 43). */
+  function encodeV3Path(tokens, fees) {
+    if (!Array.isArray(tokens) || !Array.isArray(fees) || !fees.length || tokens.length !== fees.length + 1) {
+      fail("V3 path needs one more token than fees");
+    }
+    var types = ["address"];
+    var values = [recipientAddress(tokens[0])];
+    fees.forEach(function (fee, i) {
+      var token = recipientAddress(tokens[i + 1]);
+      if (token === values[values.length - 1]) fail("adjacent path tokens must differ");
+      types.push("uint24", "address");
+      values.push(v3Fee(fee), token);
+    });
+    return utils.solidityPack(types, values);
+  }
+
+  function buildV3Calldata(args) {
+    var input = uint128(args.amountIn, "amountIn");
+    var minimum = uint128(args.amountOutMinimum, "amountOutMinimum");
+    if (input.isZero() || input.eq(MAX_UINT128) || minimum.isZero()) fail("V3 input and minimum output must be positive");
+    var swap = v3RouterInterface.encodeFunctionData("exactInput", [{
+      path: encodeV3Path(args.tokens, args.fees), recipient: recipientAddress(args.recipient),
+      amountIn: input, amountOutMinimum: minimum,
+    }]);
+    return v3RouterInterface.encodeFunctionData("multicall", [args.deadline, [swap]]);
+  }
+
+  /** Real pool simulation via a reverting creation eth_call. No guessed quoter address or wallet. */
+  async function quoteV3ExactIn(request, args) {
+    var pool = args.pool;
+    var sorted = sortPair(pool.currency0, pool.currency1);
+    if (sorted.currency0 !== utils.getAddress(pool.currency0)) fail("V3 currencies must be sorted");
+    var input = uint128(args.amountIn, "amountIn");
+    if (input.isZero() || input.eq(MAX_UINT128)) fail("amountIn must be a real, non-zero amount");
+    var tokenIn = args.zeroForOne ? sorted.currency0 : sorted.currency1;
+    var tokenOut = args.zeroForOne ? sorted.currency1 : sorted.currency0;
+    var data = V3_QUOTE_BYTECODE + abi.encode(["address", "address", "uint24", "uint128"],
+      [tokenIn, tokenOut, v3Fee(pool.fee), input]).slice(2);
+    try {
+      await request("eth_call", [{ data: data }, "latest"]);
+    } catch (error) {
+      var result = extractRevertData(error);
+      if (result && result.slice(0, 10).toLowerCase() === V3_QUOTE_SELECTOR && utils.hexDataLength(result) === 68) {
+        var decoded = abi.decode(["uint256", "uint256"], "0x" + result.slice(10));
+        if (decoded[1].isZero()) return decoded[1];
+        if (!decoded[0].eq(input)) fail("V3 quote only fills part of the input; reduce the amount");
+        return decoded[1];
+      }
+      throw new Error("V3 quote failed: " + (error.message || String(error)));
+    }
+    fail("V3 quote did not return its expected revert; nothing may be sent");
+  }
+
+  function quotePool(request, pool, zeroForOne, amountIn, from) {
+    return protocolOf(pool) === "V3" ? quoteV3ExactIn(request, { pool: pool, zeroForOne: zeroForOne, amountIn: amountIn }) :
+      quoteExactIn(request, { poolKey: pool.poolKey, zeroForOne: zeroForOne, amountIn: amountIn, from: from });
+  }
+
+  /** Mixed spreads are manual-only. Find the best atomic opportunity across both protocols. */
+  function protocolAutoDecision(pools, thresholdPercent) {
+    var v4 = autoDecision(pools.filter(function (pool) { return protocolOf(pool) === "V4"; }), thresholdPercent);
+    var v3 = autoDecision(pools.filter(function (pool) { return protocolOf(pool) === "V3"; }), thresholdPercent);
+    v3.skips.forEach(function (skip) {
+      skip.reason = skip.reason.replace(/pool (\d+)\/(?:null|undefined) /, function (_, fee) {
+        return "V3 pool " + formatV3Fee(fee) + " ";
+      }).replace("sqrtPriceX96 = 0", "liquidity = 0");
+    });
+    var best = [v4.spread, v3.spread].filter(Boolean).sort(function (a, b) { return b.netPercent - a.netPercent; });
+    return { spread: best[0] || null, skips: v4.skips.concat(v3.skips) };
+  }
+
   function fail(message) {
     throw new Error("V4ArbEncoder: " + message);
   }
@@ -744,6 +899,7 @@
 
     function freshState() {
       return { pair: null, pools: [], spreads: [], blockNumber: null, blockTimestamp: null, fromBlock: null,
+        protocol: normaliseProtocol(options.protocol || "V4"), v3Pools: null,
         windowBlocks: null, lastPoll: null,
         lastError: null, retryAt: null, nextPollMs: null, polls: 0, errors: 0 };
     }
@@ -799,6 +955,20 @@
       ]);
     }
 
+    async function readV3PoolHealth(pool, latest) {
+      await Promise.all([
+        readBlock(utils.hexValue(pool.lastBlock)).then(function (block) {
+          pool.swapTimestamp = block.timestamp;
+          pool.elapsedSeconds = Math.max(0, latest.timestamp - block.timestamp);
+        }, function (error) { pool.healthError = "swap block read failed: " + messageOf(error); }),
+        request("eth_call", [{ to: pool.address, data: v3PoolInterface.encodeFunctionData("liquidity") },
+          utils.hexValue(latest.number)]).then(function (result) {
+          pool.liquidity = v3PoolInterface.decodeFunctionResult("liquidity", result)[0];
+          pool.empty = pool.liquidity.isZero();
+        }).catch(function (error) { pool.healthError = "liquidity read failed: " + messageOf(error); }),
+      ]);
+    }
+
     /** One scan: latest block, Swap logs of the seven pools over the window, pool health, table and spreads. */
     async function pollOnce() {
       if (!tokens) fail("start(tokenA, tokenB) first");
@@ -806,16 +976,29 @@
       var current = state;
       var blocks = readWindow();
       var pair = current.pair || await loadPair(tokens[0], tokens[1]);
+      if (current.protocol !== "V4") {
+        current.pair = pair;
+        if (current.v3Pools === null) current.v3Pools = await discoverV3Pools(request, pair.currency0, pair.currency1);
+      }
       var latest = await readBlock("latest");
       var fromBlock = Math.max(0, latest.number - (blocks - 1));
-      var logs = await request("eth_getLogs", [{
+      var logs = current.protocol === "V3" ? [] : await request("eth_getLogs", [{
         address: POOL_MANAGER,
         fromBlock: utils.hexValue(fromBlock),
         toBlock: utils.hexValue(latest.number),
         topics: [SWAP_TOPIC, pair.keys.map(poolId)],
       }]);
       if (!Array.isArray(logs)) fail("eth_getLogs did not return a list");
-      var pools = summarisePools(pair.keys, logs);
+      var pools = current.protocol === "V3" ? [] : summarisePools(pair.keys, logs);
+      pools.forEach(function (pool) { pool.protocol = "V4"; });
+      if (current.protocol !== "V4") {
+        // Never send address: []: some nodes interpret an empty filter as ALL addresses.
+        var v3Logs = current.v3Pools.length ? await request("eth_getLogs", [{
+          address: current.v3Pools.map(function (pool) { return pool.address; }), topics: [V3_SWAP_TOPIC],
+          fromBlock: utils.hexValue(fromBlock), toBlock: utils.hexValue(latest.number),
+        }]) : [];
+        pools = pools.concat(summariseV3Pools(current.v3Pools, v3Logs));
+      }
       var scale = Math.pow(10, pair.decimals0 - pair.decimals1);
       pools.forEach(function (pool) {
         pool.displayPrice = pool.price === null ? null : pool.price * scale;
@@ -825,12 +1008,12 @@
         pool.healthError = null;
       });
       await Promise.all(pools.filter(function (pool) { return pool.active; }).map(function (pool) {
-        return readPoolHealth(pool, latest);
+        return protocolOf(pool) === "V3" ? readV3PoolHealth(pool, latest) : readPoolHealth(pool, latest);
       }));
       annotatePools(pools, maxStaleness());
       current.pair = pair;
       current.pools = pools;
-      current.spreads = rankSpreads(pools, threshold());
+      current.spreads = rankSpreads(pools, threshold(), current.protocol === "Both" ? Infinity : 5);
       current.blockNumber = latest.number;
       current.blockTimestamp = latest.timestamp;
       current.fromBlock = fromBlock;
@@ -871,11 +1054,12 @@
       timer = null;
     }
 
-    function start(tokenA, tokenB) {
+    function start(tokenA, tokenB, protocol) {
       stop();
       sortPair(tokenA, tokenB); // validate synchronously so a bad pair never starts a loop
       tokens = [tokenA, tokenB];
       state = freshState();
+      if (protocol !== undefined) state.protocol = normaliseProtocol(protocol);
       running = true;
       return cycle();
     }
@@ -1157,6 +1341,226 @@
       return submit(candidate.transaction, expected, "Swap");
     }
 
+    // -------------------------------------------------------------- V3 and mixed execution
+    // The V4 encoder, Permit2 APIs and prepareSwap/sendSwap above remain unchanged.
+    function routeSnapshot(args) {
+      if (!args || !args.buy || !args.sell) fail("select both route pools");
+      function snapshot(pool) {
+        var protocol = protocolOf(pool);
+        if (protocol === "V4") return Object.freeze({ protocol: protocol, poolKey: Object.freeze(normalisePoolKey(pool.poolKey)),
+          poolId: poolId(pool.poolKey) });
+        if (protocol !== "V3") fail("unknown pool protocol");
+        var sorted = sortPair(pool.currency0, pool.currency1);
+        if (sorted.currency0 !== utils.getAddress(pool.currency0)) fail("V3 currencies must be sorted");
+        return Object.freeze({ protocol: protocol, address: recipientAddress(pool.address),
+          currency0: sorted.currency0, currency1: sorted.currency1, fee: v3Fee(pool.fee) });
+      }
+      var buy = snapshot(args.buy);
+      var sell = snapshot(args.sell);
+      var a = buy.poolKey || buy;
+      var b = sell.poolKey || sell;
+      if (a.currency0 !== b.currency0 || a.currency1 !== b.currency1) fail("both pools must trade the same pair");
+      if (buy.protocol === sell.protocol && (buy.protocol === "V3" ? buy.fee === sell.fee || buy.address === sell.address : buy.poolId === sell.poolId)) {
+        fail("buy and sell pool are the same pool");
+      }
+      var input = uint128(args.usdgIn, "usdgIn");
+      var bridge = uint128(args.ponsAmount, "ponsAmount");
+      var minimum = uint128(args.minUsdgOut, "minUsdgOut");
+      if (input.isZero() || bridge.isZero() || input.eq(MAX_UINT128) || bridge.eq(MAX_UINT128)) fail("input and bridge amounts must be positive and below uint128 max");
+      if ((buy.protocol === "V3" || sell.protocol === "V3") && minimum.isZero()) fail("a quoted minimum return is required for V3 routes");
+      return Object.freeze({ buy: buy, sell: sell, usdgIn: input, ponsAmount: bridge, minUsdgOut: minimum,
+        pair: Object.freeze(resolvePair({ currency0: a.currency0, currency1: a.currency1,
+          symbol0: args.pair && args.pair.symbol0, symbol1: args.pair && args.pair.symbol1 })),
+        mixed: buy.protocol !== sell.protocol, deadline: args.deadline });
+    }
+
+    function routeApprovals(route) {
+      var entries = [{ protocol: route.buy.protocol, token: route.pair.currency1, amount: route.usdgIn }];
+      // V3 exactInput carries the whole output between its hops inside the router.
+      if (route.mixed || route.buy.protocol === "V4") entries.push({ protocol: route.sell.protocol,
+        token: route.pair.currency0, amount: route.ponsAmount });
+      return entries;
+    }
+
+    async function tokenAllowance(expected, token, spender) {
+      var result = await request("eth_call", [{ to: token,
+        data: tokenInterface.encodeFunctionData("allowance", [expected.account, spender]) }, "latest"]);
+      return tokenInterface.decodeFunctionResult("allowance", result)[0];
+    }
+
+    async function checkRouteAllowances(route, deadline, expected) {
+      await assertSession(expected);
+      for (var entry of routeApprovals(route)) {
+        var spender = entry.protocol === "V3" ? V3_ROUTER : PERMIT2;
+        if ((await tokenAllowance(expected, entry.token, spender)).lt(entry.amount)) {
+          fail(labelFor(entry.token, route.pair) + " ERC20 allowance to " + (entry.protocol === "V3" ? "V3 Router is too low; click APPROVE V3 ROUTER" : "Permit2 is too low"));
+        }
+        if (entry.protocol === "V4") {
+          var permit = await readPermit2(expected.account, entry.token);
+          if (permit.amount.lt(entry.amount) || BigNumber.from(permit.expiration).lt(deadline)) fail("Permit2 allowance is insufficient or expires too soon; click APPROVE PERMIT2");
+        }
+      }
+      await assertSession(expected);
+    }
+
+    async function approveRouteV3(args) {
+      var route = routeSnapshot(args);
+      var expected = session;
+      prepared = null;
+      await assertSession(expected);
+      await requireCode(V3_ROUTER);
+      for (var entry of routeApprovals(route).filter(function (entry) { return entry.protocol === "V3"; })) {
+        var limit = entry.amount.mul(100);
+        var allowed = await tokenAllowance(expected, entry.token, V3_ROUTER);
+        if (allowed.gte(limit)) { status("V3 Router allowance already sufficient; skipped"); continue; }
+        await requireCode(entry.token);
+        // Support tokens requiring zero before changing a nonzero allowance. Each receipt gates the next prompt.
+        var amounts = allowed.isZero() ? [limit] : [BigNumber.from(0), limit];
+        for (var amount of amounts) {
+          var transaction = { from: expected.account, to: entry.token, value: "0x0", chainId: utils.hexValue(CHAIN_ID),
+            data: v3TokenInterface.encodeFunctionData("approve", [V3_ROUTER, amount]) };
+          await assertSession(expected);
+          var result = await request("eth_call", [transaction, "latest"]);
+          if (result !== "0x" && !abi.decode(["bool"], result)[0]) fail("Token refused V3 approval");
+          await submit(transaction, expected, labelFor(entry.token, route.pair) + " V3 Router approval");
+        }
+        if ((await tokenAllowance(expected, entry.token, V3_ROUTER)).lt(limit)) fail("V3 Router allowance did not update after confirmation");
+      }
+      await assertSession(expected);
+    }
+
+    async function approveRoutePermit2(args, expiration) {
+      var route = routeSnapshot(args);
+      var expected = session;
+      prepared = null;
+      await assertSession(expected);
+      var until = (await timestamp()) + 1200;
+      if (BigNumber.from(expiration).lt(until)) fail("approval expiration must cover the next 20 minutes");
+      for (var entry of routeApprovals(route).filter(function (entry) { return entry.protocol === "V4"; })) {
+        var limit = entry.amount.mul(100);
+        encodePermit2Approve(entry.token, ROUTER, limit, expiration);
+        if ((await tokenAllowance(expected, entry.token, PERMIT2)).lt(entry.amount)) fail("ERC20 allowance to Permit2 is too low; approve the token to Permit2 first");
+        var allowed = await readPermit2(expected.account, entry.token);
+        if (allowed.amount.gte(limit) && BigNumber.from(allowed.expiration).gte(until)) {
+          status("Permit2 allowance already sufficient; skipped"); continue;
+        }
+        await approveForSession(entry.token, ROUTER, limit, expiration, expected, route.pair);
+      }
+      await assertSession(expected);
+    }
+
+    function routeTransactions(route, recipient, deadline) {
+      function transaction(to, data) { return Object.freeze({ from: recipient, to: to, data: data,
+        value: "0x0", chainId: utils.hexValue(CHAIN_ID) }); }
+      if (!route.mixed) {
+        return [transaction(V3_ROUTER, buildV3Calldata({ tokens: [route.pair.currency1, route.pair.currency0, route.pair.currency1],
+          fees: [route.buy.fee, route.sell.fee], recipient: recipient, deadline: deadline,
+          amountIn: route.usdgIn, amountOutMinimum: route.minUsdgOut }))];
+      }
+      return [route.buy, route.sell].map(function (pool, index) {
+        var input = index === 0 ? route.usdgIn : route.ponsAmount;
+        var minimum = index === 0 ? route.ponsAmount : route.minUsdgOut;
+        if (pool.protocol === "V3") return transaction(V3_ROUTER, buildV3Calldata({
+          tokens: index === 0 ? [route.pair.currency1, route.pair.currency0] : [route.pair.currency0, route.pair.currency1],
+          fees: [pool.fee], recipient: recipient, deadline: deadline, amountIn: input, amountOutMinimum: minimum }));
+        return transaction(ROUTER, encodeExecute(COMMAND_V4_SWAP, [encodeV4Swap({ poolKey: pool.poolKey,
+          zeroForOne: index === 1, amountIn: input, amountOutMinimum: minimum, recipient: recipient })], deadline));
+      });
+    }
+
+    async function validateV3Pools(route) {
+      for (var pool of [route.buy, route.sell].filter(function (pool) { return pool.protocol === "V3"; })) {
+        var result = await request("eth_call", [{ to: V3_FACTORY,
+          data: v3FactoryInterface.encodeFunctionData("getPool", [pool.currency0, pool.currency1, pool.fee]) }, "latest"]);
+        if (v3FactoryInterface.decodeFunctionResult("getPool", result)[0] !== pool.address) fail("V3 pool no longer matches factory discovery; restart the monitor");
+      }
+    }
+
+    async function prepareRoute(args) {
+      var route = routeSnapshot(args);
+      if (route.buy.protocol === "V4" && route.sell.protocol === "V4") return prepareSwap({
+        usdgIn: route.usdgIn, ponsAmount: route.ponsAmount, minUsdgOut: route.minUsdgOut,
+        buyPool: route.buy.poolKey, sellPool: route.sell.poolKey, pair: route.pair, deadline: route.deadline,
+      });
+      prepared = null;
+      var expected = session;
+      await assertSession(expected);
+      var now = await timestamp();
+      var deadline = route.deadline === undefined ? now + 1200 : BigNumber.from(route.deadline).toNumber();
+      if (deadline <= now) fail("Swap deadline has expired; build and dry run again");
+      await requireCode(V3_ROUTER);
+      if (route.mixed) await requireCode(ROUTER);
+      await validateV3Pools(route);
+      await checkRouteAllowances(route, deadline, expected);
+      var transactions = Object.freeze(routeTransactions(route, expected.account, deadline));
+      // Mixed leg 2 is simulated only AFTER leg 1 confirms: its funds do not exist yet.
+      await request("eth_call", [transactions[0], "latest"]);
+      await assertSession(expected);
+      prepared = Object.freeze({ route: route, transactions: transactions, transaction: transactions[0], deadline: deadline });
+      status(route.mixed ? "First leg dry run succeeded; second leg will be simulated after its funds arrive" : "V3 atomic dry run succeeded");
+      return prepared;
+    }
+
+    async function sendRoute(candidate) {
+      if (candidate && !candidate.route) return sendSwap(candidate);
+      if (!candidate || candidate !== prepared) fail("Build and dry run this swap first");
+      prepared = null;
+      var expected = session;
+      var firstReceipt = null;
+      var submittedHashes = [];
+      async function submitLeg(transaction, label) {
+        await assertSession(expected);
+        var hash = await request("eth_sendTransaction", [transaction]);
+        submittedHashes.push(hash);
+        status(label + " submitted: " + hash);
+        try {
+          var receipt = await waitReceipt(hash, expected);
+          status(label + " confirmed: " + hash);
+          return receipt;
+        } catch (error) {
+          // A wallet/network change or RPC failure after submission leaves confirmation unknown.
+          // Preserve the hash just as for a timeout; never silently restart either mixed leg.
+          if (!/Transaction reverted:/.test(error.message)) error.pendingHash = hash;
+          throw error;
+        }
+      }
+      try {
+        await assertSession(expected);
+        if ((await timestamp()) >= candidate.deadline) fail("Swap deadline has expired; build and dry run again");
+        await checkRouteAllowances(candidate.route, candidate.deadline, expected);
+        var before = candidate.route.mixed ? (await readBalances([candidate.route.pair.currency0], expected.account)).tokens[0] : null;
+        await request("eth_call", [candidate.transactions[0], "latest"]);
+        firstReceipt = await submitLeg(candidate.transactions[0], candidate.route.mixed ? "Mixed leg 1" : "V3 atomic swap");
+        if (!candidate.route.mixed) return firstReceipt;
+        await assertSession(expected);
+        var after = (await readBalances([candidate.route.pair.currency0], expected.account)).tokens[0];
+        if (after.lt(before.add(candidate.route.ponsAmount))) fail("Bridge balance increase is below the minimum; second leg stopped");
+        if ((await timestamp()) >= candidate.deadline) fail("Deadline expired after leg 1; second leg stopped");
+        // Only the second leg's allowance remains necessary; the first may now be spent.
+        var sell = candidate.route.sell;
+        var token = candidate.route.pair.currency0;
+        var spender = sell.protocol === "V3" ? V3_ROUTER : PERMIT2;
+        if ((await tokenAllowance(expected, token, spender)).lt(candidate.route.ponsAmount)) fail("Second leg allowance is insufficient");
+        if (sell.protocol === "V4") {
+          var permit = await readPermit2(expected.account, token);
+          if (permit.amount.lt(candidate.route.ponsAmount) || BigNumber.from(permit.expiration).lt(candidate.deadline)) fail("Second leg Permit2 allowance expired or is insufficient");
+        }
+        await request("eth_call", [candidate.transactions[1], "latest"]);
+        var receipt = await submitLeg(candidate.transactions[1], "Mixed leg 2");
+        return Object.assign({}, receipt, { firstLegHash: firstReceipt.transactionHash });
+      } catch (error) {
+        if (candidate.route.mixed && firstReceipt) {
+          error.firstLegHash = firstReceipt.transactionHash;
+          error.message = "Leg 1 confirmed (" + firstReceipt.transactionHash + "). Leg 2 did not confirm; check both hashes and the wallet's bridge balance before taking further action. " + error.message;
+          status(error.message);
+        } else if (candidate.route.mixed && submittedHashes.length && error.pendingHash) {
+          error.message = "Leg 1 submitted (" + submittedHashes[0] + "), but confirmation was interrupted. Check its receipt before retrying the route. " + error.message;
+          status(error.message);
+        }
+        throw error;
+      }
+    }
+
     function transferTarget(to, expected) {
       var target = recipientAddress(to);
       if (target === expected.account) fail("The new wallet must differ from the connected account");
@@ -1216,6 +1620,7 @@
     }
 
     return { connect: connect, timestamp: timestamp, approvePermit2: approvePermit2,
+      prepareRoute: prepareRoute, sendRoute: sendRoute, approveRouteV3: approveRouteV3, approveRoutePermit2: approveRoutePermit2,
       approveBothPermit2: approveBothPermit2, checkTokenAllowances: checkTokenAllowances,
       checkAllowances: checkAllowances, prepareSwap: prepareSwap, sendSwap: sendSwap,
       readBalances: readBalances, transferAllToken: transferAllToken, transferAllEth: transferAllEth,
@@ -1233,6 +1638,22 @@
   }
 
   return {
+    V3_FACTORY: V3_FACTORY,
+    V3_ROUTER: V3_ROUTER,
+    WETH: WETH,
+    V3_FEE_TIERS: V3_FEE_TIERS,
+    V3_SWAP_TOPIC: V3_SWAP_TOPIC,
+    V3_QUOTE_SELECTOR: V3_QUOTE_SELECTOR,
+    protocolOf: protocolOf,
+    formatV3Fee: formatV3Fee,
+    discoverV3Pools: discoverV3Pools,
+    decodeV3SwapLog: decodeV3SwapLog,
+    summariseV3Pools: summariseV3Pools,
+    encodeV3Path: encodeV3Path,
+    buildV3Calldata: buildV3Calldata,
+    quoteV3ExactIn: quoteV3ExactIn,
+    quotePool: quotePool,
+    protocolAutoDecision: protocolAutoDecision,
     ROUTER: ROUTER,
     PERMIT2: PERMIT2,
     POOL_MANAGER: POOL_MANAGER,
