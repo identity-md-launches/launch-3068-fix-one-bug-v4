@@ -2,39 +2,69 @@
 
 // Execute the actual inline page script and local scripts with a minimal DOM. No browser/npm/network needed.
 // These are event-handler tests; they do not claim to test browser rendering or a real wallet extension.
+// Timers of 5 s or more (the 30 s poll, the 60 s retry) are recorded and fired by the test; shorter
+// ones (receipt polling) run immediately.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const { MockWallet, CALLER } = require("./mock-wallet.js");
+const { MockWallet, CALLER, OTHER, erc20 } = require("./mock-wallet.js");
 const { ethers } = require("../vendor/ethers-5.7.2.umd.min.js");
 const E = require("../v4-arb-encoder.js");
 
-function loadPage(provider = new MockWallet()) {
+function node(tag, attributes = {}) {
+  return {
+    tagName: tag,
+    textContent: "",
+    value: attributes.value || "",
+    disabled: attributes.disabled || false,
+    checked: attributes.checked || false,
+    className: "",
+    children: [],
+    listeners: {},
+    addEventListener(event, listener) { this.listeners[event] = listener; },
+    appendChild(child) { this.children.push(child); },
+    replaceChildren() { this.children = []; },
+    async click() { if (!this.disabled && this.listeners.click) return this.listeners.click(); },
+    input(value) { this.value = value; return this.listeners.input && this.listeners.input(); },
+    change(checked) { this.checked = checked; return this.listeners.change && this.listeners.change(); },
+    text() { return this.children.map((c) => c.textContent).join(" | "); },
+  };
+}
+
+function loadPage(provider = new MockWallet(), { noWallet = false } = {}) {
   const root = path.resolve(__dirname, "../..");
   const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
   const elements = new Map();
   for (const match of html.matchAll(/<\w+\b[^>]*\bid="([^"]+)"[^>]*>/g)) {
     const tag = match[0];
-    elements.set(match[1], {
-      textContent: "",
+    const created = node(/^<(\w+)/.exec(tag)[1], {
       value: /\bvalue="([^"]*)"/.exec(tag)?.[1] || "",
       disabled: /\bdisabled\b/.test(tag),
-      className: "",
-      listeners: {},
-      addEventListener(event, listener) { this.listeners[event] = listener; },
-      async click() { if (!this.disabled) return this.listeners.click(); },
-      input(value) { this.value = value; return this.listeners.input(); },
+      checked: /\bchecked\b/.test(tag),
     });
+    created.textContent = (/^([^<]*)</.exec(html.slice(match.index + tag.length))?.[1] || "").trim();
+    elements.set(match[1], created);
   }
-  const document = { getElementById: (id) => {
-    assert.ok(elements.has(id), "Missing DOM element " + id);
-    return elements.get(id);
-  } };
-  const context = vm.createContext({ document, window: { ethereum: provider, crypto: globalThis.crypto },
-    // Zero-delay scheduling exercises receipt polling without real-time waits.
-    setTimeout: (fn) => setTimeout(fn, 0), clearTimeout, console, atob, btoa });
+  const document = {
+    getElementById: (id) => { assert.ok(elements.has(id), "Missing DOM element " + id); return elements.get(id); },
+    createElement: (tag) => node(tag),
+  };
+  const timers = [];
+  let nextId = 1;
+  // Each Date.now() call advances the clock 10 s, so the two-minute receipt timeout needs twelve polls, not real time.
+  let clock = 1762500000000;
+  class FakeDate extends Date { static now() { clock += 10000; return clock; } }
+  const context = vm.createContext({
+    document,
+    window: { ethereum: noWallet ? undefined : provider, crypto: globalThis.crypto, fetch: provider.fetch },
+    fetch: provider.fetch,
+    // Short delays run now (receipt polling); long ones (poll / retry) are fired by the test.
+    setTimeout: (fn, ms) => { if (ms >= 5000) { const id = nextId++; timers.push({ id, fn, ms }); return id; } return setImmediate(fn); },
+    clearTimeout: (id) => { const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); else clearImmediate(id); },
+    console, atob, btoa, Date: FakeDate, JSON, Math, Number, BigInt, RegExp, String, Object, Array, Promise, Error,
+  });
   for (const script of html.matchAll(/<script([^>]*)>([\s\S]*?)<\/script>/g)) {
     const src = /\bsrc="([^"]+)"/.exec(script[1])?.[1];
     if (src) {
@@ -44,95 +74,391 @@ function loadPage(provider = new MockWallet()) {
       } catch (error) { throw new Error(src + ": " + error.message); }
     } else vm.runInContext(script[2], context, { filename: "index.html:inline" });
   }
-  return { provider, element: document.getElementById, context, html };
+  const flush = async (turns = 40) => { for (let i = 0; i < turns; i++) await new Promise((resolve) => setImmediate(resolve)); };
+  const until = async (predicate, what = "condition") => {
+    for (let i = 0; i < 400; i++) { if (predicate()) return; await new Promise((resolve) => setImmediate(resolve)); }
+    throw new Error("Timed out waiting for " + what);
+  };
+  // Fire the pending poll timer and wait for the cycle to schedule the next one.
+  const poll = async () => {
+    const due = timers.splice(0);
+    assert.ok(due.length, "no poll scheduled");
+    for (const t of due) t.fn();
+    await until(() => timers.length > 0, "the next poll to be scheduled");
+    await flush(5);
+  };
+  return { provider, element: document.getElementById, context, html, timers, flush, until, poll };
 }
 
-async function approvedPage() {
-  const page = loadPage();
-  await page.element("connect").click();
-  await page.element("approve-permit2").click();
+/** A page whose first poll has finished. */
+async function readyPage(provider = new MockWallet()) {
+  const page = loadPage(provider);
+  await page.until(() => page.timers.length > 0, "first poll");
+  await page.flush(5);
   return page;
 }
 
-test("page loads offline, makes no wallet calls on load, and sends only after approve + dry run + send clicks", async () => {
-  const { provider, element, html } = loadPage();
+/** Three active pools: 3000/60 is cheapest, 30000/600 dearest; the best spread is GREEN at 0.5%. */
+function withActivePools(provider = new MockWallet()) {
+  provider.addSwap(3000, 60, -292916);
+  provider.addSwap(2500, 25, -292902);
+  provider.addSwap(30000, 600, -292000);
+  provider.quotes.set(E.poolId({ currency0: E.PONS, currency1: E.USDG, fee: 30000, tickSpacing: 600, hooks: E.NO_HOOKS }),
+    ethers.BigNumber.from("5000000000000000000000000000000000000000000000000"));
+  return provider;
+}
+
+test("page loads offline, polls the public RPC without any wallet call, and shows seven inactive pools", async () => {
+  const { provider, element, html, timers } = await readyPage();
   assert.ok(html.includes("APPROVE PERMIT2 (one-time)"));
+  assert.ok(html.includes("CONNECT WALLET"));
+  assert.ok(html.includes("TRANSFER TO NEW WALLET"));
+  assert.ok(html.includes("Sends ALL of this asset to the new address. Cannot undo."));
   assert.equal(provider.calls.length, 0);
+  assert.ok(provider.rpcCalls.some((c) => c.method === "eth_getLogs"));
+  assert.ok(provider.rpcCalls.every((c) => c.url === E.RPC_URL));
+  assert.equal(element("pools-body").children.length, 7);
+  assert.deepEqual(element("pools-body").children.map((row) => row.children[0].textContent), ["0", "0", "500", "2500", "3000", "10000", "30000"]);
+  assert.ok(element("pools-body").children.every((row) => row.children[4].textContent.startsWith("no")));
+  assert.equal(element("spreads-body").children.length, 0);
+  assert.match(element("spreads-note").textContent, /at least two active/);
+  assert.match(element("poll-status").textContent, /Last poll .* block 108394834 .* window 108394735–108394834/);
+  assert.match(element("pair-info").textContent, /Token A PONS · Token B USDG · currency0 = PONS/);
+  assert.deepEqual(timers.map((t) => t.ms), [E.POLL_INTERVAL_MS]);
   assert.equal(element("send").disabled, true);
+  assert.equal(element("dry-run").disabled, true);
   assert.equal(element("approve-permit2").disabled, true);
+  assert.equal(element("transfer-a").disabled, true);
+  assert.equal(element("bal-a").textContent, "—");
+});
+
+test("active pools render prices and the top spreads; the full flow runs with the selected pools and updates balances", async () => {
+  const { provider, element, poll, flush } = await readyPage(withActivePools());
+  await poll();
+  const rows = element("pools-body").children;
+  assert.match(rows[4].children[2].textContent, /^0\.19030[0-9]* \(tick -292916\)$/);
+  assert.equal(rows[4].children[3].textContent, "1");
+  assert.equal(rows[4].children[4].textContent, "yes");
+  assert.equal(rows[0].children[2].textContent, "—");
+  const spreads = element("spreads-body").children;
+  assert.equal(spreads.length, 3);
+  assert.equal(spreads[0].children[0].textContent, "3000 / 60");
+  assert.equal(spreads[0].children[1].textContent, "30000 / 600");
+  assert.equal(spreads[0].children[3].textContent, "3.300");
+  assert.equal(spreads[0].children[5].textContent, "GREEN");
+  assert.equal(spreads[2].children[5].textContent, "RED");
+  assert.match(element("spreads-note").textContent, /3 spread\(s\) from 3 active pool\(s\)/);
+
+  // Click the best row: the pool keys are filled and swap 1 is quoted through the public RPC.
+  await spreads[0].click();
+  await flush();
+  const selected = JSON.parse(element("selected-pools").textContent);
+  assert.equal(selected.buyPool.fee, 3000);
+  assert.equal(selected.buyPool.tickSpacing, 60);
+  assert.equal(selected.sellPool.fee, 30000);
+  assert.equal(selected.buyPool.currency0, ethers.utils.getAddress(E.PONS));
+  assert.equal(element("bridge-amount").value, "0.052096879755458694");
+  assert.match(element("quote-info").textContent, /Swap 1 quote: 0\.01 USDG → 0\.052358673121064015 PONS on pool 3000 \/ 60/);
+  assert.equal(provider.calls.length, 0); // still no wallet involvement
+  assert.equal(element("dry-run").disabled, true); // not connected yet
+
   await element("connect").click();
   assert.equal(element("account").textContent, CALLER);
-  assert.equal(element("send").disabled, true);
+  assert.equal(element("bal-a").textContent, "1.5 PONS");
+  assert.equal(element("bal-b").textContent, "25.0 USDG");
+  assert.equal(element("bal-eth").textContent, "0.2 ETH");
+  assert.match(element("transfer-balances").textContent, /1\.5 PONS · 25\.0 USDG · 0\.2 ETH/);
+  assert.equal(element("dry-run").disabled, false);
+  assert.match(element("approval-limits").textContent, /1\.0 USDG and 5\.2096879755458694 PONS/);
   await element("approve-permit2").click();
   assert.equal(provider.sent.length, 2);
   assert.match(element("status").textContent, /allowances are ready/);
-  assert.equal(element("send").disabled, true);
+  assert.match(element("activity").textContent, /USDG Permit2 approval confirmed:/);
+  assert.match(element("activity").textContent, /PONS Permit2 approval confirmed:/);
   await element("dry-run").click();
   assert.match(element("status").textContent, /Dry run succeeded/);
-  assert.equal(element("send").disabled, false);
   const data = element("calldata").textContent;
   assert.equal(data, E.buildCalldata({
     usdgIn: ethers.utils.parseUnits("0.01", 6),
-    ponsAmount: ethers.utils.parseUnits("0.001", 18),
+    ponsAmount: "52096879755458694",
     minUsdgOut: 0,
     recipient: CALLER,
     deadline: provider.now + 1200,
+    buyPool: { currency0: E.PONS, currency1: E.USDG, fee: 3000, tickSpacing: 60, hooks: E.NO_HOOKS },
+    sellPool: { currency0: E.PONS, currency1: E.USDG, fee: 30000, tickSpacing: 600, hooks: E.NO_HOOKS },
   }));
-  assert.equal(provider.sent.length, 2);
+  assert.equal(element("send").disabled, false);
   await element("send").click();
   assert.equal(provider.sent.length, 3);
   assert.equal(provider.sent[2].data, data);
   assert.match(element("status").textContent, /Swap confirmed:/);
-  assert.match(element("activity").textContent, /USDG Permit2 approval confirmed:/);
-  assert.match(element("activity").textContent, /PONS Permit2 approval confirmed:/);
+  assert.equal(element("bal-b").textContent, "24.99 USDG"); // refreshed after the receipt
   assert.equal(element("send").disabled, true);
+});
+
+test("a buy pool without liquidity warns 'no liquidity' and keeps sending disabled", async () => {
+  const provider = new MockWallet();
+  provider.addSwap(30000, 600, -293500); // cheapest, but empty on the router
+  provider.addSwap(3000, 60, -292916);
+  const { element, poll, flush } = await readyPage(provider);
+  await poll();
+  await element("connect").click();
+  const row = element("spreads-body").children[0];
+  assert.equal(row.children[0].textContent, "30000 / 600");
+  await row.click();
+  await flush();
+  assert.match(element("quote-info").textContent, /Warning: no liquidity/);
+  assert.equal(element("quote-info").className, "error");
+  assert.match(element("status").textContent, /No liquidity/);
+  assert.equal(element("dry-run").disabled, true);
+  assert.equal(element("approve-permit2").disabled, true);
+  assert.equal(element("send").disabled, true);
+  assert.equal(element("bridge-amount").value, "");
+  assert.equal(provider.sent.length, 0);
+});
+
+test("RPC errors show the 60 s retry in the status bar and polling continues afterwards", async () => {
+  const { provider, element, timers, poll } = await readyPage();
+  provider.rpcFailures = 1;
+  await poll();
+  assert.match(element("poll-status").textContent, /^RPC error, retrying in 60s — RPC error: rate limited · last successful poll/);
+  assert.equal(element("poll-status").className, "error");
+  assert.deepEqual(timers.map((t) => t.ms), [E.RPC_RETRY_MS]);
+  assert.equal(element("pools-body").children.length, 7);
+  provider.httpFailures = 1;
+  await poll();
+  assert.match(element("poll-status").textContent, /RPC error, retrying in 60s — .*HTTP error 429/);
+  assert.deepEqual(timers.map((t) => t.ms), [E.RPC_RETRY_MS]);
+  provider.block += 10;
+  await poll();
+  assert.match(element("poll-status").textContent, /Last poll .* block 108394844/);
+  assert.equal(element("poll-status").className, "success");
+  assert.deepEqual(timers.map((t) => t.ms), [E.POLL_INTERVAL_MS]);
+});
+
+test("auto mode executes a GREEN spread once, never double-fires while a receipt is pending, and resumes after it", async () => {
+  const { provider, element, poll, flush, until } = await readyPage(withActivePools());
+  await poll();
+  await element("connect").click();
+  await element("spreads-body").children[0].click();
+  await flush();
+  await element("approve-permit2").click();
+  assert.equal(provider.sent.length, 2);
+
+  // Hold the swap's receipt until released; the poll keeps firing meanwhile.
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  provider.beforeRequest = async ({ method, params }) => {
+    if (method === "eth_getTransactionReceipt" && params[0] === ethers.utils.hexZeroPad("0x03", 32)) await gate;
+  };
+  await element("auto-mode").change(true);
+  await until(() => provider.sent.length === 3, "the auto-mode swap to be submitted");
+  assert.match(element("activity").textContent, /Auto mode: best spread 3000 \/ 60 → 30000 \/ 600 net 6\.\d+% is above the threshold; executing/);
+  await poll();
+  await poll();
+  assert.equal(provider.sent.length, 3, "no second swap while the first receipt is pending");
+  assert.equal(element("send").disabled, true);
+  release();
+  await until(() => /Swap confirmed/.test(element("status").textContent), "the swap receipt");
+  assert.equal(element("auto-mode").checked, true);
+  provider.beforeRequest = null;
+  await poll();
+  await until(() => provider.sent.length === 4, "the next auto-mode swap");
+  await until(() => /Swap confirmed/.test(element("status").textContent) && element("send").disabled, "second receipt");
+  assert.equal(provider.sent[3].to, E.ROUTER);
+
+  // Off: polls no longer send.
+  await element("auto-mode").change(false);
+  await poll();
+  await flush();
+  assert.equal(provider.sent.length, 4);
+});
+
+test("auto mode respects the threshold, turns itself off after a failure, and stays off after a timed-out receipt", async () => {
+  const { provider, element, poll, flush, until } = await readyPage(withActivePools());
+  await poll();
+  await element("connect").click();
+  await element("spreads-body").children[0].click();
+  await flush();
+  await element("approve-permit2").click();
+  element("threshold").input("10"); // best net is about 6.3%
+  assert.equal(element("spreads-body").children[0].children[5].textContent, "RED");
+  await element("auto-mode").change(true);
+  await poll();
+  await flush();
+  assert.equal(provider.sent.length, 2);
+  assert.equal(element("auto-mode").checked, true);
+
+  element("threshold").input("abc");
+  assert.match(element("auto-status").textContent, /non-negative number.*Using 0\.5%/);
+  element("threshold").input("1");
+  provider.failRouterCall = provider.routerCalls + 1; // the dry run fails
+  await poll();
+  await until(() => element("auto-mode").checked === false, "auto mode to switch off");
+  assert.match(element("auto-status").textContent, /turned OFF after a failed attempt/);
+  assert.match(element("activity").textContent, /pool unavailable/);
+  assert.equal(provider.sent.length, 2);
+  await poll();
+  await flush();
+  assert.equal(provider.sent.length, 2);
+
+  // A receipt that never arrives blocks auto mode until it is switched on again.
+  provider.neverMine = true;
+  await element("auto-mode").change(true);
+  await until(() => provider.sent.length === 3, "a swap submission");
+  await until(() => /may still be pending/.test(element("status").textContent), "the receipt timeout");
+  assert.equal(element("auto-mode").checked, false);
+  assert.match(element("activity").textContent, /Pending transaction 0x0+3: auto mode stays off/);
+  provider.neverMine = false;
+  await poll();
+  await flush();
+  assert.equal(provider.sent.length, 3);
+}, { timeout: 180000 });
+
+test("changing the pair restarts polling for the new tokens; a bad address is reported and recoverable", async () => {
+  const provider = new MockWallet();
+  const third = "0x1111111111111111111111111111111111111111";
+  provider.tokens.set(third, ["FOO", 8]);
+  provider.addSwap(3000, 60, -1000, provider.block, { currency0: third, currency1: E.PONS });
+  const { element, until, timers, flush } = await readyPage(provider);
+  element("token-b").input(third);
+  await element("apply-pair").click();
+  await until(() => /FOO/.test(element("pair-info").textContent), "new pair");
+  await flush(5);
+  assert.match(element("pair-info").textContent, /Token A PONS · Token B FOO · currency0 = FOO/);
+  assert.equal(element("pools-body").children[4].children[4].textContent, "yes");
+  assert.equal(element("selected-pools").textContent, "No spread selected.");
+  assert.deepEqual(timers.map((t) => t.ms), [E.POLL_INTERVAL_MS]);
+  element("token-b").input("0x1234");
+  await element("apply-pair").click();
+  await flush(5);
+  assert.match(element("poll-status").textContent, /invalid address/);
+  assert.equal(timers.length, 0);
+  element("token-b").input(E.PONS);
+  await element("apply-pair").click();
+  await flush(5);
+  assert.match(element("poll-status").textContent, /must be different/);
+  element("token-b").input(E.USDG);
+  await element("apply-pair").click();
+  await until(() => timers.length > 0, "polling to resume");
+  assert.match(element("pair-info").textContent, /Token B USDG/);
+});
+
+test("transfer buttons need a connection, an acknowledgement and a valid other address; token A and ETH transfers send everything", async () => {
+  const { provider, element, flush } = await readyPage();
+  element("transfer-to").input(OTHER);
+  await element("transfer-ack").change(true);
+  assert.equal(element("transfer-a").disabled, true); // not connected
+  await element("connect").click();
+  assert.equal(element("transfer-a").disabled, false);
+  assert.equal(element("transfer-b").disabled, false);
+  assert.equal(element("transfer-eth").disabled, false);
+  element("transfer-to").input(CALLER);
+  assert.equal(element("transfer-a").disabled, true); // never to the same account
+  element("transfer-to").input("0x12");
+  assert.equal(element("transfer-eth").disabled, true);
+  element("transfer-to").input(OTHER);
+  await element("transfer-ack").change(false);
+  assert.equal(element("transfer-a").disabled, true);
+  await element("transfer-ack").change(true);
+
+  await element("transfer-a").click();
+  await flush();
+  assert.equal(provider.sent.length, 1);
+  assert.equal(provider.sent[0].to, ethers.utils.getAddress(E.PONS));
+  const decoded = erc20.decodeFunctionData("transfer", provider.sent[0].data);
+  assert.equal(decoded.to, OTHER);
+  assert.equal(ethers.utils.formatUnits(decoded.amount, 18), "1.5");
+  assert.match(element("transfer-result").textContent, /Token A transfer confirmed\. Amount 1500000000000000000 base units\. Tx 0x0+1$/);
+  assert.equal(element("bal-a").textContent, "0.0 PONS");
+  assert.equal(element("transfer-ack").checked, false); // re-acknowledge for the next asset
+  assert.equal(element("transfer-eth").disabled, true);
+
+  await element("transfer-ack").change(true);
+  await element("transfer-eth").click();
+  await flush();
+  assert.equal(provider.sent.length, 2);
+  const reserve = provider.gasEstimate.mul(provider.gasPrice).mul(2);
+  assert.ok(ethers.BigNumber.from(provider.sent[1].value).eq(ethers.utils.parseEther("0.2").sub(reserve)));
+  assert.match(element("transfer-result").textContent, /ETH transfer confirmed/);
+  assert.notEqual(element("bal-eth").textContent, "0.2 ETH");
+
+  await element("transfer-ack").change(true);
+  await element("transfer-b").click();
+  await flush();
+  assert.equal(provider.sent.length, 3);
+  assert.equal(provider.sent[2].to, E.USDG);
+  assert.equal(element("bal-b").textContent, "0.0 USDG");
+});
+
+test("a rejected or reverted transfer is reported as a failure, never as confirmed", async () => {
+  const { provider, element, flush } = await readyPage();
+  await element("connect").click();
+  element("transfer-to").input(OTHER);
+  await element("transfer-ack").change(true);
+  provider.rejectSend = 1;
+  await element("transfer-a").click();
+  await flush();
+  assert.match(element("transfer-result").textContent, /Token A transfer failed: Wallet request rejected/);
+  assert.equal(element("transfer-result").className, "error");
+  assert.equal(element("bal-a").textContent, "1.5 PONS");
+  provider.rejectSend = 0;
+  provider.failReceipt = 1;
+  await element("transfer-eth").click();
+  await flush();
+  assert.match(element("transfer-result").textContent, /ETH transfer failed: .*reverted/);
+  assert.equal(provider.ethBalance(OTHER).toString(), "0");
 });
 
 test("missing wallet and wrong chain show useful errors without writes", async () => {
-  for (const provider of [undefined, new MockWallet()]) {
-    const page = provider === undefined ? loadPage(null) : loadPage(provider);
-    if (provider) provider.chain = "0x1";
+  for (const noWallet of [true, false]) {
+    const provider = new MockWallet();
+    const page = loadPage(provider, { noWallet });
+    if (!noWallet) provider.chain = "0x1";
     await page.element("connect").click();
-    assert.match(page.element("status").textContent, /No wallet|4663/);
+    assert.match(page.element("status").textContent, noWallet ? /No wallet/ : /4663/);
     assert.equal(page.element("send").disabled, true);
     assert.equal(page.element("approve-permit2").disabled, true);
-    if (provider) assert.equal(provider.sent.length, 0);
+    assert.equal(provider.sent.length, 0);
+    assert.equal(provider.calls.length, noWallet ? 0 : 2);
   }
 });
 
-test("bad input never requests approval and changing amounts invalidates a previous dry run", async () => {
-  const { provider, element } = await approvedPage();
+test("changing the input amount after a quote invalidates it; bad amounts never request approval", async () => {
+  const { provider, element, poll, flush } = await readyPage(withActivePools());
+  await poll();
+  await element("connect").click();
+  await element("spreads-body").children[0].click();
+  await flush();
+  await element("approve-permit2").click();
+  provider.sent.length = 0;
   await element("dry-run").click();
-  element("pons-amount").input("0.002");
+  assert.equal(element("send").disabled, false);
+  element("amount-in").input("0.02");
   assert.equal(element("send").disabled, true);
   assert.equal(element("calldata").textContent, "Not built yet.");
-  for (const value of ["0", "-1", "abc", "1e18", "0.0000000000000000001"]) {
-    element("pons-amount").input(value);
-    await element("approve-permit2").click();
-    assert.equal(provider.sent.length, 2);
-    assert.equal(element("send").disabled, true);
+  await element("approve-permit2").click();
+  assert.match(element("status").textContent, /Select the spread again to re-quote/);
+  assert.equal(provider.sent.length, 0);
+  for (const value of ["0", "-1", "abc", "1e18", "0.0000001"]) {
+    element("amount-in").input(value);
+    await element("dry-run").click();
     assert.equal(element("status").className, "error");
+    assert.equal(provider.sent.length, 0);
   }
-  element("pons-amount").input("0.001");
-  element("min-usdg-out").input("0.0000001");
+  element("amount-in").input("0.01");
+  element("min-out").input("0.0000001");
   await element("dry-run").click();
   assert.match(element("status").textContent, /6 decimals/);
-  assert.equal(provider.sent.length, 2);
-});
-
-test("ERC20 prerequisite failure explains correct spender before any Permit2 approval", async () => {
-  const { provider, element } = loadPage();
-  provider.tokenAllowances.set(E.PONS.toLowerCase(), ethers.BigNumber.from(0));
-  await element("connect").click();
-  await element("approve-permit2").click();
-  assert.match(element("status").textContent, /PONS ERC20 allowance to Permit2/);
-  assert.ok(element("status").textContent.includes(E.PERMIT2));
   assert.equal(provider.sent.length, 0);
 });
 
 test("failed approval, failed dry run and failed final simulation never enable a bypass", async () => {
-  const { provider, element } = loadPage();
+  const { provider, element, poll, flush } = await readyPage(withActivePools());
+  await poll();
   await element("connect").click();
+  await element("spreads-body").children[0].click();
+  await flush();
   provider.rejectSend = 2;
   await element("approve-permit2").click();
   assert.match(element("status").textContent, /Wallet request rejected/);
@@ -140,53 +466,65 @@ test("failed approval, failed dry run and failed final simulation never enable a
   assert.equal(element("send").disabled, true);
   provider.rejectSend = 0;
   await element("approve-permit2").click();
-  provider.failRouterCall = 1;
+  provider.failRouterCall = provider.routerCalls + 1;
   await element("dry-run").click();
   assert.equal(element("send").disabled, true);
   assert.match(element("status").textContent, /pool unavailable/);
-  provider.failRouterCall = 0;
   await element("dry-run").click();
-  provider.failRouterCall = 3;
+  provider.failRouterCall = provider.routerCalls + 1; // the re-simulation inside send
   await element("send").click();
   assert.equal(provider.sent.length, 2);
   assert.equal(element("send").disabled, true);
   assert.match(element("status").textContent, /pool unavailable/);
 });
 
-test("wallet events clear send readiness and require reconnection", async () => {
-  const { provider, element } = await approvedPage();
+test("wallet events clear send readiness and balances and require reconnection", async () => {
+  const { provider, element, poll, flush } = await readyPage(withActivePools());
+  await poll();
+  await element("connect").click();
+  await element("spreads-body").children[0].click();
+  await flush();
+  await element("approve-permit2").click();
   for (const event of ["accountsChanged", "chainChanged", "disconnect"]) {
     await element("connect").click();
     await element("dry-run").click();
     assert.equal(element("send").disabled, false);
+    assert.equal(element("bal-a").textContent, "1.5 PONS");
     provider.emit(event, []);
     assert.equal(element("send").disabled, true);
     assert.equal(element("dry-run").disabled, true);
+    assert.equal(element("transfer-a").disabled, true);
+    assert.equal(element("bal-a").textContent, "—");
     assert.match(element("account").textContent, /Connect again/);
     assert.match(element("status").textContent, /reconnect/);
   }
   assert.equal(provider.sent.length, 2);
 });
 
-test("busy UI prevents duplicate approval sequences and locks amount fields", async () => {
-  const { provider, element } = loadPage();
+test("busy UI prevents duplicate approval sequences and locks fields", async () => {
+  const { provider, element, poll, flush } = await readyPage(withActivePools());
+  await poll();
   await element("connect").click();
+  await element("spreads-body").children[0].click();
+  await flush();
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
   provider.beforeRequest = async ({ method }) => { if (method === "eth_getTransactionReceipt") await gate; };
   const first = element("approve-permit2").click();
   assert.equal(element("approve-permit2").disabled, true);
-  assert.equal(element("pons-amount").disabled, true);
+  assert.equal(element("amount-in").disabled, true);
   assert.equal(element("connect").disabled, true);
+  assert.equal(element("apply-pair").disabled, true);
+  assert.equal(element("token-a").disabled, true);
   await element("approve-permit2").click();
   release();
   await first;
   assert.equal(provider.sent.length, 2);
-  assert.equal(element("pons-amount").disabled, false);
+  assert.equal(element("amount-in").disabled, false);
 });
 
 test("provider errors are rendered as text, never interpreted as HTML", async () => {
-  const { provider, element } = loadPage();
+  const { provider, element } = await readyPage();
   provider.beforeRequest = async () => { throw new Error("<img src=x onerror=alert(1)>"); };
   await element("connect").click();
   assert.equal(element("status").textContent, "<img src=x onerror=alert(1)>");

@@ -3,69 +3,120 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>USDG / PONS · V4 swap test</title>
+  <title>V4 pool monitor · arb · Robinhood Chain</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #101721; color: #e7edf5; }
-    body { max-width: 860px; margin: 0 auto; padding: 32px 20px 60px; line-height: 1.55; }
+    body { max-width: 980px; margin: 0 auto; padding: 32px 20px 60px; line-height: 1.55; }
     h1 { margin-bottom: 0; font-size: 2rem; }
     h2 { font-size: 1.1rem; margin-top: 0; }
+    h3 { font-size: 1rem; margin-bottom: 6px; }
     .muted, small { color: #a9b9cc; }
     section { background: #182331; border: 1px solid #344356; border-radius: 12px; padding: 22px; margin-top: 20px; }
     .notice { border-left: 4px solid #f3be57; padding-left: 16px; }
+    .danger { border-color: #ff8a7a; }
     .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 18px; }
     label { display: block; }
-    input { box-sizing: border-box; width: 100%; margin-top: 6px; padding: 10px; background: #101721; color: inherit;
+    input[type=text] { box-sizing: border-box; width: 100%; margin-top: 6px; padding: 10px; background: #101721; color: inherit;
       border: 1px solid #687e98; border-radius: 6px; font: inherit; }
+    input[readonly] { color: #a9b9cc; }
     button { padding: 12px 16px; border: 0; border-radius: 6px; background: #83dfbd; color: #12221c;
       cursor: pointer; font-weight: 700; margin: 6px 8px 6px 0; }
+    button.warn { background: #ff8a7a; }
     button:disabled { opacity: .45; cursor: not-allowed; }
-    button:focus-visible, input:focus-visible, summary:focus-visible { outline: 3px solid #f3be57; outline-offset: 3px; }
+    button:focus-visible, input:focus-visible, summary:focus-visible, tr[tabindex]:focus-visible { outline: 3px solid #f3be57; outline-offset: 3px; }
     code, pre { overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
     pre { max-height: 300px; overflow: auto; padding: 14px; background: #101721; border-radius: 6px; font-size: .85rem; }
-    dl { display: grid; grid-template-columns: 100px 1fr; gap: 8px; }
+    dl { display: grid; grid-template-columns: 120px 1fr; gap: 8px; }
     dd { margin: 0; min-width: 0; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: .95rem; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #344356; }
+    tbody tr.selectable { cursor: pointer; }
+    tbody tr.selectable:hover { background: #22324a; }
+    tbody tr.selected { background: #2a4a3f; }
+    .green { color: #83dfbd; font-weight: 700; }
+    .red { color: #ffb4a9; font-weight: 700; }
     .error { color: #ffb4a9; }
     .success { color: #83dfbd; }
+    .bar { display: flex; flex-wrap: wrap; gap: 18px 32px; padding: 12px 16px; background: #182331; border: 1px solid #344356;
+      border-radius: 12px; margin-top: 20px; }
+    .bar div { min-width: 180px; }
   </style>
 </head>
 <body>
   <header>
     <p class="muted">ROBINHOOD CHAIN · 4663</p>
-    <h1>USDG → PONS → USDG</h1>
-    <p>Approve Permit2, dry run the round trip, then review the swap in your wallet.</p>
+    <h1>V4 pool monitor · arbitrage · wallet transfer</h1>
+    <p>Watch the seven fee tiers of a pair, pick a spread, quote, dry run, send. Approve Permit2 once first.</p>
   </header>
-  <p class="notice"><strong>Small-amount test.</strong> The default minimum return is 0 USDG, so the swap may
-    return nothing. A successful dry run does not show profit or guarantee execution at the same price.</p>
+  <p class="notice"><strong>Small-amount test.</strong> The default minimum return is 0, so a swap may return
+    nothing. A GREEN verdict compares the last swap prices of two pools; it is not a guarantee of profit, and
+    prices can move between the poll and your transaction.</p>
 
-  <section aria-labelledby="wallet-heading">
-    <h2 id="wallet-heading">1. Connect your wallet</h2>
-    <button id="connect" type="button">CONNECT WALLET</button>
-    <p id="account">Not connected. Select Robinhood Chain in your wallet.</p>
-    <small>The connected account pays, receives both swaps, and owns the allowances.</small>
+  <div class="bar" role="region" aria-label="Balances and polling status">
+    <div><small>Token A balance</small><br><span id="bal-a">—</span></div>
+    <div><small>Token B balance</small><br><span id="bal-b">—</span></div>
+    <div><small>ETH balance</small><br><span id="bal-eth">—</span></div>
+    <div style="flex: 1 1 100%"><small>Polling</small><br><span id="poll-status" role="status" aria-live="polite">Not started.</span></div>
+  </div>
+
+  <section aria-labelledby="pair-heading">
+    <h2 id="pair-heading">1. Token pair</h2>
+    <div class="fields">
+      <label>Token A<input id="token-a" type="text" value="0x39dbed3a2bd333467115de45665cc57f813c4571" autocomplete="off" spellcheck="false"></label>
+      <label>Token B<input id="token-b" type="text" value="0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" autocomplete="off" spellcheck="false"></label>
+    </div>
+    <button id="apply-pair" type="button">WATCH PAIR</button>
+    <p id="pair-info" class="muted">currency0 is the lower address. Symbols are read from each token's symbol().</p>
+    <p class="muted">Every 30 s the page reads the PoolManager's Swap logs of the last 100 blocks for fee / tick
+      spacing (0,1) (0,10) (500,10) (2500,25) (3000,60) (10000,200) (30000,600). Price = 1.0001^tick of the latest
+      swap, shown as currency1 per currency0 after decimals. No swap in the window means inactive. On an RPC error the
+      page waits 60 s and keeps polling.</p>
   </section>
 
-  <section aria-labelledby="amount-heading">
-    <h2 id="amount-heading">2. Choose the test amounts</h2>
+  <section aria-labelledby="wallet-heading">
+    <h2 id="wallet-heading">2. Connect your wallet</h2>
+    <button id="connect" type="button">CONNECT WALLET</button>
+    <p id="account">Not connected. Select Robinhood Chain in your wallet.</p>
+    <small>The connected account pays, receives both swaps, and owns the allowances. Polling and quoting use the
+      public RPC and need no wallet.</small>
+  </section>
+
+  <section aria-labelledby="pools-heading">
+    <h2 id="pools-heading">3. Live pools</h2>
+    <table aria-describedby="pools-heading">
+      <thead><tr><th>Fee</th><th>TickSpacing</th><th>Price</th><th>Swaps (100 blocks)</th><th>Active?</th></tr></thead>
+      <tbody id="pools-body"></tbody>
+    </table>
+    <h3>Top 5 pairwise spreads (click a row to select it)</h3>
+    <table aria-describedby="pools-heading">
+      <thead><tr><th>Pool A (buy)</th><th>Pool B (sell)</th><th>Spread%</th><th>Fee Cost%</th><th>Net%</th><th>Verdict</th></tr></thead>
+      <tbody id="spreads-body"></tbody>
+    </table>
+    <p id="spreads-note" class="muted">Spreads need at least two active pools.</p>
     <div class="fields">
-      <label>USDG input (6 decimals)<input id="usdg-in" value="0.01" readonly></label>
-      <label>PONS to sell (18 decimals)<input id="pons-amount" value="0.001" inputmode="decimal" autocomplete="off"></label>
-      <label>Minimum USDG return<input id="min-usdg-out" value="0" inputmode="decimal" autocomplete="off"></label>
+      <label><input id="auto-mode" type="checkbox"> Auto mode: execute when Net% is above the threshold</label>
+      <label>Net% threshold<input id="threshold" type="text" value="0.5" inputmode="decimal" autocomplete="off"></label>
     </div>
-    <p class="muted">0.001 PONS is a fixed test amount, not a live quote. You can enter swap 1's quoted output
-      minus slippage here. Swap 1 must buy at least this much PONS; swap 2 sells this amount.
-      Extra PONS stays in your wallet.</p>
-    <p id="approval-limits"></p>
-    <button id="approve-permit2" type="button" disabled>APPROVE PERMIT2 (one-time)</button>
-    <small>USDG first, then PONS, with each receipt confirmed before continuing. Existing sufficient allowances
-      are skipped. “One-time” lasts until the limits are spent, revoked, or expire after 30 days.</small>
-    <p class="muted">Prerequisite: both tokens must allow Permit2 to spend them through their ERC20 allowance.
-      An ERC20 approval directly to the router does not satisfy this. The page checks both layers.</p>
+    <p id="auto-status" class="muted">Auto mode OFF. With it ON, each poll with a GREEN best spread runs quote → dry run →
+      send without a click; your wallet still asks for the signature. One transaction at a time: nothing is submitted
+      while another is waiting for its receipt. Auto mode turns itself off after any failed attempt.</p>
   </section>
 
   <section aria-labelledby="swap-heading">
-    <h2 id="swap-heading">3. Simulate and send</h2>
-    <p>Pool A: fee 3000 / tick spacing 60. Pool B: fee 30000 / tick spacing 600. Both have no hook.
-      The swap deadline is 20 minutes from the latest block.</p>
+    <h2 id="swap-heading">4. Quote, approve, simulate and send</h2>
+    <details open><summary>Selected pools</summary><pre id="selected-pools">No spread selected.</pre></details>
+    <p id="quote-info" class="muted">Select a spread row to quote swap 1.</p>
+    <div class="fields">
+      <label>Input, currency1 (sold in swap 1)<input id="amount-in" type="text" value="0.01" inputmode="decimal" autocomplete="off"></label>
+      <label>currency0 to bridge (quote − 0.5%)<input id="bridge-amount" type="text" value="" readonly></label>
+      <label>Minimum currency1 return<input id="min-out" type="text" value="0" inputmode="decimal" autocomplete="off"></label>
+    </div>
+    <p id="approval-limits"></p>
+    <button id="approve-permit2" type="button" disabled>APPROVE PERMIT2 (one-time)</button>
+    <small>currency1 (USDG) first, then currency0 (PONS), with each receipt confirmed before continuing. Existing
+      sufficient allowances are skipped. “One-time” lasts until the limits are spent, revoked, or expire after 30 days.</small>
+    <p class="muted">Prerequisite: both tokens must allow Permit2 to spend them through their ERC20 allowance.
+      An ERC20 approval directly to the router does not satisfy this. The page checks both layers.</p>
     <button id="dry-run" type="button" disabled>BUILD CALLDATA &amp; DRY RUN</button>
     <button id="send" type="button" disabled>SEND TRANSACTION</button>
     <p id="status" role="status" aria-live="polite">Connect to begin.</p>
@@ -74,12 +125,27 @@
       <dl>
         <dt>Permit2</dt><dd><code id="permit2-address"></code></dd>
         <dt>Router</dt><dd><code id="router-address"></code></dd>
-        <dt>USDG</dt><dd><code id="usdg-address"></code></dd>
-        <dt>PONS</dt><dd><code id="pons-address"></code></dd>
+        <dt>PoolManager</dt><dd><code id="pool-manager-address"></code></dd>
+        <dt>RPC</dt><dd><code id="rpc-url"></code></dd>
       </dl>
     </details>
     <h3>Activity</h3>
     <pre id="activity" role="log" aria-live="polite">No transactions submitted.</pre>
+  </section>
+
+  <section class="danger" aria-labelledby="transfer-heading">
+    <h2 id="transfer-heading">TRANSFER TO NEW WALLET</h2>
+    <p class="error"><strong>Sends ALL of this asset to the new address. Cannot undo.</strong></p>
+    <p id="transfer-balances" class="muted">Connect to see the balances that would be sent.</p>
+    <label>New wallet address<input id="transfer-to" type="text" placeholder="0x…" autocomplete="off" spellcheck="false"></label>
+    <label><input id="transfer-ack" type="checkbox"> I checked the address. Send the whole balance; this cannot be undone.</label>
+    <button id="transfer-a" class="warn" type="button" disabled>Transfer Token A</button>
+    <button id="transfer-b" class="warn" type="button" disabled>Transfer Token B</button>
+    <button id="transfer-eth" class="warn" type="button" disabled>Transfer ETH</button>
+    <p id="transfer-result" role="status" aria-live="polite"></p>
+    <small>Token transfers call token.transfer(newAddress, balance) for whatever is in the Token A / Token B fields.
+      The ETH transfer keeps back twice the estimated gas cost, so a little dust stays behind. Each result shows the
+      transaction hash after its receipt confirms.</small>
   </section>
   <noscript><p>JavaScript and an EIP-1193 wallet are required.</p></noscript>
   <script src="js/vendor/ethers-5.7.2.umd.min.js"></script>
@@ -92,7 +158,12 @@
     let account = null;
     let prepared = null;
     let busy = false;
+    let selected = null;        // { buy, sell, quote, bridgeAmount } after a spread row is quoted
+    let auto = false;
+    let pendingHash = null;     // a submitted transaction whose receipt never arrived
+    let balances = null;
     const activity = [];
+    const rpc = E.createRpcClient(E.RPC_URL, typeof fetch === "function" ? fetch.bind(window) : undefined);
 
     function log(message) {
       activity.push(message);
@@ -104,13 +175,33 @@
       element("status").className = error ? "error" : "success";
     }
 
+    function pair() { return monitor.getState().pair; }
+
+    function validTransferTarget() {
+      try {
+        const to = element("transfer-to").value.trim();
+        return ethers.utils.isAddress(to) && ethers.utils.getAddress(to) !== ethers.constants.AddressZero &&
+          (!account || ethers.utils.getAddress(to) !== account);
+      } catch (error) { return false; }
+    }
+
     function render() {
+      const ready = !busy && !!account;
+      const quoted = !!selected && !!selected.bridgeAmount;
       element("connect").disabled = busy;
-      element("approve-permit2").disabled = busy || !account;
-      element("dry-run").disabled = busy || !account;
-      element("send").disabled = busy || !account || !prepared;
-      element("pons-amount").disabled = busy;
-      element("min-usdg-out").disabled = busy;
+      element("apply-pair").disabled = busy;
+      element("token-a").disabled = busy;
+      element("token-b").disabled = busy;
+      element("approve-permit2").disabled = !ready || !quoted;
+      element("dry-run").disabled = !ready || !quoted;
+      element("send").disabled = !ready || !prepared;
+      element("amount-in").disabled = busy;
+      element("min-out").disabled = busy;
+      element("threshold").disabled = busy;
+      const canTransfer = ready && element("transfer-ack").checked && validTransferTarget();
+      element("transfer-a").disabled = !canTransfer;
+      element("transfer-b").disabled = !canTransfer;
+      element("transfer-eth").disabled = !canTransfer;
     }
 
     function clearPrepared() {
@@ -119,38 +210,91 @@
       render();
     }
 
+    function clearSelection() {
+      selected = null;
+      element("selected-pools").textContent = "No spread selected.";
+      element("bridge-amount").value = "";
+      element("quote-info").textContent = "Select a spread row to quote swap 1.";
+      element("quote-info").className = "muted";
+      element("approval-limits").textContent = "";
+      clearPrepared();
+    }
+
+    function threshold() {
+      const text = element("threshold").value.trim();
+      if (!/^\d+(\.\d+)?$/.test(text)) throw new Error("Enter the Net% threshold as a non-negative number.");
+      return Number(text);
+    }
+
+    function thresholdOrDefault() {
+      try { return threshold(); } catch (error) { return 0.5; }
+    }
+
+    function format(amount, decimals) {
+      return ethers.utils.commify(ethers.utils.formatUnits(amount, decimals));
+    }
+
     function readAmounts() {
-      const ponsText = element("pons-amount").value.trim();
-      const minText = element("min-usdg-out").value.trim();
-      if (!/^\d+(\.\d{1,18})?$/.test(ponsText)) throw new Error("Enter a PONS amount with up to 18 decimals.");
-      if (!/^\d+(\.\d{1,6})?$/.test(minText)) throw new Error("Enter a USDG minimum with up to 6 decimals.");
-      const ponsAmount = ethers.utils.parseUnits(ponsText, 18);
-      const minUsdgOut = ethers.utils.parseUnits(minText, 6);
-      if (ponsAmount.isZero() || ponsAmount.gte(E.MAX_UINT128)) throw new Error("PONS amount must be positive and below uint128 max.");
-      if (minUsdgOut.gt(E.MAX_UINT128)) throw new Error("USDG minimum exceeds uint128.");
-      return {
-        usdgIn: ethers.utils.parseUnits("0.01", 6),
-        ponsAmount,
-        minUsdgOut,
-      };
+      const meta = pair();
+      if (!meta) throw new Error("Wait for the pair's symbols and decimals to load.");
+      if (!selected || !selected.bridgeAmount) throw new Error("Select a spread with liquidity first.");
+      const inText = element("amount-in").value.trim();
+      const minText = element("min-out").value.trim();
+      const inPattern = new RegExp("^\\d+(\\.\\d{1," + Math.max(meta.decimals1, 1) + "})?$");
+      if (!inPattern.test(inText)) throw new Error("Enter an input amount with up to " + meta.decimals1 + " decimals.");
+      if (!inPattern.test(minText)) throw new Error("Enter a minimum return with up to " + meta.decimals1 + " decimals.");
+      const usdgIn = ethers.utils.parseUnits(inText, meta.decimals1);
+      const minUsdgOut = ethers.utils.parseUnits(minText, meta.decimals1);
+      if (usdgIn.isZero() || usdgIn.gte(E.MAX_UINT128)) throw new Error("Input amount must be positive and below uint128 max.");
+      if (minUsdgOut.gt(E.MAX_UINT128)) throw new Error("Minimum return exceeds uint128.");
+      if (!selected.amountIn.eq(usdgIn)) throw new Error("Input changed since the quote. Select the spread again to re-quote.");
+      return { usdgIn, ponsAmount: selected.bridgeAmount, minUsdgOut, buyPool: selected.buy.poolKey, sellPool: selected.sell.poolKey,
+        pair: { currency0: meta.currency0, currency1: meta.currency1, symbol0: meta.symbol0, symbol1: meta.symbol1 } };
     }
 
     function updateLimits() {
+      const meta = pair();
+      if (!meta || !selected || !selected.bridgeAmount) { element("approval-limits").textContent = ""; return; }
       try {
         const amounts = readAmounts();
-        element("approval-limits").textContent = "Reusable Permit2 limits: 1 USDG and " +
-          ethers.utils.formatUnits(amounts.ponsAmount.mul(100), 18) + " PONS (100 test swaps), expiring in 30 days.";
+        element("approval-limits").textContent = "Reusable Permit2 limits: " + format(amounts.usdgIn.mul(100), meta.decimals1) + " " +
+          meta.symbol1 + " and " + format(amounts.ponsAmount.mul(100), meta.decimals0) + " " + meta.symbol0 + " (100 test swaps), expiring in 30 days.";
       } catch (error) {
         element("approval-limits").textContent = error.message;
       }
     }
 
-    async function runAction(action) {
-      if (busy) return;
+    async function refreshBalances() {
+      if (!wallet || !account) return;
+      const meta = pair();
+      const tokens = [element("token-a").value.trim(), element("token-b").value.trim()];
+      balances = await wallet.readBalances(tokens, account);
+      const symbolA = meta && meta.tokenA === ethers.utils.getAddress(tokens[0]) ? meta.symbolA : "Token A";
+      const symbolB = meta && meta.tokenB === ethers.utils.getAddress(tokens[1]) ? meta.symbolB : "Token B";
+      const decA = meta && meta.tokenA === ethers.utils.getAddress(tokens[0]) ? meta.decimalsA : 0;
+      const decB = meta && meta.tokenB === ethers.utils.getAddress(tokens[1]) ? meta.decimalsB : 0;
+      const a = format(balances.tokens[0], decA) + " " + symbolA + (decA === 0 ? " (base units)" : "");
+      const b = format(balances.tokens[1], decB) + " " + symbolB + (decB === 0 ? " (base units)" : "");
+      const eth = format(balances.eth, 18) + " ETH";
+      element("bal-a").textContent = a;
+      element("bal-b").textContent = b;
+      element("bal-eth").textContent = eth;
+      element("transfer-balances").textContent = "Current balances of " + account + ": " + a + " · " + b + " · " + eth + ".";
+    }
+
+    function clearBalances() {
+      balances = null;
+      ["bal-a", "bal-b", "bal-eth"].forEach((id) => { element(id).textContent = "—"; });
+      element("transfer-balances").textContent = "Connect to see the balances that would be sent.";
+    }
+
+    async function runAction(action, options = {}) {
+      if (busy) return false;
       busy = true;
       render();
       try {
         await action();
+        return true;
       } catch (error) {
         clearPrepared();
         if (!account) element("account").textContent = "Not connected. Select Robinhood Chain and connect again.";
@@ -158,6 +302,17 @@
         const message = (error.code === 4001 ? "Wallet request rejected. " : "") + error.message + detail;
         showStatus(message, true);
         log(message);
+        if (error.pendingHash) {
+          pendingHash = error.pendingHash;
+          log("Pending transaction " + pendingHash + ": auto mode stays off until you turn it on again.");
+        }
+        if (options.auto && auto) {
+          auto = false;
+          element("auto-mode").checked = false;
+          element("auto-status").textContent = "Auto mode turned OFF after a failed attempt: " + error.message;
+          log("Auto mode turned off after a failed attempt.");
+        }
+        return false;
       } finally {
         busy = false;
         render();
@@ -167,9 +322,171 @@
     function walletChanged() {
       account = null;
       clearPrepared();
+      clearBalances();
       element("account").textContent = "Wallet or network changed. Connect again.";
       showStatus("Wallet or network changed. Pending work stopped; reconnect and dry run again.", true);
     }
+
+    // ------------------------------------------------------------------ live monitor
+
+    function cell(row, text, className) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (className) td.className = className;
+      row.appendChild(td);
+      return td;
+    }
+
+    function poolLabel(pool) { return pool.fee + " / " + pool.tickSpacing; }
+
+    function renderPools(state) {
+      const body = element("pools-body");
+      body.replaceChildren();
+      state.pools.forEach((pool) => {
+        const row = document.createElement("tr");
+        cell(row, String(pool.fee));
+        cell(row, String(pool.tickSpacing));
+        cell(row, pool.displayPrice === null ? "—" : pool.displayPrice.toPrecision(6) + " (tick " + pool.tick + ")");
+        cell(row, String(pool.swaps));
+        cell(row, pool.active ? "yes" : "no (inactive)", pool.active ? "green" : "muted");
+        body.appendChild(row);
+      });
+    }
+
+    function renderSpreads(state) {
+      const body = element("spreads-body");
+      body.replaceChildren();
+      const spreads = state.pools.length ? E.rankSpreads(state.pools, thresholdOrDefault()) : [];
+      spreads.forEach((spread) => {
+        const row = document.createElement("tr");
+        row.className = "selectable" + (selected && selected.buy.poolId === spread.buy.poolId && selected.sell.poolId === spread.sell.poolId ? " selected" : "");
+        row.tabIndex = 0;
+        cell(row, poolLabel(spread.buy));
+        cell(row, poolLabel(spread.sell));
+        cell(row, spread.spreadPercent.toFixed(3));
+        cell(row, spread.feeCostPercent.toFixed(3));
+        cell(row, spread.netPercent.toFixed(3));
+        cell(row, spread.verdict, spread.verdict === "GREEN" ? "green" : "red");
+        row.addEventListener("click", () => selectSpread(spread));
+        row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") selectSpread(spread); });
+        body.appendChild(row);
+      });
+      const active = state.pools.filter((pool) => pool.active).length;
+      element("spreads-note").textContent = spreads.length ? spreads.length + " spread(s) from " + active + " active pool(s). Pool A has the lower price (buy currency0 there), Pool B the higher (sell there)."
+        : "Spreads need at least two active pools. Active now: " + active + ".";
+      return spreads;
+    }
+
+    function renderMonitor(state) {
+      const when = (ms) => new Date(ms).toISOString().replace("T", " ").slice(0, 19) + " UTC";
+      if (state.pair) {
+        const meta = state.pair;
+        element("pair-info").textContent = "Token A " + meta.symbolA + " · Token B " + meta.symbolB + " · currency0 = " + meta.symbol0 + " (" +
+          meta.currency0 + ", " + meta.decimals0 + " decimals) · currency1 = " + meta.symbol1 + " (" + meta.currency1 + ", " + meta.decimals1 + " decimals)";
+      }
+      if (state.lastError) {
+        element("poll-status").textContent = "RPC error, retrying in " + Math.round(E.RPC_RETRY_MS / 1000) + "s — " + state.lastError +
+          (state.lastPoll ? " · last successful poll " + when(state.lastPoll) : " · no successful poll yet") + " · errors: " + state.errors;
+        element("poll-status").className = "error";
+      } else if (state.lastPoll) {
+        element("poll-status").textContent = "Last poll " + when(state.lastPoll) + " · block " + state.blockNumber + " · window " + state.fromBlock + "–" +
+          state.blockNumber + " · " + state.pools.filter((pool) => pool.active).length + " active pool(s) · next poll in " + Math.round(E.POLL_INTERVAL_MS / 1000) + "s";
+        element("poll-status").className = "success";
+      }
+      renderPools(state);
+      const spreads = renderSpreads(state);
+      if (!state.lastError && spreads.length) maybeAutoExecute(spreads[0]);
+    }
+
+    const monitor = E.createPoolMonitor({ request: rpc.request, thresholdPercent: thresholdOrDefault, onUpdate: renderMonitor });
+
+    function startMonitor() {
+      clearSelection();
+      const tokenA = element("token-a").value.trim();
+      const tokenB = element("token-b").value.trim();
+      try {
+        element("poll-status").textContent = "Loading pair and polling…";
+        element("poll-status").className = "muted";
+        monitor.start(tokenA, tokenB).then(() => refreshBalances()).catch((error) => {
+          element("poll-status").textContent = error.message;
+          element("poll-status").className = "error";
+        });
+      } catch (error) {
+        monitor.stop();
+        element("poll-status").textContent = error.message;
+        element("poll-status").className = "error";
+        element("pair-info").textContent = "Pair not watched. Fix the token addresses and click WATCH PAIR.";
+      }
+    }
+
+    // ------------------------------------------------------------------ spreads → execution
+
+    async function quoteSpread(spread) {
+      clearSelection();
+      const meta = pair();
+      if (!meta) throw new Error("Wait for the pair's symbols and decimals to load.");
+      const inText = element("amount-in").value.trim();
+      const inPattern = new RegExp("^\\d+(\\.\\d{1," + Math.max(meta.decimals1, 1) + "})?$");
+      if (!inPattern.test(inText)) throw new Error("Enter an input amount with up to " + meta.decimals1 + " decimals.");
+      const amountIn = ethers.utils.parseUnits(inText, meta.decimals1);
+      if (amountIn.isZero() || amountIn.gte(E.MAX_UINT128)) throw new Error("Input amount must be positive and below uint128 max.");
+      element("selected-pools").textContent = JSON.stringify({ buyPool: spread.buy.poolKey, sellPool: spread.sell.poolKey }, null, 2);
+      element("quote-info").textContent = "Quoting swap 1 on pool " + poolLabel(spread.buy) + "…";
+      const quote = await E.quoteExactIn(rpc.request, { poolKey: spread.buy.poolKey, zeroForOne: false, amountIn, from: account || undefined });
+      selected = { buy: spread.buy, sell: spread.sell, amountIn, quote, bridgeAmount: null };
+      if (quote.isZero()) {
+        element("quote-info").textContent = "Warning: no liquidity. Swap 1 on pool " + poolLabel(spread.buy) + " returns 0 " + meta.symbol0 + " for " +
+          format(amountIn, meta.decimals1) + " " + meta.symbol1 + ". Sending is disabled.";
+        element("quote-info").className = "error";
+        showStatus("No liquidity in the selected buy pool; choose another spread.", true);
+        return selected;
+      }
+      selected.bridgeAmount = E.applySlippage(quote, E.SLIPPAGE_BPS);
+      element("bridge-amount").value = ethers.utils.formatUnits(selected.bridgeAmount, meta.decimals0);
+      element("quote-info").textContent = "Swap 1 quote: " + format(amountIn, meta.decimals1) + " " + meta.symbol1 + " → " + format(quote, meta.decimals0) + " " +
+        meta.symbol0 + " on pool " + poolLabel(spread.buy) + ". Bridge amount after 0.5% slippage: " + format(selected.bridgeAmount, meta.decimals0) + " " + meta.symbol0 +
+        ", sold on pool " + poolLabel(spread.sell) + ".";
+      element("quote-info").className = "success";
+      updateLimits();
+      showStatus("Spread selected and quoted. Approve Permit2 if needed, then dry run.");
+      return selected;
+    }
+
+    function selectSpread(spread) {
+      runAction(() => quoteSpread(spread)).then(() => renderSpreads(monitor.getState()));
+    }
+
+    async function dryRun() {
+      clearPrepared();
+      showStatus("Building calldata and running eth_call…");
+      // prepareSwap calls buildCalldata with these amounts, pools and recipient = the connected wallet.
+      prepared = await wallet.prepareSwap(readAmounts());
+      element("calldata").textContent = prepared.transaction.data;
+      showStatus("Dry run succeeded. Send will simulate these same bytes again before requesting your signature.");
+    }
+
+    async function send() {
+      const candidate = prepared;
+      prepared = null;
+      showStatus("Rechecking allowances and eth_call, then waiting for your wallet and receipt…");
+      const receipt = await wallet.sendSwap(candidate);
+      showStatus("Swap confirmed: " + receipt.transactionHash);
+      await refreshBalances();
+    }
+
+    function maybeAutoExecute(best) {
+      if (!auto || busy || !account || !wallet || pendingHash) return;
+      if (best.verdict !== "GREEN" || !(best.netPercent > thresholdOrDefault())) return;
+      log("Auto mode: best spread " + poolLabel(best.buy) + " → " + poolLabel(best.sell) + " net " + best.netPercent.toFixed(3) + "% is above the threshold; executing.");
+      runAction(async () => {
+        const quoted = await quoteSpread(best);
+        if (!quoted.bridgeAmount) throw new Error("Auto mode: the buy pool has no liquidity; nothing sent.");
+        await dryRun();
+        await send();
+      }, { auto: true }).then(() => renderSpreads(monitor.getState()));
+    }
+
+    // ------------------------------------------------------------------ wiring
 
     element("connect").addEventListener("click", () => runAction(async () => {
       clearPrepared();
@@ -183,47 +500,91 @@
       }
       account = await wallet.connect();
       element("account").textContent = account;
-      showStatus("Connected on Robinhood Chain. Approve Permit2 or dry run with existing allowances.");
+      await refreshBalances();
+      showStatus("Connected on Robinhood Chain. Select a spread, approve Permit2 if needed, then dry run.");
     }));
+
+    element("apply-pair").addEventListener("click", () => { if (!busy) startMonitor(); });
 
     element("approve-permit2").addEventListener("click", () => runAction(async () => {
       clearPrepared();
       const amounts = readAmounts();
       showStatus("Checking ERC20 allowances to Permit2…");
-      await wallet.checkTokenAllowances(amounts.usdgIn, amounts.ponsAmount);
+      await wallet.checkTokenAllowances(amounts.usdgIn, amounts.ponsAmount, amounts.pair);
       const expiration = (await wallet.timestamp()) + 30 * 24 * 60 * 60;
-      showStatus("Approve USDG, then PONS in your wallet. Waiting for successful receipts…");
-      await wallet.approveBothPermit2(amounts.usdgIn.mul(100), amounts.ponsAmount.mul(100), expiration);
-      await wallet.checkAllowances(amounts.usdgIn, amounts.ponsAmount, (await wallet.timestamp()) + 1200);
+      showStatus("Approve " + amounts.pair.symbol1 + ", then " + amounts.pair.symbol0 + " in your wallet. Waiting for successful receipts…");
+      await wallet.approveBothPermit2(amounts.usdgIn.mul(100), amounts.ponsAmount.mul(100), expiration, amounts.pair);
+      await wallet.checkAllowances(amounts.usdgIn, amounts.ponsAmount, (await wallet.timestamp()) + 1200, amounts.pair);
+      await refreshBalances();
       showStatus("Both Permit2 allowances are ready. Build calldata and dry run next.");
     }));
 
-    element("dry-run").addEventListener("click", () => runAction(async () => {
-      clearPrepared();
-      showStatus("Building calldata and running eth_call…");
-      // prepareSwap calls buildCalldata with these amounts and recipient = the connected wallet.
-      prepared = await wallet.prepareSwap(readAmounts());
-      element("calldata").textContent = prepared.transaction.data;
-      showStatus("Dry run succeeded. Send will simulate these same bytes again before requesting your signature.");
-    }));
+    element("dry-run").addEventListener("click", () => runAction(dryRun));
+    element("send").addEventListener("click", () => runAction(send));
 
-    element("send").addEventListener("click", () => runAction(async () => {
-      const candidate = prepared;
-      prepared = null;
-      showStatus("Rechecking allowances and eth_call, then waiting for your wallet and receipt…");
-      const receipt = await wallet.sendSwap(candidate);
-      showStatus("Swap confirmed: " + receipt.transactionHash);
-    }));
-
-    ["pons-amount", "min-usdg-out"].forEach((id) => element(id).addEventListener("input", () => {
+    ["amount-in", "min-out"].forEach((id) => element(id).addEventListener("input", () => {
       clearPrepared();
       updateLimits();
-      showStatus("Amounts changed. Build and dry run again before sending.");
+      showStatus("Amounts changed. " + (id === "amount-in" ? "Select the spread again to re-quote, then dry run." : "Dry run again before sending."));
     }));
-    [["permit2-address", E.PERMIT2], ["router-address", E.ROUTER], ["usdg-address", E.USDG], ["pons-address", E.PONS]]
+
+    element("threshold").addEventListener("input", () => {
+      try {
+        threshold();
+        element("auto-status").className = "muted";
+      } catch (error) {
+        element("auto-status").textContent = error.message + " Using 0.5% until fixed.";
+        element("auto-status").className = "error";
+      }
+      renderSpreads(monitor.getState());
+    });
+
+    element("auto-mode").addEventListener("change", () => {
+      auto = element("auto-mode").checked;
+      if (auto) {
+        pendingHash = null;
+        element("auto-status").textContent = "Auto mode ON: the next poll with a GREEN best spread above " + thresholdOrDefault() + "% executes automatically.";
+        element("auto-status").className = "success";
+        log("Auto mode ON (threshold " + thresholdOrDefault() + "%).");
+        const state = monitor.getState();
+        const spreads = state.pools.length ? E.rankSpreads(state.pools, thresholdOrDefault()) : [];
+        if (spreads.length) maybeAutoExecute(spreads[0]);
+      } else {
+        element("auto-status").textContent = "Auto mode OFF. Sending needs a click.";
+        element("auto-status").className = "muted";
+        log("Auto mode OFF.");
+      }
+    });
+
+    ["transfer-to", "transfer-ack"].forEach((id) => element(id).addEventListener("input", render));
+    element("transfer-ack").addEventListener("change", render);
+
+    function transfer(label, action) {
+      return runAction(async () => {
+        const to = ethers.utils.getAddress(element("transfer-to").value.trim());
+        element("transfer-result").textContent = label + " to " + to + ": waiting for your wallet and the receipt…";
+        element("transfer-result").className = "muted";
+        const result = await action(to);
+        element("transfer-result").textContent = label + " confirmed. Amount " + result.amount.toString() + " base units. Tx " + result.hash;
+        element("transfer-result").className = "success";
+        element("transfer-ack").checked = false;
+        await refreshBalances();
+      }).then((ok) => {
+        if (!ok) {
+          element("transfer-result").textContent = label + " failed: " + element("status").textContent;
+          element("transfer-result").className = "error";
+        }
+      });
+    }
+
+    element("transfer-a").addEventListener("click", () => transfer("Token A transfer", (to) => wallet.transferAllToken(element("token-a").value.trim(), to)));
+    element("transfer-b").addEventListener("click", () => transfer("Token B transfer", (to) => wallet.transferAllToken(element("token-b").value.trim(), to)));
+    element("transfer-eth").addEventListener("click", () => transfer("ETH transfer", (to) => wallet.transferAllEth(to)));
+
+    [["permit2-address", E.PERMIT2], ["router-address", E.ROUTER], ["pool-manager-address", E.POOL_MANAGER], ["rpc-url", E.RPC_URL]]
       .forEach(([id, value]) => { element(id).textContent = value; });
-    updateLimits();
     render();
+    startMonitor();
   </script>
 </body>
 </html>

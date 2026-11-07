@@ -21,6 +21,12 @@
  *
  * OPEN_DELTA on this router is 0, not 2^128-1, and it only refers to a credit opened earlier in
  * the SAME V4_SWAP command. See buildCalldata() and buildAtomicCalldata().
+ *
+ * Follow-up 3 adds, in this same file: pool ids and tick prices for the seven fee tiers of any
+ * pair (sortPair, poolKeysFor, poolId, tickToPrice), a Swap-log pool monitor that polls every
+ * 30 s and backs off 60 s on RPC errors (createPoolMonitor), pairwise spread ranking
+ * (rankSpreads), an exact-input quote recovered from the router's price-check revert
+ * (quoteExactIn), and whole-balance token / ETH transfers in the wallet client.
  */
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
@@ -38,10 +44,29 @@
 
   var ROUTER = "0x8876789976dEcBfCbBbe364623C63652db8C0904";
   var PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+  var POOL_MANAGER = "0x8366a39CC670B4001A1121B8F6A443A643e40951";
+  var RPC_URL = "https://rpc.mainnet.chain.robinhood.com";
   var CHAIN_ID = 4663;
   var PONS = "0x39dbed3a2bd333467115de45665cc57f813c4571"; // 18 decimals
   var USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"; // 6 decimals
   var NO_HOOKS = ethers.constants.AddressZero; // "no hook" is the zero address in a V4 pool key
+
+  // PoolManager Swap(PoolId indexed id, address indexed sender, int128 amount0, int128 amount1,
+  //                  uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)
+  var SWAP_TOPIC = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f";
+  var SWAP_DATA_TYPES = ["int128", "int128", "uint160", "uint128", "int24", "uint24"];
+  // The seven fee / tick spacing combinations the monitor scans, in the brief's order.
+  var FEE_TIERS = [[0, 1], [0, 10], [500, 10], [2500, 25], [3000, 60], [10000, 200], [30000, 600]];
+  var LOG_WINDOW_BLOCKS = 100;
+  var POLL_INTERVAL_MS = 30000;
+  var RPC_RETRY_MS = 60000;
+  var SLIPPAGE_BPS = 50; // 0.5%
+  var MIN_TICK = -887272;
+  var MAX_TICK = 887272;
+  // V4TooLittleReceivedPerHopSingle(uint256 minHopPriceX36, uint256 actualPriceX36): the router's
+  // price check, which fires after the PoolManager has executed the swap and before settlement.
+  var QUOTE_REVERT_SELECTOR = "0x4713c18b";
+  var X36 = BigNumber.from(10).pow(36);
 
   var EXECUTE_SELECTOR = "0x3593564c";
   var COMMAND_V4_SWAP = "0x10";
@@ -67,6 +92,10 @@
   var permit2Interface = new utils.Interface(PERMIT2_ABI);
   var tokenInterface = new utils.Interface([
     "function allowance(address owner,address spender) view returns (uint256)",
+    "function balanceOf(address owner) view returns (uint256)",
+    "function symbol() view returns (string)",
+    "function decimals() view returns (uint8)",
+    "function transfer(address to,uint256 amount) returns (bool)",
   ]);
 
   var POOL_KEY_TYPE = "tuple(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks)";
@@ -293,6 +322,363 @@
     return encodeExecute(COMMAND_V4_SWAP, [input], args.deadline);
   }
 
+  // ------------------------------------------------------------------ pools and prices
+
+  /** currency0 is the numerically lower address (BigInt comparison), as the PoolManager requires. */
+  function sortPair(tokenA, tokenB) {
+    if (!tokenA || !tokenB) fail("both token addresses are required");
+    var a = utils.getAddress(tokenA);
+    var b = utils.getAddress(tokenB);
+    if (a === b) fail("Token A and Token B must be different addresses");
+    if (a === ethers.constants.AddressZero || b === ethers.constants.AddressZero) fail("enter ERC20 token addresses");
+    /* global BigInt */
+    return BigInt(a) < BigInt(b) ? { currency0: a, currency1: b } : { currency0: b, currency1: a };
+  }
+
+  /** The seven hookless pool keys of a pair, in FEE_TIERS order. */
+  function poolKeysFor(currency0, currency1) {
+    return FEE_TIERS.map(function (tier) {
+      return normalisePoolKey({ currency0: currency0, currency1: currency1, fee: tier[0], tickSpacing: tier[1], hooks: NO_HOOKS });
+    });
+  }
+
+  /** PoolId = keccak256(abi.encode(currency0, currency1, fee, tickSpacing, hooks)). */
+  function poolId(poolKey) {
+    return utils.keccak256(abi.encode([POOL_KEY_TYPE], [normalisePoolKey(poolKey)]));
+  }
+
+  /** Price of currency0 in currency1 base units: 1.0001^tick. */
+  function tickToPrice(tick) {
+    var t = Number(tick);
+    if (!Number.isInteger(t) || t < MIN_TICK || t > MAX_TICK) fail("tick out of range");
+    return Math.pow(1.0001, t);
+  }
+
+  /** The Swap log's pool id, tick and position. Throws on a log that is not a PoolManager Swap. */
+  function decodeSwapLog(log) {
+    if (!log || !log.topics || log.topics[0] !== SWAP_TOPIC || log.topics.length < 2) fail("not a Swap log");
+    var decoded = abi.decode(SWAP_DATA_TYPES, log.data);
+    return {
+      poolId: log.topics[1].toLowerCase(),
+      blockNumber: BigNumber.from(log.blockNumber).toNumber(),
+      logIndex: log.logIndex === undefined ? 0 : BigNumber.from(log.logIndex).toNumber(),
+      sqrtPriceX96: decoded[2],
+      liquidity: decoded[3],
+      tick: BigNumber.from(decoded[4]).toNumber(),
+      fee: BigNumber.from(decoded[5]).toNumber(),
+    };
+  }
+
+  /**
+   * One row per pool key: swap count in the window, the tick of the latest swap and its price.
+   * A pool with no swap in the window is inactive and has no price.
+   */
+  function summarisePools(poolKeys, logs) {
+    if (!Array.isArray(logs)) fail("logs must be an array");
+    var rows = poolKeys.map(function (key) {
+      var normalised = normalisePoolKey(key);
+      return { poolKey: normalised, poolId: poolId(normalised), fee: normalised.fee, tickSpacing: normalised.tickSpacing,
+        swaps: 0, tick: null, price: null, active: false, lastBlock: null, lastIndex: null };
+    });
+    var byId = {};
+    rows.forEach(function (row) { byId[row.poolId] = row; });
+    logs.forEach(function (log) {
+      if (!log || !log.topics || log.topics[0] !== SWAP_TOPIC || !log.topics[1]) return;
+      var row = byId[log.topics[1].toLowerCase()];
+      if (!row) return;
+      var swap = decodeSwapLog(log);
+      row.swaps += 1;
+      if (row.lastBlock === null || swap.blockNumber > row.lastBlock ||
+        (swap.blockNumber === row.lastBlock && swap.logIndex >= row.lastIndex)) {
+        row.lastBlock = swap.blockNumber;
+        row.lastIndex = swap.logIndex;
+        row.tick = swap.tick;
+        row.price = tickToPrice(swap.tick);
+      }
+    });
+    rows.forEach(function (row) { row.active = row.swaps > 0; });
+    return rows;
+  }
+
+  /** Percent of the pool's input the LP fee takes: fee is in hundredths of a basis point. */
+  function feeCostPercent(feeA, feeB) {
+    return (Number(feeA) + Number(feeB)) / 10000;
+  }
+
+  /** Price gap as a percent of the lower price. */
+  function spreadPercent(priceA, priceB) {
+    var a = Number(priceA);
+    var b = Number(priceB);
+    if (!(a > 0) || !(b > 0) || !Number.isFinite(a) || !Number.isFinite(b)) fail("prices must be positive numbers");
+    return Math.abs(a - b) / Math.min(a, b) * 100;
+  }
+
+  /**
+   * Every pair of active pools, best net first, at most `limit` rows. `buy` is the pool with the
+   * lower price (currency0 is cheaper there: sell currency1 into it, zeroForOne=false) and `sell`
+   * the pool with the higher price (zeroForOne=true). GREEN means net% is above the threshold.
+   */
+  function rankSpreads(pools, thresholdPercent, limit) {
+    var threshold = thresholdPercent === undefined ? 0.5 : Number(thresholdPercent);
+    if (!Number.isFinite(threshold) || threshold < 0) fail("threshold must be a non-negative percent");
+    var max = limit === undefined ? 5 : limit;
+    var active = pools.filter(function (pool) { return pool.active && pool.price !== null && pool.price > 0; });
+    var spreads = [];
+    for (var i = 0; i < active.length; i++) {
+      for (var j = i + 1; j < active.length; j++) {
+        var buy = active[i].price <= active[j].price ? active[i] : active[j];
+        var sell = buy === active[i] ? active[j] : active[i];
+        var spread = spreadPercent(buy.price, sell.price);
+        var feeCost = feeCostPercent(buy.fee, sell.fee);
+        var net = spread - feeCost;
+        spreads.push({ buy: buy, sell: sell, spreadPercent: spread, feeCostPercent: feeCost, netPercent: net,
+          verdict: net > threshold ? "GREEN" : "RED" });
+      }
+    }
+    spreads.sort(function (x, y) { return y.netPercent - x.netPercent; });
+    return spreads.slice(0, max);
+  }
+
+  /** amount * (10000 - bps) / 10000, rounded down. */
+  function applySlippage(amount, bps) {
+    var basis = bps === undefined ? SLIPPAGE_BPS : Number(bps);
+    if (!Number.isInteger(basis) || basis < 0 || basis > 10000) fail("slippage must be whole basis points, 0 to 10000");
+    return BigNumber.from(amount).mul(10000 - basis).div(10000);
+  }
+
+  // ------------------------------------------------------------------ JSON-RPC and quotes
+
+  /** Minimal JSON-RPC over HTTP client. Errors carry the node's `code` and revert `data`. */
+  function createRpcClient(url, fetchImpl, options) {
+    options = options || {};
+    var doFetch = fetchImpl || (typeof fetch === "function" ? fetch : null);
+    if (typeof doFetch !== "function") fail("fetch is not available; pass a fetch implementation");
+    if (typeof url !== "string" || !/^https?:\/\//.test(url)) fail("RPC url must be an http(s) URL");
+    var timeoutMs = options.timeoutMs === undefined ? 20000 : options.timeoutMs;
+    var nextId = 0;
+    async function request(method, params) {
+      var controller = typeof AbortController === "function" ? new AbortController() : null;
+      var timer = controller ? setTimeout(function () { controller.abort(); }, timeoutMs) : null;
+      try {
+        var response = await doFetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: ++nextId, method: method, params: params || [] }),
+          signal: controller ? controller.signal : undefined,
+        });
+        if (!response || !response.ok) fail("RPC HTTP error " + (response ? response.status : "no response"));
+        var body = await response.json();
+        if (!body || typeof body !== "object") fail("RPC returned no JSON object");
+        if (body.error) {
+          var error = new Error("RPC error: " + (body.error.message || "unknown"));
+          error.code = body.error.code;
+          error.data = body.error.data;
+          throw error;
+        }
+        return body.result;
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+    }
+    return { request: request, url: url };
+  }
+
+  /** Revert data from the shapes wallets and nodes use: a string, nested objects, or inside the message. */
+  function extractRevertData(error) {
+    var seen = [];
+    function walk(value, depth) {
+      if (depth > 6 || value === null || value === undefined) return null;
+      if (typeof value === "string") {
+        var match = /0x[0-9a-fA-F]{8,}/.exec(value);
+        return match ? match[0] : null;
+      }
+      if (typeof value !== "object" || seen.indexOf(value) !== -1) return null;
+      seen.push(value);
+      var keys = ["data", "originalError", "error", "cause", "info", "body", "message"];
+      for (var i = 0; i < keys.length; i++) {
+        var found = walk(value[keys[i]], depth + 1);
+        if (found) return found;
+      }
+      return null;
+    }
+    return walk(error, 0);
+  }
+
+  /** The calldata the quote simulates: one swap whose minHopPriceX36 can never be met. */
+  function encodeQuoteCalldata(poolKey, zeroForOne, amountIn) {
+    var input = encodeV4Swap({ poolKey: poolKey, zeroForOne: zeroForOne, amountIn: amountIn, amountOutMinimum: 0,
+      recipient: MSG_SENDER, minHopPriceX36: MAX_UINT256 });
+    return encodeExecute(COMMAND_V4_SWAP, [input], MAX_UINT256);
+  }
+
+  /** amountOut from V4TooLittleReceivedPerHopSingle revert data, or null if the data is something else. */
+  function decodeQuoteRevert(revertData, amountIn) {
+    if (typeof revertData !== "string" || revertData.slice(0, 10).toLowerCase() !== QUOTE_REVERT_SELECTOR) return null;
+    if (utils.hexDataLength(revertData) !== 68) return null;
+    var decoded = abi.decode(["uint256", "uint256"], "0x" + revertData.slice(10));
+    return decoded[1].mul(BigNumber.from(amountIn)).div(X36);
+  }
+
+  /**
+   * Exact-input quote. The PoolManager executes the swap inside an eth_call of the router; the
+   * router's price check then reverts with the achieved price (amountOut * 1e36 / amountIn), from
+   * which amountOut is recovered. Nothing is settled, so no allowance or balance is needed.
+   * Returns 0 when the pool exists but has no liquidity on the path. Rejects when the pool is
+   * not initialised, the RPC fails, or the router did not answer with its price check.
+   */
+  async function quoteExactIn(request, args) {
+    if (typeof request !== "function") fail("request function is required");
+    if (!args) fail("quote args are required");
+    var key = normalisePoolKey(args.poolKey);
+    var amountIn = uint128(args.amountIn, "amountIn");
+    if (amountIn.isZero() || amountIn.eq(MAX_UINT128)) fail("amountIn must be a real, non-zero amount");
+    var zeroForOne = Boolean(args.zeroForOne);
+    var transaction = { to: ROUTER, data: encodeQuoteCalldata(key, zeroForOne, amountIn) };
+    if (args.from) transaction.from = utils.getAddress(args.from);
+    try {
+      await request("eth_call", [transaction, "latest"]);
+    } catch (error) {
+      var amountOut = decodeQuoteRevert(extractRevertData(error), amountIn);
+      if (amountOut !== null) return amountOut;
+      var wrapped = new Error("Quote failed for pool " + key.fee + "/" + key.tickSpacing + ": " +
+        (error && error.message ? error.message : String(error)));
+      wrapped.cause = error;
+      throw wrapped;
+    }
+    fail("quote simulation did not revert with the router's price check; router behaviour changed");
+  }
+
+  // ------------------------------------------------------------------ live pool monitor
+
+  /**
+   * Polls the PoolManager's Swap logs for the seven fee tiers of one pair.
+   *
+   * options: request(method, params) (required), pollIntervalMs (30000), retryIntervalMs (60000),
+   *          windowBlocks (100), thresholdPercent (number or function, 0.5), onUpdate(state),
+   *          onError(error, state), now().
+   *
+   * start(tokenA, tokenB) resolves after the first poll attempt and keeps polling until stop().
+   * Any RPC failure (metadata, block number, logs) is caught: the state records the error, the
+   * next attempt is scheduled after retryIntervalMs, and polling never stops by itself.
+   */
+  function createPoolMonitor(options) {
+    options = options || {};
+    var request = options.request;
+    if (typeof request !== "function") fail("request function is required");
+    var pollMs = options.pollIntervalMs === undefined ? POLL_INTERVAL_MS : options.pollIntervalMs;
+    var retryMs = options.retryIntervalMs === undefined ? RPC_RETRY_MS : options.retryIntervalMs;
+    var windowBlocks = options.windowBlocks === undefined ? LOG_WINDOW_BLOCKS : options.windowBlocks;
+    if (!Number.isFinite(pollMs) || pollMs < 0 || !Number.isFinite(retryMs) || retryMs < 0) fail("invalid intervals");
+    if (!Number.isInteger(windowBlocks) || windowBlocks < 1) fail("windowBlocks must be a positive integer");
+    var onUpdate = options.onUpdate || function () {};
+    var onError = options.onError || function () {};
+    var now = options.now || function () { return Date.now(); };
+    var thresholdOption = options.thresholdPercent === undefined ? 0.5 : options.thresholdPercent;
+    var threshold = typeof thresholdOption === "function" ? thresholdOption : function () { return thresholdOption; };
+
+    var tokens = null;
+    var running = false;
+    var generation = 0;
+    var timer = null;
+    var state = freshState();
+
+    function freshState() {
+      return { pair: null, pools: [], spreads: [], blockNumber: null, fromBlock: null, lastPoll: null,
+        lastError: null, retryAt: null, nextPollMs: null, polls: 0, errors: 0 };
+    }
+
+    async function readString(token, name) {
+      var result = await request("eth_call", [{ to: token, data: tokenInterface.encodeFunctionData(name, []) }, "latest"]);
+      if (!result || result === "0x") fail("no " + name + "() at " + token);
+      return tokenInterface.decodeFunctionResult(name, result)[0];
+    }
+
+    /** Sort the pair and read symbol() and decimals() of both tokens. */
+    async function loadPair(tokenA, tokenB) {
+      var sorted = sortPair(tokenA, tokenB);
+      var pair = { tokenA: utils.getAddress(tokenA), tokenB: utils.getAddress(tokenB),
+        currency0: sorted.currency0, currency1: sorted.currency1, keys: poolKeysFor(sorted.currency0, sorted.currency1) };
+      pair.symbol0 = String(await readString(pair.currency0, "symbol"));
+      pair.decimals0 = BigNumber.from(await readString(pair.currency0, "decimals")).toNumber();
+      pair.symbol1 = String(await readString(pair.currency1, "symbol"));
+      pair.decimals1 = BigNumber.from(await readString(pair.currency1, "decimals")).toNumber();
+      pair.symbolA = pair.tokenA === pair.currency0 ? pair.symbol0 : pair.symbol1;
+      pair.symbolB = pair.tokenB === pair.currency0 ? pair.symbol0 : pair.symbol1;
+      pair.decimalsA = pair.tokenA === pair.currency0 ? pair.decimals0 : pair.decimals1;
+      pair.decimalsB = pair.tokenB === pair.currency0 ? pair.decimals0 : pair.decimals1;
+      return pair;
+    }
+
+    /** One scan: latest block, Swap logs of the seven pools over the window, table and spreads. */
+    async function pollOnce() {
+      if (!tokens) fail("start(tokenA, tokenB) first");
+      var pair = state.pair || await loadPair(tokens[0], tokens[1]);
+      var latest = BigNumber.from(await request("eth_blockNumber", [])).toNumber();
+      var fromBlock = Math.max(0, latest - (windowBlocks - 1));
+      var logs = await request("eth_getLogs", [{
+        address: POOL_MANAGER,
+        fromBlock: utils.hexValue(fromBlock),
+        toBlock: utils.hexValue(latest),
+        topics: [SWAP_TOPIC, pair.keys.map(poolId)],
+      }]);
+      if (!Array.isArray(logs)) fail("eth_getLogs did not return a list");
+      var pools = summarisePools(pair.keys, logs);
+      var scale = Math.pow(10, pair.decimals0 - pair.decimals1);
+      pools.forEach(function (pool) { pool.displayPrice = pool.price === null ? null : pool.price * scale; });
+      state.pair = pair;
+      state.pools = pools;
+      state.spreads = rankSpreads(pools, threshold());
+      state.blockNumber = latest;
+      state.fromBlock = fromBlock;
+      state.lastPoll = now();
+      state.lastError = null;
+      state.retryAt = null;
+      state.polls += 1;
+      return state;
+    }
+
+    async function cycle() {
+      if (!running) return;
+      var mine = generation;
+      var delay = pollMs;
+      try {
+        await pollOnce();
+        if (mine !== generation) return;
+        onUpdate(state);
+      } catch (error) {
+        if (mine !== generation) return;
+        delay = retryMs;
+        state.errors += 1;
+        state.lastError = error && error.message ? error.message : String(error);
+        state.retryAt = now() + retryMs;
+        onError(error, state);
+        onUpdate(state);
+      }
+      if (mine !== generation || !running) return;
+      state.nextPollMs = delay;
+      timer = setTimeout(cycle, delay);
+    }
+
+    function stop() {
+      running = false;
+      generation += 1;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    }
+
+    function start(tokenA, tokenB) {
+      stop();
+      sortPair(tokenA, tokenB); // validate synchronously so a bad pair never starts a loop
+      tokens = [tokenA, tokenB];
+      state = freshState();
+      running = true;
+      return cycle();
+    }
+
+    return { start: start, stop: stop, pollOnce: pollOnce, loadPair: loadPair,
+      getState: function () { return state; }, isRunning: function () { return running; } };
+  }
+
   /** Permit2 uses uint160/uint48, NOT ERC20's approve(address,uint256). Zero amount revokes. */
   function encodePermit2Approve(token, spender, amount, expiration) {
     var approved = BigNumber.from(amount);
@@ -369,11 +755,38 @@
       return permit2Interface.decodeFunctionResult("allowance", result);
     }
 
-    async function checkTokenAllowances(usdgAmount, ponsAmount) {
+    /**
+     * The pair a swap settles in. Default: PONS (currency0) / USDG (currency1). A pair carries
+     * currency0, currency1 and optional symbol0/symbol1 for messages. The "USDG" amount of the
+     * original API is the currency1 amount and the "PONS" amount the currency0 amount.
+     */
+    function resolvePair(pair) {
+      if (!pair) return { currency0: utils.getAddress(PONS), currency1: utils.getAddress(USDG), symbol0: "PONS", symbol1: "USDG" };
+      var sorted = sortPair(pair.currency0, pair.currency1);
+      if (sorted.currency0 !== utils.getAddress(pair.currency0)) fail("pair.currency0 must sort below pair.currency1");
+      return { currency0: sorted.currency0, currency1: sorted.currency1,
+        symbol0: pair.symbol0 || labelFor(sorted.currency0), symbol1: pair.symbol1 || labelFor(sorted.currency1) };
+    }
+
+    function labelFor(token, pair) {
+      var address = utils.getAddress(token);
+      if (pair && address === pair.currency0) return pair.symbol0;
+      if (pair && address === pair.currency1) return pair.symbol1;
+      if (address === utils.getAddress(USDG)) return "USDG";
+      if (address === utils.getAddress(PONS)) return "PONS";
+      return address;
+    }
+
+    /** [[currency1, amount1, label1], [currency0, amount0, label0]]: currency1 (USDG) first. */
+    function pairEntries(pair, amount1, amount0) {
+      return [[pair.currency1, amount1, pair.symbol1], [pair.currency0, amount0, pair.symbol0]];
+    }
+
+    async function checkTokenAllowances(usdgAmount, ponsAmount, pair) {
       var expected = session;
+      var resolved = resolvePair(pair);
       await assertSession(expected);
-      var tokens = [[USDG, usdgAmount, "USDG"], [PONS, ponsAmount, "PONS"]];
-      for (var entry of tokens) {
+      for (var entry of pairEntries(resolved, usdgAmount, ponsAmount)) {
         var result = await request("eth_call", [{
           to: entry[0], data: tokenInterface.encodeFunctionData("allowance", [expected.account, PERMIT2]),
         }, "latest"]);
@@ -385,17 +798,34 @@
       await assertSession(expected);
     }
 
-    async function checkAllowances(usdgAmount, ponsAmount, validUntil) {
+    async function checkAllowances(usdgAmount, ponsAmount, validUntil, pair) {
       var expected = session;
-      await checkTokenAllowances(usdgAmount, ponsAmount);
+      var resolved = resolvePair(pair);
+      await checkTokenAllowances(usdgAmount, ponsAmount, resolved);
       var until = validUntil === undefined ? await timestamp() : validUntil;
-      for (var entry of [[USDG, usdgAmount, "USDG"], [PONS, ponsAmount, "PONS"]]) {
+      for (var entry of pairEntries(resolved, usdgAmount, ponsAmount)) {
         var allowed = await readPermit2(expected.account, entry[0]);
         if (allowed.amount.lt(entry[1]) || BigNumber.from(allowed.expiration).lt(until)) {
           fail(entry[2] + " Permit2 allowance is insufficient or expires too soon; click APPROVE PERMIT2");
         }
       }
       await assertSession(expected);
+    }
+
+    /** Native and ERC20 balances of `account` (default: the connected account). Read-only. */
+    async function readBalances(tokens, account) {
+      var owner = account ? utils.getAddress(account) : (session ? session.account : null);
+      if (!owner) fail("Wallet changed or disconnected; connect again");
+      var eth = BigNumber.from(await request("eth_getBalance", [owner, "latest"]));
+      var balances = [];
+      for (var token of tokens || []) {
+        var result = await request("eth_call", [{
+          to: utils.getAddress(token), data: tokenInterface.encodeFunctionData("balanceOf", [owner]),
+        }, "latest"]);
+        if (!result || result === "0x") fail("no balanceOf() at " + token);
+        balances.push(tokenInterface.decodeFunctionResult("balanceOf", result)[0]);
+      }
+      return { account: owner, eth: eth, tokens: balances };
     }
 
     async function waitReceipt(hash, expected) {
@@ -410,7 +840,10 @@
         }
         await new Promise(function (resolve) { setTimeout(resolve, pollInterval); });
       }
-      fail("Confirmation timed out; transaction may still be pending. Check " + hash + " before retrying");
+      var timeout = new Error("V4ArbEncoder: Confirmation timed out; transaction may still be pending. Check " + hash +
+        " before retrying");
+      timeout.pendingHash = hash;
+      throw timeout;
     }
 
     async function submit(transaction, expected, label) {
@@ -423,7 +856,7 @@
     }
 
     /** Calls Permit2.approve through the wallet and resolves ONLY after a successful receipt. */
-    async function approveForSession(token, spender, amount, expiration, expected) {
+    async function approveForSession(token, spender, amount, expiration, expected, pair) {
       var data = encodePermit2Approve(token, spender, amount, expiration);
       await assertSession(expected);
       if (!BigNumber.from(amount).isZero() && BigNumber.from(expiration).lte(await timestamp())) {
@@ -431,8 +864,7 @@
       }
       await requireCode(PERMIT2);
       prepared = null;
-      var label = utils.getAddress(token) === utils.getAddress(USDG) ? "USDG" :
-        utils.getAddress(token) === utils.getAddress(PONS) ? "PONS" : token;
+      var label = labelFor(token, pair);
       return submit({ from: expected.account, to: PERMIT2, data: data, value: "0x0",
         chainId: utils.hexValue(CHAIN_ID) }, expected, label + " Permit2 approval");
     }
@@ -441,18 +873,22 @@
       return approveForSession(token, spender, amount, expiration, session);
     }
 
-    /** USDG then PONS; never request the next approval before the previous receipt succeeds. */
-    async function approveBothPermit2(usdgAmount, ponsAmount, expiration) {
+    /**
+     * currency1 (USDG) then currency0 (PONS); never request the next approval before the
+     * previous receipt succeeds. `pair` is optional and defaults to PONS/USDG.
+     */
+    async function approveBothPermit2(usdgAmount, ponsAmount, expiration, pair) {
       var expected = session;
+      var resolved = resolvePair(pair);
       // Validate BOTH before the first wallet transaction, so an invalid PONS limit sends nothing.
-      encodePermit2Approve(USDG, ROUTER, usdgAmount, expiration);
-      encodePermit2Approve(PONS, ROUTER, ponsAmount, expiration);
+      encodePermit2Approve(resolved.currency1, ROUTER, usdgAmount, expiration);
+      encodePermit2Approve(resolved.currency0, ROUTER, ponsAmount, expiration);
       if (BigNumber.from(usdgAmount).isZero() || BigNumber.from(ponsAmount).isZero()) fail("approval limits must be positive");
       await assertSession(expected);
       var validUntil = (await timestamp()) + 1200;
       if (BigNumber.from(expiration).lt(validUntil)) fail("approval expiration must cover the next 20 minutes");
       prepared = null;
-      for (var entry of [[USDG, usdgAmount, "USDG"], [PONS, ponsAmount, "PONS"]]) {
+      for (var entry of pairEntries(resolved, usdgAmount, ponsAmount)) {
         await assertSession(expected);
         var allowed = await readPermit2(expected.account, entry[0]);
         if (session !== expected) fail("Wallet changed or disconnected; connect again");
@@ -460,16 +896,28 @@
           status(entry[2] + " Permit2 allowance already sufficient; skipped");
           continue;
         }
-        await approvePermit2(entry[0], ROUTER, entry[1], expiration);
+        await approveForSession(entry[0], ROUTER, entry[1], expiration, expected, resolved);
       }
       await assertSession(expected);
     }
 
-    /** Build with the connected account as recipient, check allowances, and eth_call the exact tx. */
+    /**
+     * Build with the connected account as recipient, check allowances, and eth_call the exact tx.
+     * args = { usdgIn, ponsAmount, minUsdgOut, deadline?, buyPool?, sellPool?, pair? }. The pools
+     * default to POOL_A / POOL_B; both must trade the same pair, whose currency1 is the input.
+     */
     async function prepareSwap(args) {
       prepared = null;
       if (!args) fail("args are required");
       // Snapshot values before the first await; later caller edits cannot change what was simulated.
+      var buyPool = normalisePoolKey(args.buyPool || POOL_A);
+      var sellPool = normalisePoolKey(args.sellPool || POOL_B);
+      if (buyPool.currency0 !== sellPool.currency0 || buyPool.currency1 !== sellPool.currency1) {
+        fail("both pools must trade the same pair");
+      }
+      if (poolId(buyPool) === poolId(sellPool)) fail("buy and sell pool are the same pool");
+      var pair = resolvePair({ currency0: buyPool.currency0, currency1: buyPool.currency1,
+        symbol0: args.pair && args.pair.symbol0, symbol1: args.pair && args.pair.symbol1 });
       args = { usdgIn: uint128(args.usdgIn, "usdgIn"), ponsAmount: uint128(args.ponsAmount, "ponsAmount"),
         minUsdgOut: uint128(args.minUsdgOut, "minUsdgOut"), deadline: args.deadline };
       var expected = session;
@@ -478,15 +926,16 @@
       var deadline = args.deadline === undefined ? now + 1200 : BigNumber.from(args.deadline).toNumber();
       if (deadline <= now) fail("Swap deadline has expired; build and dry run again");
       var data = buildCalldata({ recipient: expected.account, usdgIn: args.usdgIn, ponsAmount: args.ponsAmount,
-        minUsdgOut: args.minUsdgOut, deadline: deadline });
+        minUsdgOut: args.minUsdgOut, deadline: deadline, buyPool: buyPool, sellPool: sellPool });
       await requireCode(ROUTER);
-      await checkAllowances(args.usdgIn, args.ponsAmount, deadline);
+      await checkAllowances(args.usdgIn, args.ponsAmount, deadline, pair);
       var transaction = Object.freeze({ from: expected.account, to: ROUTER, data: data, value: "0x0",
         chainId: utils.hexValue(CHAIN_ID) });
       await request("eth_call", [transaction, "latest"]);
       await assertSession(expected);
       prepared = Object.freeze({ transaction: transaction, deadline: deadline,
-        usdgIn: BigNumber.from(args.usdgIn), ponsAmount: BigNumber.from(args.ponsAmount) });
+        usdgIn: BigNumber.from(args.usdgIn), ponsAmount: BigNumber.from(args.ponsAmount),
+        buyPool: Object.freeze(buyPool), sellPool: Object.freeze(sellPool), pair: Object.freeze(pair) });
       status("Calldata built; eth_call dry run succeeded");
       return prepared;
     }
@@ -498,9 +947,60 @@
       var expected = session;
       await assertSession(expected);
       if ((await timestamp()) >= candidate.deadline) fail("Swap deadline has expired; build and dry run again");
-      await checkAllowances(candidate.usdgIn, candidate.ponsAmount, candidate.deadline);
+      await checkAllowances(candidate.usdgIn, candidate.ponsAmount, candidate.deadline, candidate.pair);
       await request("eth_call", [candidate.transaction, "latest"]);
       return submit(candidate.transaction, expected, "Swap");
+    }
+
+    function transferTarget(to, expected) {
+      var target = recipientAddress(to);
+      if (target === expected.account) fail("The new wallet must differ from the connected account");
+      return target;
+    }
+
+    /**
+     * token.transfer(to, balanceOf(account)) through the wallet: the WHOLE balance, irreversible.
+     * Simulated with eth_call first; resolves after a successful receipt with { hash, amount }.
+     */
+    async function transferAllToken(token, to) {
+      var expected = session;
+      await assertSession(expected);
+      var target = transferTarget(to, expected);
+      var asset = utils.getAddress(token);
+      await requireCode(asset);
+      var balance = (await readBalances([asset], expected.account)).tokens[0];
+      if (balance.isZero()) fail("Nothing to transfer: the " + labelFor(asset) + " balance is 0");
+      var transaction = { from: expected.account, to: asset, value: "0x0",
+        data: tokenInterface.encodeFunctionData("transfer", [target, balance]), chainId: utils.hexValue(CHAIN_ID) };
+      var result = await request("eth_call", [transaction, "latest"]);
+      if (result && result !== "0x" && !tokenInterface.decodeFunctionResult("transfer", result)[0]) {
+        fail("token.transfer simulation returned false");
+      }
+      prepared = null;
+      var receipt = await submit(transaction, expected, labelFor(asset) + " transfer of " + balance.toString() + " base units");
+      return { hash: receipt.transactionHash, amount: balance, receipt: receipt };
+    }
+
+    /**
+     * Sends the whole native balance minus a gas reserve of 2 x (estimated gas x gas price); the
+     * reserve that is not spent stays behind as dust. Resolves after a successful receipt.
+     */
+    async function transferAllEth(to) {
+      var expected = session;
+      await assertSession(expected);
+      var target = transferTarget(to, expected);
+      var balance = (await readBalances([], expected.account)).eth;
+      var gasPrice = BigNumber.from(await request("eth_gasPrice", []));
+      var gas = BigNumber.from(await request("eth_estimateGas", [{ from: expected.account, to: target, value: "0x1" }]));
+      if (gas.isZero() || gasPrice.isZero()) fail("Gas estimate or gas price is zero; cannot size the transfer");
+      var reserve = gas.mul(gasPrice).mul(2);
+      if (balance.lte(reserve)) fail("ETH balance " + balance.toString() + " wei does not cover the gas reserve of " + reserve.toString() + " wei");
+      var value = balance.sub(reserve);
+      var transaction = { from: expected.account, to: target, value: value.toHexString(), gas: gas.toHexString(),
+        gasPrice: gasPrice.toHexString(), chainId: utils.hexValue(CHAIN_ID) };
+      prepared = null;
+      var receipt = await submit(transaction, expected, "ETH transfer of " + value.toString() + " wei");
+      return { hash: receipt.transactionHash, amount: value, reserve: reserve, receipt: receipt };
     }
 
     function destroy() {
@@ -513,6 +1013,8 @@
     return { connect: connect, timestamp: timestamp, approvePermit2: approvePermit2,
       approveBothPermit2: approveBothPermit2, checkTokenAllowances: checkTokenAllowances,
       checkAllowances: checkAllowances, prepareSwap: prepareSwap, sendSwap: sendSwap,
+      readBalances: readBalances, transferAllToken: transferAllToken, transferAllEth: transferAllEth,
+      request: request, account: function () { return session ? session.account : null; },
       invalidate: invalidate, destroy: destroy };
   }
 
@@ -528,6 +1030,8 @@
   return {
     ROUTER: ROUTER,
     PERMIT2: PERMIT2,
+    POOL_MANAGER: POOL_MANAGER,
+    RPC_URL: RPC_URL,
     PERMIT2_ABI: PERMIT2_ABI,
     CHAIN_ID: CHAIN_ID,
     PONS: PONS,
@@ -535,6 +1039,29 @@
     NO_HOOKS: NO_HOOKS,
     POOL_A: POOL_A,
     POOL_B: POOL_B,
+    SWAP_TOPIC: SWAP_TOPIC,
+    FEE_TIERS: FEE_TIERS,
+    LOG_WINDOW_BLOCKS: LOG_WINDOW_BLOCKS,
+    POLL_INTERVAL_MS: POLL_INTERVAL_MS,
+    RPC_RETRY_MS: RPC_RETRY_MS,
+    SLIPPAGE_BPS: SLIPPAGE_BPS,
+    QUOTE_REVERT_SELECTOR: QUOTE_REVERT_SELECTOR,
+    sortPair: sortPair,
+    poolKeysFor: poolKeysFor,
+    poolId: poolId,
+    tickToPrice: tickToPrice,
+    decodeSwapLog: decodeSwapLog,
+    summarisePools: summarisePools,
+    feeCostPercent: feeCostPercent,
+    spreadPercent: spreadPercent,
+    rankSpreads: rankSpreads,
+    applySlippage: applySlippage,
+    createRpcClient: createRpcClient,
+    extractRevertData: extractRevertData,
+    encodeQuoteCalldata: encodeQuoteCalldata,
+    decodeQuoteRevert: decodeQuoteRevert,
+    quoteExactIn: quoteExactIn,
+    createPoolMonitor: createPoolMonitor,
     EXECUTE_SELECTOR: EXECUTE_SELECTOR,
     COMMAND_V4_SWAP: COMMAND_V4_SWAP,
     ACTIONS_SWAP_SETTLE_TAKE: ACTIONS_SWAP_SETTLE_TAKE,

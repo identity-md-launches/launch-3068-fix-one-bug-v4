@@ -2,6 +2,8 @@
 
 // Deterministic EIP-1193 test double. Approvals change state only when their receipts are mined.
 // This checks client sequencing and failure handling, not the deployed AMM's execution/prices.
+// The same object also answers the page's direct JSON-RPC traffic through `fetch()`, so one
+// state (balances, logs, allowances) backs both the wallet and the public RPC in the tests.
 const { EventEmitter } = require("node:events");
 const { ethers } = require("../vendor/ethers-5.7.2.umd.min.js");
 const E = require("../v4-arb-encoder.js");
@@ -10,11 +12,23 @@ const permit = new ethers.utils.Interface([
   "function approve(address token,address spender,uint160 amount,uint48 expiration)",
   "function allowance(address owner,address token,address spender) view returns (uint160,uint48,uint48)",
 ]);
-const erc20 = new ethers.utils.Interface(["function allowance(address owner,address spender) view returns (uint256)"]);
+const erc20 = new ethers.utils.Interface([
+  "function allowance(address owner,address spender) view returns (uint256)",
+  "function balanceOf(address owner) view returns (uint256)",
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
+  "function transfer(address to,uint256 amount) returns (bool)",
+]);
 const CALLER = "0xd064E892A3BBb758053922C80098b7f4130444c6";
 const OTHER = "0xd7F5739050c65fCe574400F70Bea1Ca63B6b4Bbc"; // existing transaction fixture
 const lower = (address) => address.toLowerCase();
 const paramsType = "tuple(tuple(address,address,uint24,int24,address),bool,uint128,uint128,uint256,bytes)";
+// Prices observed on the live router on 2026-11-07 (amountOut * 1e36 / amountIn for 0.01 USDG → PONS).
+const LIVE_PRICE_X36 = {
+  "3000/60": ethers.BigNumber.from("5235867312106401500000000000000000000000000000000"),
+  "2500/25": ethers.BigNumber.from("5230904955821507700000000000000000000000000000000"),
+  "30000/600": ethers.BigNumber.from(0), // exists, no liquidity
+};
 
 class MockWallet extends EventEmitter {
   constructor() {
@@ -22,17 +36,36 @@ class MockWallet extends EventEmitter {
     this.account = CALLER;
     this.chain = "0x1237";
     this.now = 1800000000;
+    this.block = 108394834;
     this.calls = [];
+    this.rpcCalls = [];
     this.sent = [];
     this.pending = new Map();
     this.permits = new Map();
     this.tokenAllowances = new Map([[lower(E.USDG), E.MAX_UINT256], [lower(E.PONS), E.MAX_UINT256]]);
+    this.tokens = new Map([[lower(E.PONS), ["PONS", 18]], [lower(E.USDG), ["USDG", 6]]]);
+    this.balances = new Map([
+      [this.key(CALLER, E.PONS, "bal"), ethers.utils.parseUnits("1.5", 18)],
+      [this.key(CALLER, E.USDG, "bal"), ethers.utils.parseUnits("25", 6)],
+    ]);
+    this.ethBalances = new Map([[lower(CALLER), ethers.utils.parseEther("0.2")]]);
+    this.gasPrice = ethers.BigNumber.from(20102000);
+    this.gasEstimate = ethers.BigNumber.from(21000);
+    this.logs = [];
+    this.quotes = new Map(); // poolId -> priceX36; pools absent here are "not initialised"
+    for (const [tier, price] of Object.entries(LIVE_PRICE_X36)) {
+      const [fee, tickSpacing] = tier.split("/").map(Number);
+      this.quotes.set(E.poolId({ currency0: E.PONS, currency1: E.USDG, fee, tickSpacing, hooks: E.NO_HOOKS }), price);
+    }
     this.pendingPolls = 1;
     this.failReceipt = 0;
     this.rejectSend = 0;
     this.routerCalls = 0;
     this.failRouterCall = 0;
+    this.rpcFailures = 0; // the next N direct-RPC requests fail (rate limit / outage)
+    this.httpFailures = 0; // the next N direct-RPC requests answer HTTP 429
     this.code = "0x60006000";
+    this.fetch = this.fetch.bind(this);
   }
 
   key(owner, token, spender = E.ROUTER) { return [owner, token, spender].map(lower).join(":"); }
@@ -43,6 +76,36 @@ class MockWallet extends EventEmitter {
 
   readPermit(owner, token, spender = E.ROUTER) {
     return this.permits.get(this.key(owner, token, spender)) || [ethers.BigNumber.from(0), 0, 0];
+  }
+
+  balance(owner, token) { return this.balances.get(this.key(owner, token, "bal")) || ethers.BigNumber.from(0); }
+  setBalance(owner, token, amount) { this.balances.set(this.key(owner, token, "bal"), ethers.BigNumber.from(amount)); }
+  ethBalance(owner) { return this.ethBalances.get(lower(owner)) || ethers.BigNumber.from(0); }
+
+  /** Append a PoolManager Swap log for a pool of the PONS/USDG pair (or any key) at a block. */
+  addSwap(fee, tickSpacing, tick, blockNumber = this.block, extra = {}) {
+    const key = { currency0: extra.currency0 || E.PONS, currency1: extra.currency1 || E.USDG, fee, tickSpacing, hooks: E.NO_HOOKS };
+    const data = abi.encode(["int128", "int128", "uint160", "uint128", "int24", "uint24"],
+      [-1000, 1000, 0, 0, tick, fee]);
+    const log = { address: lower(E.POOL_MANAGER), topics: [E.SWAP_TOPIC, E.poolId(key)], data,
+      blockNumber: ethers.utils.hexValue(blockNumber), logIndex: ethers.utils.hexValue(this.logs.length) };
+    this.logs.push(log);
+    return log;
+  }
+
+  /** A quote-style router call (one command, minHopPriceX36 = max) reverts with the pool's price. */
+  quoteCall(tx) {
+    const [commands, inputs] = abi.decode(["bytes", "bytes[]", "uint256"], "0x" + tx.data.slice(10));
+    if (commands !== "0x10") return false;
+    const [, params] = abi.decode(["bytes", "bytes[]"], inputs[0]);
+    const swap = abi.decode([paramsType], params[0])[0];
+    if (!swap[4].eq(ethers.constants.MaxUint256)) return false;
+    const id = E.poolId({ currency0: swap[0][0], currency1: swap[0][1], fee: swap[0][2], tickSpacing: swap[0][3], hooks: swap[0][4] });
+    if (!this.quotes.has(id)) {
+      throw Object.assign(new Error("execution reverted"), { code: 3, data: "0x486aa307" }); // PoolNotInitialized()
+    }
+    const data = E.QUOTE_REVERT_SELECTOR + abi.encode(["uint256", "uint256"], [ethers.constants.MaxUint256, this.quotes.get(id)]).slice(2);
+    throw Object.assign(new Error("execution reverted"), { code: 3, data });
   }
 
   routerCall(tx) {
@@ -59,39 +122,68 @@ class MockWallet extends EventEmitter {
       if (lower(recipient) !== lower(tx.from) || max.lt(swap[2])) throw new Error("Wrong recipient/settlement");
       const [amount, expiration] = this.readPermit(tx.from, currency);
       if (amount.lt(swap[2]) || expiration < this.now) throw new Error("Permit2 allowance missing or expired");
-      if (this.tokenAllowances.get(lower(currency)).lt(swap[2])) throw new Error("ERC20 allowance missing");
-      if (index === 0 && swap[3].gt(ethers.utils.parseUnits("0.01", 18))) throw new Error("V4TooLittleReceived");
-      return swap[2];
+      if ((this.tokenAllowances.get(lower(currency)) || ethers.BigNumber.from(0)).lt(swap[2])) throw new Error("ERC20 allowance missing");
+      if (index === 0 && swap[3].gt(ethers.utils.parseUnits("0.1", 18))) throw new Error("V4TooLittleReceived");
+      return { amount: swap[2], currency };
     });
     return amounts;
   }
 
-  async request(call) {
-    this.calls.push(JSON.parse(JSON.stringify(call)));
-    if (this.beforeRequest) await this.beforeRequest(call);
-    const { method, params = [] } = call;
+  /** Shared JSON-RPC semantics for the wallet provider and the direct RPC. */
+  handle(method, params = []) {
     if (method === "eth_chainId") return this.chain;
     if (method === "eth_accounts" || method === "eth_requestAccounts") return this.account ? [this.account] : [];
     if (method === "eth_getCode") return this.code;
-    if (method === "eth_getBlockByNumber") return { timestamp: ethers.utils.hexValue(this.now) };
+    if (method === "eth_getBlockByNumber") return { timestamp: ethers.utils.hexValue(this.now), number: ethers.utils.hexValue(this.block) };
+    if (method === "eth_blockNumber") return ethers.utils.hexValue(this.block);
+    if (method === "eth_gasPrice") return this.gasPrice.toHexString();
+    if (method === "eth_estimateGas") return this.gasEstimate.toHexString();
+    if (method === "eth_getBalance") return this.ethBalance(params[0]).toHexString();
+    if (method === "eth_getLogs") {
+      const filter = params[0];
+      const from = ethers.BigNumber.from(filter.fromBlock).toNumber();
+      const to = ethers.BigNumber.from(filter.toBlock).toNumber();
+      if (to - from + 1 > 100) throw new Error("block range too large");
+      const [topic0, topic1] = filter.topics;
+      return this.logs.filter((log) => {
+        const block = ethers.BigNumber.from(log.blockNumber).toNumber();
+        if (lower(log.address) !== lower(filter.address) || block < from || block > to) return false;
+        if (topic0 && log.topics[0] !== topic0) return false;
+        if (topic1) return (Array.isArray(topic1) ? topic1 : [topic1]).map(lower).includes(lower(log.topics[1]));
+        return true;
+      });
+    }
     if (method === "eth_call") {
       const tx = params[0];
       if (lower(tx.to) === lower(E.PERMIT2)) {
         const [owner, token, spender] = permit.decodeFunctionData("allowance", tx.data);
         return permit.encodeFunctionResult("allowance", this.readPermit(owner, token, spender));
       }
-      if ([E.USDG, E.PONS].map(lower).includes(lower(tx.to))) {
+      if (this.tokens.has(lower(tx.to))) {
+        const selector = tx.data.slice(0, 10);
+        if (selector === erc20.getSighash("symbol")) return erc20.encodeFunctionResult("symbol", [this.tokens.get(lower(tx.to))[0]]);
+        if (selector === erc20.getSighash("decimals")) return erc20.encodeFunctionResult("decimals", [this.tokens.get(lower(tx.to))[1]]);
+        if (selector === erc20.getSighash("balanceOf")) {
+          const [owner] = erc20.decodeFunctionData("balanceOf", tx.data);
+          return erc20.encodeFunctionResult("balanceOf", [this.balance(owner, tx.to)]);
+        }
+        if (selector === erc20.getSighash("transfer")) {
+          const [, amount] = erc20.decodeFunctionData("transfer", tx.data);
+          if (this.balance(tx.from, tx.to).lt(amount)) throw new Error("execution reverted: ERC20: transfer amount exceeds balance");
+          return erc20.encodeFunctionResult("transfer", [true]);
+        }
         const [, spender] = erc20.decodeFunctionData("allowance", tx.data);
         if (lower(spender) !== lower(E.PERMIT2)) throw new Error("ERC20 allowance must target Permit2");
-        return erc20.encodeFunctionResult("allowance", [this.tokenAllowances.get(lower(tx.to))]);
+        return erc20.encodeFunctionResult("allowance", [this.tokenAllowances.get(lower(tx.to)) || ethers.BigNumber.from(0)]);
       }
       if (lower(tx.to) === lower(E.ROUTER)) {
+        if (this.quoteCall(tx)) return "0x";
         this.routerCalls++;
         if (this.failRouterCall === this.routerCalls) throw new Error("execution reverted: pool unavailable");
         this.routerCall(tx);
         return "0x";
       }
-      throw new Error("Unexpected eth_call destination");
+      throw new Error("execution reverted"); // no code / not a token
     }
     if (method === "eth_sendTransaction") {
       const index = this.sent.length + 1;
@@ -107,24 +199,64 @@ class MockWallet extends EventEmitter {
       const pending = this.pending.get(params[0]);
       if (!pending || pending.polls-- > 0) return null;
       const succeeded = this.failReceipt !== pending.index;
-      if (!pending.mined && succeeded) {
-        const tx = pending.tx;
-        if (lower(tx.to) === lower(E.PERMIT2)) {
-          const [token, spender, amount, expiration] = permit.decodeFunctionData("approve", tx.data);
-          this.setPermit(token, amount, Number(expiration), tx.from, spender);
-        } else if (lower(tx.to) === lower(E.ROUTER)) {
-          const amounts = this.routerCall(tx);
-          [E.USDG, E.PONS].forEach((token, i) => {
-            const [amount, expiration] = this.readPermit(tx.from, token);
-            this.setPermit(token, amount.sub(amounts[i]), expiration, tx.from);
-          });
-        } else throw new Error("Unexpected transaction destination");
-      }
+      if (!pending.mined && succeeded) this.mine(pending.tx);
       pending.mined = true;
-      return { transactionHash: params[0], status: succeeded ? "0x1" : "0x0", blockNumber: "0x100" };
+      return { transactionHash: params[0], status: succeeded ? "0x1" : "0x0", blockNumber: ethers.utils.hexValue(this.block) };
     }
     throw new Error("Unexpected RPC method " + method);
   }
+
+  /** State transition of a mined transaction. */
+  mine(tx) {
+    if (lower(tx.to) === lower(E.PERMIT2)) {
+      const [token, spender, amount, expiration] = permit.decodeFunctionData("approve", tx.data);
+      this.setPermit(token, amount, Number(expiration), tx.from, spender);
+    } else if (lower(tx.to) === lower(E.ROUTER)) {
+      const amounts = this.routerCall(tx);
+      for (const { amount, currency } of amounts) {
+        const [allowed, expiration] = this.readPermit(tx.from, currency);
+        this.setPermit(currency, allowed.sub(amount), expiration, tx.from);
+      }
+      this.setBalance(tx.from, amounts[0].currency, this.balance(tx.from, amounts[0].currency).sub(amounts[0].amount));
+    } else if (this.tokens.has(lower(tx.to))) {
+      const [to, amount] = erc20.decodeFunctionData("transfer", tx.data);
+      if (this.balance(tx.from, tx.to).lt(amount)) throw new Error("ERC20 transfer exceeds balance");
+      this.setBalance(tx.from, tx.to, this.balance(tx.from, tx.to).sub(amount));
+      this.setBalance(to, tx.to, this.balance(to, tx.to).add(amount));
+    } else if (tx.value && !ethers.BigNumber.from(tx.value).isZero()) {
+      const value = ethers.BigNumber.from(tx.value);
+      const fee = ethers.BigNumber.from(tx.gas || this.gasEstimate).mul(ethers.BigNumber.from(tx.gasPrice || this.gasPrice));
+      if (this.ethBalance(tx.from).lt(value.add(fee))) throw new Error("insufficient funds for value + gas");
+      this.ethBalances.set(lower(tx.from), this.ethBalance(tx.from).sub(value).sub(fee));
+      this.ethBalances.set(lower(tx.to), this.ethBalance(tx.to).add(value));
+    } else throw new Error("Unexpected transaction destination");
+  }
+
+  /** The EIP-1193 provider surface. */
+  async request(call) {
+    this.calls.push(JSON.parse(JSON.stringify(call)));
+    if (this.beforeRequest) await this.beforeRequest(call);
+    return this.handle(call.method, call.params || []);
+  }
+
+  /** The direct JSON-RPC surface the page's `fetch` uses. Only POST JSON-RPC to the RPC URL is answered. */
+  async fetch(url, init) {
+    const body = JSON.parse(init.body);
+    this.rpcCalls.push({ url, ...body });
+    if (this.beforeRpc) await this.beforeRpc(body);
+    if (url !== E.RPC_URL) return { ok: false, status: 404, json: async () => ({}) };
+    if (this.httpFailures > 0) { this.httpFailures--; return { ok: false, status: 429, json: async () => ({}) }; }
+    const reply = (payload) => ({ ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: body.id, ...payload }) });
+    if (this.rpcFailures > 0) {
+      this.rpcFailures--;
+      return reply({ error: { code: -32005, message: "rate limited" } });
+    }
+    try {
+      return reply({ result: this.handle(body.method, body.params || []) });
+    } catch (error) {
+      return reply({ error: { code: error.code === undefined ? -32000 : error.code, message: error.message, data: error.data } });
+    }
+  }
 }
 
-module.exports = { MockWallet, CALLER, OTHER, permit, erc20, paramsType };
+module.exports = { MockWallet, CALLER, OTHER, permit, erc20, paramsType, LIVE_PRICE_X36 };
