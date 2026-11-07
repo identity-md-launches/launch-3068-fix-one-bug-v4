@@ -32,6 +32,10 @@
  * time since each pool's last swap (latest block timestamp minus swap block timestamp), a slot0
  * read per active pool, and pool statuses (OK, STALE, EMPTY, UNKNOWN) that keep a pool out of the
  * spreads and auto mode (poolStatus, annotatePools, autoDecision).
+ *
+ * Follow-up 5 adds Manual mode: two pasted V3 pool addresses read with eth_call only, token0,
+ * token1, fee and slot0 per pool, one request at a time, no logs, no batch, no block reads
+ * (parseManualPoolAddress, readManualPool, validateManualPools, manualSpread, createManualMonitor).
  */
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
@@ -142,6 +146,293 @@
   // BEGIN GENERATED V3 QUOTE BYTECODE (scripts/embed-v3-quote.js)
   var V3_QUOTE_BYTECODE = "0x608060405234801561000f575f80fd5b506040516108d33803806108d383398101604081905261002e91610306565b6001600160a01b038416158061004b57506001600160a01b038316155b806100675750826001600160a01b0316846001600160a01b0316145b8061007957506001600160801b038116155b1561009757604051630951f7bd60e11b815260040160405180910390fd5b6001600160a01b03808416908516105f731f7d7550b1b028f7571e69a784071f0205fd2efa631698ee82836100cc57866100ce565b875b846100d957886100db565b875b6040516001600160e01b031960e085901b1681526001600160a01b0392831660048201529116602482015262ffffff87166044820152606401602060405180830381865afa15801561012f573d5f803e3d5ffd5b505050506040513d601f19601f820116820180604052508101906101539190610360565b90506001600160a01b03811661017c57604051630951f7bd60e11b815260040160405180910390fd5b806001600160a01b0316631a6865026040518163ffffffff1660e01b8152600401602060405180830381865afa1580156101b8573d5f803e3d5ffd5b505050506040513d601f19601f820116820180604052508101906101dc9190610380565b6001600160801b03165f0361021157604051635fe077e360e11b81525f60048201819052602482015260440160405180910390fd5b808260405161021f906102c8565b6001600160a01b03909216825215156020820152604001604051809103905ff08015801561024f573d5f803e3d5ffd5b506040516320e9b73b60e01b81526001600160801b03851660048201526001600160a01b0391909116906320e9b73b906024015f604051808303815f87803b158015610299575f80fd5b505af11580156102ab573d5f803e3d5ffd5b5050505060405163030ad99760e01b815260040160405180910390fd5b6105398061039a83390190565b80516001600160a01b03811681146102eb575f80fd5b919050565b80516001600160801b03811681146102eb575f80fd5b5f805f8060808587031215610319575f80fd5b610322856102d5565b9350610330602086016102d5565b9250604085015162ffffff81168114610347575f80fd5b9150610355606086016102f0565b905092959194509250565b5f60208284031215610370575f80fd5b610379826102d5565b9392505050565b5f60208284031215610390575f80fd5b610379826102f056fe60e060405234801561000f575f80fd5b5060405161053938038061053983398101604081905261002e91610072565b6001600160a01b03821661005557604051630951f7bd60e11b815260040160405180910390fd5b336080526001600160a01b039190911660a052151560c0526100b9565b5f8060408385031215610083575f80fd5b82516001600160a01b0381168114610099575f80fd5b602084015190925080151581146100ae575f80fd5b809150509250929050565b60805160a05160c05161043d6100fc5f395f818160ef0152818161011a01528181610250015261028001525f818160bf015261020f01525f606b015261043d5ff3fe608060405234801561000f575f80fd5b5060043610610034575f3560e01c806320e9b73b14610038578063fa461e331461004d575b5f80fd5b61004b610046366004610316565b610060565b005b61004b61005b366004610343565b610204565b336001600160a01b037f00000000000000000000000000000000000000000000000000000000000000001614158061009f57506001600160801b038116155b156100bd57604051630951f7bd60e11b815260040160405180910390fd5b7f00000000000000000000000000000000000000000000000000000000000000006001600160a01b031663128acb08307f0000000000000000000000000000000000000000000000000000000000000000846001600160801b03167f00000000000000000000000000000000000000000000000000000000000000006101575773fffd8963efd1fc6a506488495d951d5263988d2561015e565b6401000276a45b60405160e086901b6001600160e01b03191681526001600160a01b03948516600482015292151560248401526044830191909152909116606482015260a060848201525f60a482015260c40160408051808303815f875af11580156101c5573d5f803e3d5ffd5b505050506040513d601f19601f820116820180604052508101906101e991906103bf565b505060405163030ad99760e01b815260040160405180910390fd5b336001600160a01b037f0000000000000000000000000000000000000000000000000000000000000000161461024d57604051630951f7bd60e11b815260040160405180910390fd5b5f7f0000000000000000000000000000000000000000000000000000000000000000610279578361027b565b845b90505f7f00000000000000000000000000000000000000000000000000000000000000006102a957856102ab565b845b90505f8212806102ba57505f81135b806102c85750600160ff1b81145b156102e657604051630951f7bd60e11b815260040160405180910390fd5b816102f0826103e1565b604051635fe077e360e11b81526004810192909252602482015260440160405180910390fd5b5f60208284031215610326575f80fd5b81356001600160801b038116811461033c575f80fd5b9392505050565b5f805f8060608587031215610356575f80fd5b8435935060208501359250604085013567ffffffffffffffff81111561037a575f80fd5b8501601f8101871361038a575f80fd5b803567ffffffffffffffff8111156103a0575f80fd5b8760208284010111156103b1575f80fd5b949793965060200194505050565b5f80604083850312156103d0575f80fd5b505080516020909101519092909150565b5f600160ff1b820161040157634e487b7160e01b5f52601160045260245ffd5b505f039056fea2646970667358221220d801d5830da366b26e2ba517b66c12e71d864bec08cc5abe24ed6f3d68bbfe6464736f6c634300081a0033";
   // END GENERATED V3 QUOTE BYTECODE
+
+  // Follow-up 5: Manual mode. Two pasted V3 pool addresses, read with eth_call only (no logs, no batch).
+  var MANUAL_ADDRESS_ERROR = "Enter a 42-char V3 pool address";
+  var MANUAL_INVALID_ERROR = "Invalid pool address";
+  var MANUAL_PAIR_ERROR = "Pools are different pairs";
+  var MANUAL_LIQUIDITY_ERROR = "Pool has no liquidity";
+  var MANUAL_SAME_POOL_ERROR = "Pool A and Pool B are the same pool";
+  var MANUAL_READS = ["token0", "token1", "fee", "slot0"];
+  // slot0 is declared as the brief gives it (six outputs). The deployed pools answer with the
+  // canonical V3 seven-word layout; both start with sqrtPriceX96 then tick, which is all the
+  // page uses, so decodeManualSlot0 reads those two words and accepts either length.
+  var v3ManualPoolInterface = new utils.Interface([
+    "function token0() view returns (address)",
+    "function token1() view returns (address)",
+    "function fee() view returns (uint24)",
+    "function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee, uint8 tickSpacing, bool unlocked)",
+  ]);
+
+  /** A pasted pool address: exactly 0x + 40 hex digits. Throws the brief's message otherwise. */
+  function parseManualPoolAddress(text, label) {
+    var value = String(text === undefined || text === null ? "" : text).trim();
+    if (!/^0x[0-9a-fA-F]{40}$/.test(value)) throw new Error((label ? label + ": " : "") + MANUAL_ADDRESS_ERROR);
+    var address = utils.getAddress(value.toLowerCase());
+    if (address === ethers.constants.AddressZero) throw new Error((label ? label + ": " : "") + MANUAL_ADDRESS_ERROR);
+    return address;
+  }
+
+  /** The four eth_call params of one pool, in MANUAL_READS order: token0, token1, fee, slot0. */
+  function manualPoolCalls(address) {
+    var pool = parseManualPoolAddress(address);
+    return MANUAL_READS.map(function (name) {
+      return { method: "eth_call", params: [{ to: pool, data: v3ManualPoolInterface.encodeFunctionData(name, []) }, "latest"] };
+    });
+  }
+
+  /** sqrtPriceX96 and tick from a slot0 reply of at least two words (six- or seven-output layout). */
+  function decodeManualSlot0(result) {
+    if (typeof result !== "string" || !utils.isHexString(result) || utils.hexDataLength(result) < 64) fail("slot0 reply is too short");
+    var words = abi.decode(["uint256", "int256"], utils.hexDataSlice(result, 0, 64));
+    if (words[0].gt(MAX_UINT160)) fail("sqrtPriceX96 does not fit uint160");
+    var tick = words[1];
+    if (tick.lt(MIN_TICK) || tick.gt(MAX_TICK)) fail("tick out of range");
+    return { sqrtPriceX96: words[0], tick: tick.toNumber() };
+  }
+
+  function manualInvalid(address, detail) {
+    var error = new Error(MANUAL_INVALID_ERROR + " (" + address + (detail ? ": " + detail : "") + ")");
+    error.manualCode = "INVALID_POOL";
+    error.address = address;
+    return error;
+  }
+
+  /** A node's JSON-RPC error is a revert or a missing contract; anything else is transport. */
+  function isRevertError(error) {
+    if (!error || error.code === undefined || error.code === null) return false;
+    if (error.code === -32005 || /rate.?limit|too many requests/i.test(error.message || "")) return false;
+    return true;
+  }
+
+  /**
+   * Decode the four replies of manualPoolCalls into one V3 row shaped like the auto-scan's V3
+   * rows (protocol, address, poolId, fee, currency0, currency1, tick, price, sqrtPriceX96).
+   * An empty reply ("0x": no contract or no such function) is an invalid pool.
+   */
+  function decodeManualPool(address, results) {
+    var pool = parseManualPoolAddress(address);
+    function read(i, name) {
+      var result = rpcResult(results[i]);
+      if (typeof result !== "string" || !utils.isHexString(result) || result === "0x") throw manualInvalid(pool, name + "() returned no data");
+      try {
+        if (name === "slot0") return decodeManualSlot0(result);
+        return v3ManualPoolInterface.decodeFunctionResult(name, result)[0];
+      } catch (error) { throw manualInvalid(pool, name + "() reply could not be decoded"); }
+    }
+    var token0 = utils.getAddress(read(0, "token0"));
+    var token1 = utils.getAddress(read(1, "token1"));
+    var fee = BigNumber.from(read(2, "fee")).toNumber();
+    var slot0 = read(3, "slot0");
+    if (token0 === ethers.constants.AddressZero || token1 === ethers.constants.AddressZero || token0 === token1 ||
+      !BigNumber.from(token0).lt(BigNumber.from(token1))) throw manualInvalid(pool, "token0/token1 are not a sorted pair");
+    if (fee > 1000000) throw manualInvalid(pool, "fee() is not a V3 fee");
+    return { protocol: "V3", manual: true, address: pool, poolId: pool.toLowerCase(), fee: fee,
+      currency0: token0, currency1: token1, tickSpacing: null, tick: slot0.tick, sqrtPriceX96: slot0.sqrtPriceX96,
+      price: tickToPrice(slot0.tick), active: true, swaps: null, lastBlock: null, lastIndex: null };
+  }
+
+  /** "0.01%", "1.00%", for any fee in hundredths of a basis point (no fee-tier whitelist). */
+  function formatManualFee(fee) { return (Number(fee) / 10000).toFixed(2) + "%"; }
+
+  /** "0x10cc…26ba" for the table. */
+  function truncateAddress(address) {
+    var value = utils.getAddress(address);
+    return value.slice(0, 6) + "…" + value.slice(-4);
+  }
+
+  /** "Last read: 12s ago". */
+  function formatLastRead(seconds) {
+    var s = Math.max(0, Math.floor(Number(seconds)));
+    if (!Number.isFinite(s)) fail("elapsed time must be a number of seconds");
+    return "Last read: " + s + "s ago";
+  }
+
+  /**
+   * Read one pool with four sequential eth_calls (never a batch). A revert, an empty reply or a
+   * reply that does not decode is "Invalid pool address"; a transport failure is rethrown as is
+   * so the monitor can back off instead of blaming the address.
+   */
+  async function readManualPool(request, address) {
+    if (typeof request !== "function") fail("request function is required");
+    var pool = parseManualPoolAddress(address);
+    var calls = manualPoolCalls(pool);
+    var results = [];
+    for (var i = 0; i < calls.length; i++) {
+      try { results.push(await request(calls[i].method, calls[i].params)); } catch (error) {
+        if (isRevertError(error)) throw manualInvalid(pool, MANUAL_READS[i] + "() reverted");
+        throw error;
+      }
+    }
+    return decodeManualPool(pool, results);
+  }
+
+  /**
+   * The checks of the brief, in its order: same token0 and token1 (same pair, same order), both
+   * sqrtPriceX96 > 0, and not the same pool twice. Returns the rows ordered buy (lower price) then sell.
+   */
+  function validateManualPools(poolA, poolB) {
+    if (poolA.currency0 !== poolB.currency0 || poolA.currency1 !== poolB.currency1) {
+      var pairError = new Error(MANUAL_PAIR_ERROR);
+      pairError.manualCode = "DIFFERENT_PAIRS";
+      throw pairError;
+    }
+    [poolA, poolB].forEach(function (pool, i) {
+      if (BigNumber.from(pool.sqrtPriceX96).isZero()) {
+        var liquidityError = new Error(MANUAL_LIQUIDITY_ERROR + " (" + (i === 0 ? "Pool A" : "Pool B") + " " + pool.address + ")");
+        liquidityError.manualCode = "NO_LIQUIDITY";
+        throw liquidityError;
+      }
+    });
+    if (poolA.address === poolB.address) {
+      var sameError = new Error(MANUAL_SAME_POOL_ERROR);
+      sameError.manualCode = "SAME_POOL";
+      throw sameError;
+    }
+    return poolA.price <= poolB.price ? [poolA, poolB] : [poolB, poolA];
+  }
+
+  /** The single manual spread row: buy = lower price, sell = higher. Same arithmetic as rankSpreads. */
+  function manualSpread(poolA, poolB, thresholdPercent) {
+    var ordered = validateManualPools(poolA, poolB);
+    return pairSpreads(ordered, readThreshold(thresholdPercent))[0];
+  }
+
+  /**
+   * Manual-mode monitor: every pollIntervalMs it reads token0, token1, fee and slot0 of both pools
+   * (8 eth_calls, one at a time), reads symbol() and decimals() of the two tokens once per pair
+   * (cached), validates, and publishes { pair, pools, spread, lastRead }. Never eth_getLogs, never a
+   * batch, never eth_getBlockByNumber. A pool-level failure (invalid, different pairs, no
+   * liquidity) is reported in state.lastError and retried at the normal interval; a transport
+   * failure backs off retryIntervalMs like the auto-scan monitor.
+   *
+   * options: request (required), pollIntervalMs (30000), retryIntervalMs (60000),
+   *          thresholdPercent (number or function, 0.5), onUpdate(state), onError(error, state), now().
+   */
+  function createManualMonitor(options) {
+    options = options || {};
+    var request = options.request;
+    if (typeof request !== "function") fail("request function is required");
+    var pollMs = options.pollIntervalMs === undefined ? POLL_INTERVAL_MS : options.pollIntervalMs;
+    var retryMs = options.retryIntervalMs === undefined ? RPC_RETRY_MS : options.retryIntervalMs;
+    if (!Number.isFinite(pollMs) || pollMs < 0 || !Number.isFinite(retryMs) || retryMs < 0) fail("invalid intervals");
+    var onUpdate = options.onUpdate || function () {};
+    var onError = options.onError || function () {};
+    var now = options.now || function () { return Date.now(); };
+    var thresholdOption = options.thresholdPercent === undefined ? 0.5 : options.thresholdPercent;
+    var threshold = typeof thresholdOption === "function" ? thresholdOption : function () { return thresholdOption; };
+    var addresses = null;
+    var running = false;
+    var generation = 0;
+    var timer = null;
+    var symbolCache = {}; // token address → { symbol, decimals }, read once
+    var state = freshState();
+
+    function freshState() {
+      return { mode: "Manual", addresses: null, pair: null, pools: [], spreads: [], spread: null, lastRead: null,
+        lastError: null, errorCode: null, retryAt: null, nextPollMs: null, polls: 0, errors: 0, protocol: "V3" };
+    }
+
+    async function tokenMeta(token) {
+      if (symbolCache[token]) return symbolCache[token];
+      var meta = {};
+      for (var name of ["symbol", "decimals"]) {
+        var result = await request("eth_call", [{ to: token, data: tokenInterface.encodeFunctionData(name, []) }, "latest"]);
+        if (!result || result === "0x") fail("no " + name + "() at " + token);
+        meta[name] = tokenInterface.decodeFunctionResult(name, result)[0];
+      }
+      symbolCache[token] = { symbol: String(meta.symbol), decimals: BigNumber.from(meta.decimals).toNumber() };
+      return symbolCache[token];
+    }
+
+    async function pollOnce() {
+      if (!addresses) fail("start(poolA, poolB) first");
+      var current = state;
+      var rows = [];
+      for (var i = 0; i < 2; i++) {
+        try { rows.push(await readManualPool(request, addresses[i])); } catch (error) {
+          if (error.manualCode) error.message = (i === 0 ? "Pool A" : "Pool B") + ": " + error.message;
+          throw error;
+        }
+      }
+      validateManualPools(rows[0], rows[1]);
+      var meta0 = await tokenMeta(rows[0].currency0);
+      var meta1 = await tokenMeta(rows[0].currency1);
+      var pair = { tokenA: rows[0].currency0, tokenB: rows[0].currency1, currency0: rows[0].currency0, currency1: rows[0].currency1,
+        symbol0: meta0.symbol, decimals0: meta0.decimals, symbol1: meta1.symbol, decimals1: meta1.decimals };
+      pair.symbolA = pair.symbol0;
+      pair.symbolB = pair.symbol1;
+      pair.decimalsA = pair.decimals0;
+      pair.decimalsB = pair.decimals1;
+      var scale = Math.pow(10, pair.decimals0 - pair.decimals1);
+      rows.forEach(function (row, index) {
+        row.label = index === 0 ? "Pool A" : "Pool B";
+        row.displayPrice = row.price * scale;
+        row.empty = false;
+        row.elapsedSeconds = 0;
+        row.healthError = null;
+        row.status = STATUS_OK;
+      });
+      var spread = manualSpread(rows[0], rows[1], threshold());
+      current.addresses = addresses.slice();
+      current.pair = pair;
+      current.pools = rows;
+      current.spread = spread;
+      current.spreads = [spread];
+      current.lastRead = now();
+      current.lastError = null;
+      current.errorCode = null;
+      current.retryAt = null;
+      current.polls += 1;
+      return current;
+    }
+
+    async function cycle() {
+      if (!running) return;
+      var mine = generation;
+      var delay = pollMs;
+      try {
+        await pollOnce();
+        if (mine !== generation) return;
+        onUpdate(state);
+      } catch (error) {
+        if (mine !== generation) return;
+        // A definite answer about the pools is re-read at the normal interval; the RPC backs off.
+        delay = error.manualCode ? pollMs : retryMs;
+        state.errors += 1;
+        state.lastError = error && error.message ? error.message : String(error);
+        state.errorCode = error.manualCode || "RPC";
+        state.retryAt = now() + delay;
+        onError(error, state);
+        onUpdate(state);
+      }
+      if (mine !== generation || !running) return;
+      state.nextPollMs = delay;
+      timer = setTimeout(cycle, delay);
+    }
+
+    function stop() {
+      running = false;
+      generation += 1;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    }
+
+    /** Validates both addresses synchronously (42 chars) so a bad field never starts a loop. */
+    function start(poolA, poolB) {
+      stop();
+      var a = parseManualPoolAddress(poolA, "Pool A");
+      var b = parseManualPoolAddress(poolB, "Pool B");
+      addresses = [a, b];
+      state = freshState();
+      state.addresses = [a, b];
+      running = true;
+      return cycle();
+    }
+
+    return { start: start, stop: stop, pollOnce: pollOnce, getState: function () { return state; },
+      isRunning: function () { return running; } };
+  }
 
   function protocolOf(pool) { return pool.protocol || "V4"; }
 
@@ -1803,6 +2094,23 @@
     V3_FEE_TIERS: V3_FEE_TIERS,
     V3_SWAP_TOPIC: V3_SWAP_TOPIC,
     V3_QUOTE_SELECTOR: V3_QUOTE_SELECTOR,
+    MANUAL_ADDRESS_ERROR: MANUAL_ADDRESS_ERROR,
+    MANUAL_INVALID_ERROR: MANUAL_INVALID_ERROR,
+    MANUAL_PAIR_ERROR: MANUAL_PAIR_ERROR,
+    MANUAL_LIQUIDITY_ERROR: MANUAL_LIQUIDITY_ERROR,
+    MANUAL_SAME_POOL_ERROR: MANUAL_SAME_POOL_ERROR,
+    MANUAL_READS: MANUAL_READS,
+    parseManualPoolAddress: parseManualPoolAddress,
+    manualPoolCalls: manualPoolCalls,
+    decodeManualSlot0: decodeManualSlot0,
+    decodeManualPool: decodeManualPool,
+    readManualPool: readManualPool,
+    validateManualPools: validateManualPools,
+    manualSpread: manualSpread,
+    formatManualFee: formatManualFee,
+    truncateAddress: truncateAddress,
+    formatLastRead: formatLastRead,
+    createManualMonitor: createManualMonitor,
     protocolOf: protocolOf,
     formatV3Fee: formatV3Fee,
     discoverV3Pools: discoverV3Pools,

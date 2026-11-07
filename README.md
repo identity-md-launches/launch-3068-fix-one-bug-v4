@@ -7,6 +7,116 @@ on chain 4663, with the evidence for the fix.
 The deliverables are [`index.html`](index.html) and [`js/v4-arb-encoder.js`](js/v4-arb-encoder.js):
 plain JavaScript and the existing vendored ethers v5, with no install or CDN required.
 
+## Follow-up 5: Manual pool mode (eth_call only)
+
+A **Mode** field at the top of the page selects **Auto-scan** (everything the page did before,
+unchanged, the default) or **Manual**. In Manual mode the Token A, Token B, Protocol and Window
+fields are hidden and two fields take their place: **Pool A** and **Pool B**, each a V3 pool
+contract address (`0x` and 40 hex digits). **READ PRICES** replaces WATCH PAIR. Switching the mode
+stops the other mode's polling at once, so no `eth_getLogs` is sent while Manual is selected.
+
+### What is read, and how often
+
+Every 30 s the page sends, for each pool, four plain `eth_call` requests, one HTTP POST each and
+in this order: `token0()`, `token1()`, `fee()`, `slot0()`. That is **8 eth_calls per poll**. On the
+first successful read of a pair it also reads `symbol()` and `decimals()` of token0 and token1
+(4 more calls), then caches them for as long as the page is open. Nothing else: no `eth_getLogs`,
+no JSON-RPC batch, no `eth_getBlockByNumber`. A quote (click the row) and a dry run are one
+`eth_call` each, on demand, through the existing V3 creation-call quote and router simulation.
+
+The brief counts the four reads as "6 eth_calls (3 per pool × 2 pools)". Four reads per pool are
+eight, and the brief's own total of "6-8 requests per 30 seconds" covers it. The immutable reads
+are repeated on purpose: a pool whose address field changed is re-validated with the same code
+path, and the cost is two requests per poll.
+
+The brief's `slot0()` ABI has six outputs (`sqrtPriceX96, tick, protocolFee, lpFee, tickSpacing,
+unlocked`). The pools deployed on chain 4663 answer with the canonical Uniswap V3 seven-word layout
+(`sqrtPriceX96, tick, observationIndex, observationCardinality, observationCardinalityNext,
+feeProtocol, unlocked`), verified with `cast call` on both test-vector pools. Both layouts start
+with `sqrtPriceX96` then `tick`, which is all the page uses, so `decodeManualSlot0` reads those two
+words and accepts either length. A reply shorter than two words is "Invalid pool address".
+
+Price is `1.0001^tick` of slot0, shown as **token1 per token0** after decimals (the page has no
+USD feed; the brief's "~$0.18" is PONS in dollars on DEXTools, which corresponds here to about
+12 073 PONS per WETH). "Whether the pool has liquidity" is `sqrtPriceX96 > 0`, as the brief defines
+it; it does not read `liquidity()`.
+
+### Validation and messages
+
+| Situation | Message | When it is checked |
+|---|---|---|
+| A field is not `0x` + 40 hex digits (a 66-char V4 poolId, a short paste, a non-hex character) | `Enter a 42-char V3 pool address` (prefixed `Pool A:` / `Pool B:`) | on READ PRICES, before any request |
+| Any of the four reads reverts, returns no data, or returns values no V3 pool can have (unsorted or zero tokens, fee above 100%) | `Invalid pool address (0x…: token0() reverted)` | each poll |
+| token0 or token1 differ between the pools | `Pools are different pairs` | each poll, before the liquidity check |
+| Either pool's `sqrtPriceX96` is 0 | `Pool has no liquidity (Pool B 0x…)` | each poll |
+| The same address in both fields | `Pool A and Pool B are the same pool` | each poll |
+| The RPC fails (HTTP error, rate limit, timeout) | the RPC message, `RPC error, retrying in 60s` | each poll; the last good row stays visible |
+
+Pool-level errors keep polling at the normal 30 s so a fix on chain (a pool being initialised)
+shows up; RPC failures back off 60 s like Auto-scan. A node's JSON-RPC error is treated as a
+revert; a rate-limit error (`-32005` or "rate limit" / "too many requests") is treated as an RPC
+failure, never as a bad address.
+
+### The spread row
+
+One row: `Pool A (fee · price · address) | Pool B (fee · price · address) | Spread% | Fee Cost% |
+Net% | Verdict`. Pool A is the lower-priced pool (buy token0 there) and Pool B the higher-priced;
+if the pasted order is the other way round the labels swap and the line under the table says so.
+Spread% = (high − low) / low × 100, Fee Cost% = (feeA + feeB) / 10000, Net% = Spread% − Fee Cost%,
+GREEN when Net% is strictly above the existing threshold field (default 0.5). The arithmetic is the
+existing `rankSpreads` code on two rows. Under the table: "Last read: Xs ago" (ticks every second
+without a request), the pair's symbols, decimals and addresses, and both full pool addresses.
+
+### Execution
+
+Clicking the row runs the existing V3+V3 path unchanged: creation-call quote of swap 1 on the buy
+pool, quote of the sell leg, APPROVE V3 ROUTER (ERC20 approve to SwapRouter02
+`0xcaf681a66d020601342297493863e78c959e5cb2`), BUILD CALLDATA & DRY RUN, SEND, with the 20-minute
+deadline, button locking and activity log. The token pair is token0/token1 read from the pools,
+never the hidden Token A / Token B fields; the balances and the TRANSFER buttons follow the pools'
+tokens too once they are loaded. The dry run keeps the existing check that
+`V3Factory.getPool(token0, token1, fee)` equals the pasted address: SwapRouter02 routes by
+(pair, fee) through the factory, so a pasted address that is not the factory's pool for its fee
+tier can be watched but not traded. Fee tiers outside 0.01 / 0.05 / 0.30 / 1.00 % display but are
+refused by the V3 path encoder. Auto mode treats the manual row like any GREEN V3/V3 spread.
+
+### Test vectors, as the chain answers them
+
+The brief lists `0x10cc6bd38112cac182db90b6a71d8bb5939526ba` as the 0.01% PONS/WETH pool. On
+chain 4663 that contract's `fee()` returns **10000 (1.00%)**; the factory's 0.01% pool for
+WETH/PONS is `0x0f5F5bCC08cAe61d19c9a2d2594C252f1Baddae6`. `0xed50bdeea8adc232f159486192a4157281d722ff`
+is the 0.30% pool as stated. Both have token0 = WETH, token1 = PONS. Read on 2026-11-07
+(`docs/manual-live.json`, produced by `node scripts/verify-manual-live.js`):
+
+| Pool | fee() | tick | price (PONS per WETH) |
+|---|---|---|---|
+| `0x10cc…26ba` | 1.00% | 94218 | ≈ 12 349 |
+| `0xed50…22ff` | 0.30% | 94267 | ≈ 12 410 |
+
+Spread 0.491%, Fee Cost 1.30%, Net −0.81%, **RED** at that moment (an earlier `cast call` the same
+day saw ticks 93992 and 94065, a 0.73% spread; the test fixtures use those). With the factory's
+real 0.01% pool in Pool A the Fee Cost is 0.31% as the brief expects. The page prefills the brief's two addresses and shows
+whatever the chain returns; the fixtures in `js/test/manual-mock.js` reproduce these live replies.
+
+### Follow-up 5 verification
+
+- **Offline:** `js/test/manual.test.js` (10 cases) covers the 42-character rule including a 66-char
+  V4 poolId, the four selectors, both slot0 layouts, every validation message, the 30 s / 60 s
+  schedule, exactly 8 `eth_call`s per poll with symbols cached, no logs, no batch, and the rows'
+  compatibility with the V3 quote and auto decision. `js/test/ui.test.js` gains 3 page cases:
+  field visibility and the single row, the full execution flow from the manual row (pasted in the
+  wrong order), and the four error messages plus the threshold recolouring. All 184 JavaScript
+  cases pass. `test/V3ManualPool.t.sol` (14 Foundry tests, 2 fuzz) covers the same checks in
+  Solidity against pool-shaped mocks: success in both slot0 layouts, no code, a token instead of a
+  pool, each of the four reads reverting, impossible token values, different pairs in both
+  orders, no liquidity on either side, the same pool twice, malformed slot0 replies, and the
+  42-character text rule. `forge build`, `forge test` with the verifier's seed and
+  `forge fmt --check` pass (91 tests).
+- **Live, read-only:** `scripts/verify-manual-live.js` read both brief pools through the public RPC
+  with 12 `eth_call`s and nothing else; a token address in Pool A gave "Invalid pool address", a
+  PONS/USDG pool in Pool B gave "Pools are different pairs". No transaction was sent in Manual
+  mode; the execution path is the existing V3 one, exercised live in follow-up 4.
+
 ## Follow-up 4.1: batch polling
 
 An active poll now sends **two HTTP POSTs**, regardless of the number of active pools:
@@ -752,8 +862,11 @@ These were visible on chain while testing. None of them is fixed by an encoder.
 
 | Path | What it is |
 |---|---|
-| `index.html` | live pool monitor, spread table, quote → Permit2 → dry run → send, auto mode, wallet transfer |
-| `js/v4-arb-encoder.js` | corrected encoder, Permit2 wallet client, pool monitor, quote, transfers |
+| `index.html` | live pool monitor, Manual pool mode, spread table, quote → Permit2 → dry run → send, auto mode, wallet transfer |
+| `js/v4-arb-encoder.js` | corrected encoder, Permit2 wallet client, pool monitor, manual pool reader, quote, transfers |
+| `js/test/manual.test.js` | Manual mode: address rule, the four reads, slot0 layouts, validation messages, monitor schedule, 10 cases |
+| `js/test/manual-mock.js` | pool-shaped eth_call double (token0 / token1 / fee / slot0), including the brief's two pools' live replies |
+| `scripts/verify-manual-live.js` | optional read-only live check of Manual mode; `docs/manual-live.json` is its output of 2026-11-07 |
 | `js/test/encoder.test.js` | offline test of the encoder, 18 cases |
 | `js/test/permit2.test.js` | approval and transaction-flow success/failure tests, 43 cases |
 | `js/test/monitor.test.js` | pool ids, spreads, monitor schedule and errors, window, staleness, slot0, quote, transfers, 34 cases |
@@ -763,6 +876,8 @@ These were visible on chain while testing. None of them is fixed by an encoder.
 | `src/V4SwapCalldata.sol` | the same encoder in Solidity, internal and pure |
 | `src/V4SwapCalldataCheck.sol` | an offline shape check that applies the router's length rules |
 | `src/V4PoolMonitor.sol` | pool ids, spread / fee / net bps, slippage, quote-revert, Swap-log and Slot0 decoding, pool status |
+| `src/V3ManualPool.sol` | Manual mode reference: the four pool reads by staticcall, slot0 decoding, pair / liquidity / same-pool checks, buy-sell ordering |
+| `test/V3ManualPool.t.sol` | 14 Foundry tests, 2 of them fuzz tests, against pool-shaped mocks: success and every failure path |
 | `test/Vectors.sol` | the two transactions' inputs and the JavaScript encoder's outputs |
 | `test/V4SwapCalldata.t.sol` | 37 Foundry tests, 4 of them fuzz tests |
 | `test/V4PoolMonitor.t.sol` | 31 Foundry tests, 7 of them fuzz tests, sharing vectors with the JavaScript |
@@ -776,7 +891,7 @@ forge build
 FOUNDRY_FUZZ_SEED=0xe6b28ac28482a0fc8caab7337860b50a5f4d736b636ed2ad9e629e73e3345aa8 forge test
 forge fmt --check
 node js/test/encoder.test.js
-node --test js/test/permit2.test.js js/test/monitor.test.js js/test/ui.test.js
+node --test js/test/permit2.test.js js/test/monitor.test.js js/test/ui.test.js js/test/manual.test.js
 ```
 
 ## How this was verified, and what was not
@@ -824,6 +939,12 @@ node --test js/test/permit2.test.js js/test/monitor.test.js js/test/ui.test.js
 - The public RPC in the brief answers `eth_getLogs` over up to 50 000 blocks with a seven-id topic filter and
   returns revert data on `eth_call`. Quoting goes through that RPC, not the wallet, because some
   wallets strip revert data.
+- Manual mode trusts the pasted contracts' own `token0()`, `token1()`, `fee()` and `slot0()`
+  answers; a contract that imitates a pool is caught only at the dry run, where the factory lookup
+  must return the pasted address. Its price is the current slot0 tick, with no staleness measure,
+  and `sqrtPriceX96 > 0` says the pool is initialised, not how deep it is: the quote does that.
+  The two test-vector pools answer the canonical seven-word V3 `slot0()`, not the brief's six-word
+  ABI; only the first two words are used.
 - Spread, fee cost and net are price-ratio arithmetic on the two last-swap ticks. They ignore price
   impact of the trade size, the 0.5% slippage buffer, gas and the possibility that either pool has
   moved since its last swap. A GREEN verdict is a signal to quote and simulate, not a profit.
@@ -843,6 +964,9 @@ The follow-up page uses these existing deployments, without creating contracts:
 | Swap topic | `0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f` |
 | Fee tiers scanned | (0,1) (0,10) (500,10) (2500,25) (3000,60) (10000,200) (30000,600), hooks `0x0` |
 | Pool A / B | Selected from the live spread table (lower-priced pool buys, higher-priced sells); the encoder's defaults 3000/60 and 30000/600 remain its fallback |
+| Mode | user-set in the page, default Auto-scan; Manual prefills the brief's two V3 pools `0x10cc6bd38112cac182db90b6a71d8bb5939526ba` and `0xed50bdeea8adc232f159486192a4157281d722ff` (user-editable) |
+| Manual reads | `token0()`, `token1()`, `fee()`, `slot0()` per pool, 8 `eth_call`s per 30 s poll, plus `symbol()` and `decimals()` of both tokens once; no `eth_getLogs`, batch or block reads |
+| V3 Factory / SwapRouter02 | `0x1f7d7550b1b028f7571e69a784071f0205fd2efa` / `0xcaf681a66d020601342297493863e78c959e5cb2`, used by the Manual execution path exactly as in follow-up 4 |
 | Poll / retry / window | 30 s / 60 s after an RPC error / user-set, default 3000 blocks, 50 to 50000 (`POLL_INTERVAL_MS`, `RPC_RETRY_MS`, `LOG_WINDOW_BLOCKS`) |
 | Max staleness | user-set in the page, default 7200 s (`MAX_STALENESS_SECONDS`) |
 | Slot0 read | `PoolManager.extsload(keccak256(abi.encode(poolId, 6)))` (`POOLS_SLOT`) |
@@ -886,6 +1010,10 @@ Whoever sends the transaction is responsible for:
   limit, and raising the minimum return above 0 before trading more than a test amount;
 - choosing a window and Max staleness that suit the pair: blocks are about 0.105 s apart, so a window's
   time span is short, and the status marks do not show that a pool has liquidity (a quote does);
+- in Manual mode, pasting the right pool addresses and checking the symbols, fees and truncated
+  addresses the page shows against an explorer before trading; the page validates the shape and
+  the pool's own answers, not which pool the operator meant. The address is re-read every poll but
+  the pair's symbols and decimals are cached until the page reloads;
 - verifying the new wallet address before a whole-balance transfer. The page checks the format, the
   zero address and self-transfers only. A transfer to a wrong address cannot be undone. The ETH
   transfer leaves a gas reserve as dust by design; a second transfer later can move most of it.

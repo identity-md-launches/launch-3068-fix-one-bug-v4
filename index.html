@@ -64,19 +64,29 @@
   <section aria-labelledby="pair-heading">
     <h2 id="pair-heading">1. Token pair</h2>
     <div class="fields">
-      <label>Protocol<select id="protocol"><option value="V4">V4</option><option value="V3">V3</option><option value="Both" selected>Both</option></select></label>
-      <label>Token A<input id="token-a" type="text" value="0x39dbed3a2bd333467115de45665cc57f813c4571" autocomplete="off" spellcheck="false"></label>
-      <label>Token B<input id="token-b" type="text" value="0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" autocomplete="off" spellcheck="false"></label>
-      <label>Window (blocks)<input id="window-blocks" type="number" value="3000" min="50" max="50000" step="1" inputmode="numeric" autocomplete="off"></label>
+      <label>Mode<select id="mode"><option value="Auto-scan" selected>Auto-scan</option><option value="Manual">Manual</option></select></label>
+      <label id="field-protocol">Protocol<select id="protocol"><option value="V4">V4</option><option value="V3">V3</option><option value="Both" selected>Both</option></select></label>
+      <label id="field-token-a">Token A<input id="token-a" type="text" value="0x39dbed3a2bd333467115de45665cc57f813c4571" autocomplete="off" spellcheck="false"></label>
+      <label id="field-token-b">Token B<input id="token-b" type="text" value="0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" autocomplete="off" spellcheck="false"></label>
+      <div id="field-window"><label>Window (blocks)<input id="window-blocks" type="number" value="3000" min="50" max="50000" step="1" inputmode="numeric" autocomplete="off"></label></div>
+      <label id="field-pool-a" hidden>Pool A (V3 pool address)<input id="pool-a" type="text" value="0x10cc6bd38112cac182db90b6a71d8bb5939526ba" autocomplete="off" spellcheck="false"></label>
+      <label id="field-pool-b" hidden>Pool B (V3 pool address)<input id="pool-b" type="text" value="0xed50bdeea8adc232f159486192a4157281d722ff" autocomplete="off" spellcheck="false"></label>
     </div>
     <button id="apply-pair" type="button">WATCH PAIR</button>
+    <button id="read-prices" type="button" hidden>READ PRICES</button>
     <p id="pair-info" class="muted">currency0 is the lower address. Symbols are read from each token's symbol().</p>
+    <div id="auto-scan-notes">
     <p class="muted">Every 30 s the page reads the PoolManager's Swap logs of the window for fee / tick
       spacing (0,1) (0,10) (500,10) (2500,25) (3000,60) (10000,200) (30000,600). Price = 1.0001^tick of the latest
       swap, shown as currency1 per currency0 after decimals. No swap in the window means inactive. A new window
       applies from the next poll, with no restart. On an RPC error the page waits 60 s and keeps polling.</p>
     <p class="muted">V3 discovers fee tiers 0.01%, 0.05%, 0.30% and 1.00% once per pair change, scans their
       Swap logs together, and checks active liquidity. Both uses the same block window for both protocols.</p>
+    </div>
+    <p id="manual-notes" class="muted" hidden>Manual mode reads each pool's token0(), token1(), fee() and slot0() with
+      plain eth_call every 30 s (8 calls, one at a time, never a batch, never eth_getLogs), plus symbol() and decimals()
+      of the two tokens once. Price = 1.0001^tick of slot0, shown as token1 per token0 after decimals. Both pools
+      must share token0 and token1 and have sqrtPriceX96 above 0. On an RPC error the page waits 60 s and reads again.</p>
   </section>
 
   <section aria-labelledby="wallet-heading">
@@ -89,6 +99,7 @@
 
   <section aria-labelledby="pools-heading">
     <h2 id="pools-heading">3. Live pools</h2>
+    <div id="auto-scan-view">
     <table aria-describedby="pools-heading">
       <thead><tr><th>Fee</th><th>TickSpacing</th><th>Price</th><th id="swaps-heading">Swaps (3000 blocks)</th><th>Active?</th><th>Last Swap</th><th>Protocol</th></tr></thead>
       <tbody id="pools-body"></tbody>
@@ -99,6 +110,18 @@
       <tbody id="spreads-body"></tbody>
     </table>
     <p id="spreads-note" class="muted">No tradeable spreads.</p>
+    </div>
+    <div id="manual-view" hidden>
+    <h3>Manual V3 pools (click the row to select it)</h3>
+    <table aria-describedby="pools-heading">
+      <thead><tr><th>Pool A (buy)</th><th>Pool B (sell)</th><th>Spread%</th><th>Fee Cost%</th><th>Net%</th><th>Verdict</th></tr></thead>
+      <tbody id="manual-body"></tbody>
+    </table>
+    <p id="manual-status" class="muted" role="status" aria-live="polite">Click READ PRICES.</p>
+    <p id="manual-last-read" class="muted"></p>
+    <p id="manual-pools" class="muted">Pool A is the lower-priced pool (buy token0 there) and Pool B the higher-priced
+      (sell there); the labels swap automatically when the pasted order is the other way round.</p>
+    </div>
     <div class="fields">
       <label><input id="auto-mode" type="checkbox"> Auto mode: execute when Net% is above the threshold</label>
       <label>Net% threshold<input id="threshold" type="text" value="0.5" inputmode="decimal" autocomplete="off"></label>
@@ -163,7 +186,8 @@
     <button id="transfer-b" class="warn" type="button" disabled>Transfer Token B</button>
     <button id="transfer-eth" class="warn" type="button" disabled>Transfer ETH</button>
     <p id="transfer-result" role="status" aria-live="polite"></p>
-    <small>Token transfers call token.transfer(newAddress, balance) for whatever is in the Token A / Token B fields.
+    <small>Token transfers call token.transfer(newAddress, balance) for whatever is in the Token A / Token B fields
+      (in Manual mode: token0 / token1 of the pools read, once they are loaded).
       The ETH transfer keeps back twice the estimated gas cost, so a little dust stays behind. Each result shows the
       transaction hash after its receipt confirms.</small>
   </section>
@@ -198,7 +222,19 @@
       element("status").className = error ? "error" : "success";
     }
 
-    function pair() { return monitor.getState().pair; }
+    function isManual() { return element("mode").value === "Manual"; }
+
+    /** The monitor of the current mode: the manual pool reader or the auto-scan log monitor. */
+    function activeState() { return isManual() ? manualMonitor.getState() : monitor.getState(); }
+
+    function pair() { return activeState().pair; }
+
+    /** The two tokens the balances and transfer buttons refer to: the fields, or the manual pools' pair. */
+    function walletTokens() {
+      const meta = isManual() ? manualMonitor.getState().pair : null;
+      if (meta) return [meta.currency0, meta.currency1];
+      return [element("token-a").value.trim(), element("token-b").value.trim()];
+    }
 
     function validTransferTarget() {
       try {
@@ -213,10 +249,18 @@
       const quoted = !!selected && !!selected.bridgeAmount;
       element("connect").disabled = busy;
       element("apply-pair").disabled = busy;
+      element("read-prices").disabled = busy;
       element("token-a").disabled = busy;
       element("token-b").disabled = busy;
+      element("pool-a").disabled = busy;
+      element("pool-b").disabled = busy;
       element("protocol").disabled = busy;
-      const protocol = element("protocol").value;
+      element("mode").disabled = busy;
+      const manual = isManual();
+      ["field-protocol", "field-token-a", "field-token-b", "field-window", "apply-pair", "auto-scan-notes", "auto-scan-view"]
+        .forEach((id) => { element(id).hidden = manual; });
+      ["field-pool-a", "field-pool-b", "read-prices", "manual-notes", "manual-view"].forEach((id) => { element(id).hidden = !manual; });
+      const protocol = manual ? "V3" : element("protocol").value;
       element("permit2-controls").hidden = protocol === "V3";
       element("v3-controls").hidden = protocol === "V4";
       element("approve-permit2").disabled = !ready || !quoted || (E.protocolOf(selected.buy) === "V3" && E.protocolOf(selected.sell) === "V3");
@@ -306,7 +350,7 @@
     async function refreshBalances() {
       if (!wallet || !account) return;
       const meta = pair();
-      const tokens = [element("token-a").value.trim(), element("token-b").value.trim()];
+      const tokens = walletTokens();
       balances = await wallet.readBalances(tokens, account);
       const symbolA = meta && meta.tokenA === ethers.utils.getAddress(tokens[0]) ? meta.symbolA : "Token A";
       const symbolB = meta && meta.tokenB === ethers.utils.getAddress(tokens[1]) ? meta.symbolB : "Token B";
@@ -376,7 +420,16 @@
       return td;
     }
 
-    function poolLabel(pool) { return E.protocolOf(pool) === "V3" ? "V3 " + E.formatV3Fee(pool.fee) : pool.fee + " / " + pool.tickSpacing; }
+    function poolLabel(pool) {
+      if (pool.manual) return "V3 " + E.formatManualFee(pool.fee) + " " + E.truncateAddress(pool.address);
+      return E.protocolOf(pool) === "V3" ? "V3 " + E.formatV3Fee(pool.fee) : pool.fee + " / " + pool.tickSpacing;
+    }
+
+    /** Re-render the spread rows of the current mode (selection highlight follows the quote). */
+    function refreshSpreads() {
+      if (isManual()) renderManual(manualMonitor.getState());
+      else renderSpreads(monitor.getState());
+    }
 
     function renderPools(state) {
       const body = element("pools-body");
@@ -449,7 +502,84 @@
       thresholdPercent: thresholdOrDefault, windowBlocks: () => windowBlocks,
       maxStalenessSeconds: () => maxStaleness, onUpdate: renderMonitor });
 
+    // ------------------------------------------------------------------ manual mode (eth_call only)
+
+    function renderLastRead(state) {
+      element("manual-last-read").textContent = state.lastRead ? E.formatLastRead((Date.now() - state.lastRead) / 1000) : "";
+    }
+
+    function renderManual(state) {
+      const body = element("manual-body");
+      body.replaceChildren();
+      if (state.pair) {
+        const meta = state.pair;
+        element("pair-info").textContent = "Pair " + meta.symbol0 + "/" + meta.symbol1 + " · token0 = " + meta.symbol0 + " (" + meta.currency0 + ", " +
+          meta.decimals0 + " decimals) · token1 = " + meta.symbol1 + " (" + meta.currency1 + ", " + meta.decimals1 + " decimals) · prices are " +
+          meta.symbol1 + " per " + meta.symbol0;
+      }
+      if (state.spread && state.pools.length === 2 && !state.lastError) {
+        const spread = E.manualSpread(state.pools[0], state.pools[1], thresholdOrDefault());
+        const row = document.createElement("tr");
+        row.className = "selectable" + (selected && selected.buy.poolId === spread.buy.poolId && selected.sell.poolId === spread.sell.poolId ? " selected" : "");
+        row.tabIndex = 0;
+        const describe = (pool) => E.formatManualFee(pool.fee) + " · " + pool.displayPrice.toPrecision(6) + " (tick " + pool.tick + ") · " + E.truncateAddress(pool.address);
+        cell(row, describe(spread.buy));
+        cell(row, describe(spread.sell));
+        cell(row, spread.spreadPercent.toFixed(3));
+        cell(row, spread.feeCostPercent.toFixed(3));
+        cell(row, spread.netPercent.toFixed(3));
+        cell(row, spread.verdict, spread.verdict === "GREEN" ? "green" : "red");
+        row.addEventListener("click", () => selectSpread(spread));
+        row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") selectSpread(spread); });
+        body.appendChild(row);
+        element("manual-pools").textContent = "Pool A (buy) " + spread.buy.address + " · Pool B (sell) " + spread.sell.address +
+          (spread.buy.address !== state.addresses[0] ? " · labels swapped: the pasted Pool B has the lower price." : "") +
+          " Pool A is the lower-priced pool (buy " + state.pair.symbol0 + " there) and Pool B the higher-priced (sell there).";
+      }
+      if (state.lastError) {
+        element("manual-status").textContent = state.lastError + (state.errorCode === "RPC" ? " · RPC error, retrying in " + Math.round(E.RPC_RETRY_MS / 1000) + "s" :
+          " · next read in " + Math.round(E.POLL_INTERVAL_MS / 1000) + "s") + " · errors: " + state.errors;
+        element("manual-status").className = "error";
+        element("poll-status").textContent = "Manual mode · " + state.lastError;
+        element("poll-status").className = "error";
+      } else if (state.lastRead) {
+        element("manual-status").textContent = "Read " + state.pools.length + " pools with eth_call only · next read in " + Math.round(E.POLL_INTERVAL_MS / 1000) + "s";
+        element("manual-status").className = "success";
+        element("poll-status").textContent = "Manual mode · " + E.formatLastRead(0) + " · 8 eth_calls per read, no eth_getLogs";
+        element("poll-status").className = "success";
+      }
+      renderLastRead(state);
+      if (!state.lastError) maybeAutoExecute(state);
+    }
+
+    const manualMonitor = E.createManualMonitor({ request: rpc.request, thresholdPercent: thresholdOrDefault, onUpdate: renderManual });
+
+    function startManual() {
+      monitor.stop();
+      clearSelection();
+      element("manual-body").replaceChildren();
+      element("manual-last-read").textContent = "";
+      try {
+        element("manual-status").textContent = "Reading both pools…";
+        element("manual-status").className = "muted";
+        element("poll-status").textContent = "Manual mode · reading pools with eth_call…";
+        element("poll-status").className = "muted";
+        manualMonitor.start(element("pool-a").value, element("pool-b").value).then(() => refreshBalances()).catch((error) => {
+          element("manual-status").textContent = error.message;
+          element("manual-status").className = "error";
+        });
+      } catch (error) {
+        manualMonitor.stop();
+        element("manual-status").textContent = error.message;
+        element("manual-status").className = "error";
+        element("poll-status").textContent = "Manual mode · " + error.message;
+        element("poll-status").className = "error";
+        element("pair-info").textContent = "Pools not read. Paste two 42-character V3 pool addresses and click READ PRICES.";
+      }
+    }
+
     function startMonitor() {
+      manualMonitor.stop();
       clearSelection();
       // Remove selectable rows from the previous pair/protocol while discovery is in flight.
       renderPools({ pools: [] });
@@ -521,7 +651,7 @@
     }
 
     function selectSpread(spread) {
-      runAction(() => quoteSpread(spread)).then(() => renderSpreads(monitor.getState()));
+      runAction(() => quoteSpread(spread)).then(refreshSpreads);
     }
 
     async function dryRun() {
@@ -569,7 +699,7 @@
         if (!quoted.bridgeAmount) throw new Error("Auto mode: the buy pool has no liquidity; nothing sent.");
         await dryRun();
         await send();
-      }, { auto: true }).then(() => renderSpreads(monitor.getState()));
+      }, { auto: true }).then(refreshSpreads);
     }
 
     // ------------------------------------------------------------------ wiring
@@ -590,8 +720,20 @@
       showStatus("Connected on Robinhood Chain. Select a spread, approve Permit2 if needed, then dry run.");
     }));
 
-    element("apply-pair").addEventListener("click", () => { if (!busy) startMonitor(); });
-    element("protocol").addEventListener("change", () => { if (!busy) startMonitor(); });
+    element("apply-pair").addEventListener("click", () => { if (!busy && !isManual()) startMonitor(); });
+    element("protocol").addEventListener("change", () => { if (!busy && !isManual()) startMonitor(); });
+    element("read-prices").addEventListener("click", () => { if (!busy && isManual()) startManual(); });
+    element("mode").addEventListener("change", () => {
+      if (busy) return;
+      render();
+      log("Mode: " + element("mode").value + ".");
+      if (isManual()) startManual();
+      else startMonitor();
+    });
+    // The "Last read: Xs ago" line ticks every second in a browser; nothing is requested by the tick.
+    if (typeof setInterval === "function") {
+      setInterval(() => { if (isManual()) renderLastRead(manualMonitor.getState()); }, 1000);
+    }
 
     element("approve-permit2").addEventListener("click", () => runAction(async () => {
       clearPrepared();
@@ -637,7 +779,7 @@
         element("auto-status").textContent = error.message + " Using 0.5% until fixed.";
         element("auto-status").className = "error";
       }
-      renderSpreads(monitor.getState());
+      refreshSpreads();
     });
 
     element("window-blocks").addEventListener("input", () => {
@@ -670,7 +812,7 @@
         element("auto-status").textContent = "Auto mode ON: the next poll with a GREEN best spread above " + thresholdOrDefault() + "% executes automatically when both legs use the same protocol.";
         element("auto-status").className = "success";
         log("Auto mode ON (threshold " + thresholdOrDefault() + "%).");
-        maybeAutoExecute(monitor.getState());
+        maybeAutoExecute(activeState());
       } else {
         element("auto-status").textContent = "Auto mode OFF. Sending needs a click.";
         element("auto-status").className = "muted";
@@ -699,14 +841,15 @@
       });
     }
 
-    element("transfer-a").addEventListener("click", () => transfer("Token A transfer", (to) => wallet.transferAllToken(element("token-a").value.trim(), to)));
-    element("transfer-b").addEventListener("click", () => transfer("Token B transfer", (to) => wallet.transferAllToken(element("token-b").value.trim(), to)));
+    element("transfer-a").addEventListener("click", () => transfer("Token A transfer", (to) => wallet.transferAllToken(walletTokens()[0], to)));
+    element("transfer-b").addEventListener("click", () => transfer("Token B transfer", (to) => wallet.transferAllToken(walletTokens()[1], to)));
     element("transfer-eth").addEventListener("click", () => transfer("ETH transfer", (to) => wallet.transferAllEth(to)));
 
     [["permit2-address", E.PERMIT2], ["router-address", E.ROUTER], ["pool-manager-address", E.POOL_MANAGER], ["rpc-url", E.RPC_URL],
       ["v3-factory-address", E.V3_FACTORY], ["v3-router-address", E.V3_ROUTER]]
       .forEach(([id, value]) => { element(id).textContent = value; });
     element("protocol").value = "Both";
+    element("mode").value = "Auto-scan";
     render();
     startMonitor();
   </script>

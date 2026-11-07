@@ -1,0 +1,36 @@
+{
+  "rpcCalls": 12,
+  "error": null,
+  "pair": {
+    "token0": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    "symbol0": "WETH",
+    "token1": "0x39dBED3a2bd333467115dE45665cC57F813C4571",
+    "symbol1": "PONS"
+  },
+  "pools": [
+    {
+      "label": "Pool A",
+      "address": "0x10CC6BD38112cAc182db90B6a71d8Bb5939526bA",
+      "fee": "1.00%",
+      "tick": 94218,
+      "sqrtPriceX96": "8804651965713602598827952926146",
+      "price": 12348.982393855358
+    },
+    {
+      "label": "Pool B",
+      "address": "0xEd50bDeeA8aDC232f159486192a4157281D722ff",
+      "fee": "0.30%",
+      "tick": 94267,
+      "sqrtPriceX96": "8826248508357505705527051289601",
+      "price": 12409.637859397726
+    }
+  ],
+  "spread": {
+    "buy": "0x10CC6BD38112cAc182db90B6a71d8Bb5939526bA",
+    "sell": "0xEd50bDeeA8aDC232f159486192a4157281D722ff",
+    "spreadPercent": 0.4911778445206061,
+    "feeCostPercent": 1.3,
+    "netPercent": -0.808822155479394,
+    "verdict": "RED"
+  }
+}

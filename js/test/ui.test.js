@@ -912,3 +912,182 @@ test("V3 auto mode executes only one atomic route while the receipt is pending, 
   assert.match(element("status").textContent, /Swap confirmed/);
   element("auto-mode").change(false);
 });
+
+// ------------------------------------------------------------------ Follow-up 5: Manual mode
+
+const { ManualMock, liveManualMock, pool: manualPool, LIVE_POOL_A, LIVE_POOL_B, WETH: MANUAL_WETH, PONS: MANUAL_PONS } = require("./manual-mock.js");
+const { poolA: MANUAL_POOL_A, poolB: MANUAL_POOL_B } = require("./v3-mock.js");
+
+async function chooseMode(page, mode) {
+  page.element("mode").value = mode;
+  page.element("mode").change(false);
+  await page.until(() => page.timers.length > 0, "mode restart");
+  await page.flush();
+}
+
+async function readPrices(page) {
+  const before = page.provider.rpcCalls.length;
+  await page.element("read-prices").click();
+  await page.until(() => page.timers.length > 0 || /Enter a 42-char/.test(page.element("manual-status").textContent), "manual read");
+  await page.flush();
+  return page.provider.rpcCalls.slice(before);
+}
+
+test("Manual mode hides the pair fields, stops the log scan, reads both pools with eth_call only and shows one spread row", async () => {
+  const provider = new ManualMock();
+  const page = await readyPage(provider), { element, timers, poll } = page;
+  assert.equal(element("mode").value, "Auto-scan");
+  assert.ok(page.html.includes("READ PRICES"));
+  assert.ok(provider.rpcCalls.some((c) => c.method === "eth_getLogs"), "auto-scan still scans logs by default");
+  assert.equal(element("pool-a").value, LIVE_POOL_A, "the brief's pools are prefilled");
+  assert.equal(element("pool-b").value, LIVE_POOL_B);
+  element("pool-a").value = MANUAL_POOL_A;
+  element("pool-b").value = MANUAL_POOL_B;
+  const before = provider.rpcCalls.length;
+  const httpBefore = provider.httpCalls.length;
+  const symbolsBefore = provider.symbolCalls; // the auto-scan pair load already read two symbols
+  await chooseMode(page, "Manual");
+  for (const id of ["field-token-a", "field-token-b", "field-protocol", "field-window", "apply-pair", "auto-scan-view", "auto-scan-notes", "permit2-controls"]) {
+    assert.equal(element(id).hidden, true, id + " hidden in manual mode");
+  }
+  for (const id of ["field-pool-a", "field-pool-b", "read-prices", "manual-view", "manual-notes", "v3-controls"]) {
+    assert.equal(element(id).hidden, false, id + " shown in manual mode");
+  }
+  const since = provider.rpcCalls.slice(before);
+  assert.ok(since.length >= 12, "calls since switching: " + JSON.stringify(since.map((c) => c.method + " " + (c.params[0] && c.params[0].to) + " " + (c.params[0] && c.params[0].data && c.params[0].data.slice(0, 10)))));
+  assert.ok(since.every((c) => c.method === "eth_call"), "only eth_call in manual mode");
+  assert.ok(provider.httpCalls.slice(httpBefore).every((c) => !Array.isArray(c.body)), "no JSON-RPC batch in manual mode");
+  assert.equal(provider.manualCalls.length, 8);
+  assert.equal(provider.calls.length, 0, "no wallet call");
+  assert.deepEqual(timers.map((t) => t.ms), [E.POLL_INTERVAL_MS], "the log monitor's timer is gone; one manual poll is scheduled");
+  const rows = element("manual-body").children;
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].children[0].textContent, /^0\.30% · 0\.19030\d* \(tick -292916\) · 0x0652…BAF3$/);
+  assert.match(rows[0].children[1].textContent, /^1\.00% · 0\.2085\d* \(tick -292000\) · 0x7A19…E4e1$/);
+  assert.equal(rows[0].children[3].textContent, "1.300");
+  assert.equal(rows[0].children[5].textContent, "GREEN");
+  assert.match(element("pair-info").textContent, /^Pair PONS\/USDG · token0 = PONS \(0x39dBED3a2bd333467115dE45665cC57F813C4571, 18 decimals\) · token1 = USDG/);
+  assert.match(element("manual-last-read").textContent, /^Last read: \d+s ago$/);
+  assert.match(element("manual-status").textContent, /Read 2 pools with eth_call only/);
+  assert.match(element("poll-status").textContent, /^Manual mode · Last read: 0s ago · 8 eth_calls per read, no eth_getLogs$/);
+  assert.match(element("manual-pools").textContent, /Pool A \(buy\) 0x0652d61511f3A96B8721bE6825680F5954D9BAF3 · Pool B \(sell\) 0x7A192E71564ec66eE0763e328a3Ac274942dE4e1/);
+  // The next poll re-reads the eight pool values and nothing else: symbols and decimals are cached.
+  const beforePoll = provider.rpcCalls.length;
+  await poll();
+  assert.equal(provider.rpcCalls.length - beforePoll, 8);
+  assert.equal(provider.symbolCalls - symbolsBefore, 2, "symbol() read once per token in manual mode");
+  assert.ok(provider.rpcCalls.slice(before).every((c) => c.method === "eth_call"));
+  // Back to Auto-scan: the manual view goes, the log scan resumes.
+  const beforeAuto = provider.rpcCalls.length;
+  await chooseMode(page, "Auto-scan");
+  assert.equal(element("manual-view").hidden, true);
+  assert.equal(element("auto-scan-view").hidden, false);
+  assert.ok(provider.rpcCalls.slice(beforeAuto).some((c) => c.method === "eth_getLogs"));
+  assert.equal(timers.length, 1);
+  assert.match(element("activity").textContent, /Mode: Manual\.\nMode: Auto-scan\./);
+});
+
+test("Manual mode executes the pasted pools through the existing V3 quote, approval, dry run and send flow", async () => {
+  const provider = new ManualMock();
+  const page = await readyPage(provider), { element, flush } = page;
+  // Pasted in the "wrong" order: the page swaps the labels so Pool A is the cheaper 0.30% pool.
+  element("pool-a").value = MANUAL_POOL_B;
+  element("pool-b").value = MANUAL_POOL_A;
+  await chooseMode(page, "Manual");
+  assert.match(element("manual-pools").textContent, /labels swapped/);
+  const row = element("manual-body").children[0];
+  assert.match(row.children[0].textContent, /^0\.30%/);
+  await row.click(); await flush();
+  assert.equal(provider.calls.length, 0, "the quote uses the public RPC, not the wallet");
+  assert.equal(element("bridge-amount").value, "0.04975");
+  assert.match(element("quote-info").textContent, /on pool V3 0\.30% 0x0652…BAF3\./);
+  assert.match(element("quote-info").textContent, /Return quote: 0.011 USDG/);
+  assert.equal(element("route-warning").hidden, true);
+  assert.equal(element("manual-body").children[0].className, "selectable selected");
+  const selected = JSON.parse(element("selected-pools").textContent);
+  assert.equal(selected.buyPool.address, MANUAL_POOL_A);
+  assert.equal(selected.buyPool.currency0, MANUAL_PONS);
+  assert.equal(selected.sellPool.address, MANUAL_POOL_B);
+  await element("connect").click();
+  assert.equal(element("approve-permit2").disabled, true);
+  assert.equal(element("approve-v3-router").disabled, false);
+  assert.match(element("bal-a").textContent, /PONS$/, "balances follow the pools' token0 / token1");
+  assert.match(element("bal-b").textContent, /USDG$/);
+  await element("approve-v3-router").click();
+  assert.equal(provider.sent.length, 1);
+  await element("dry-run").click();
+  assert.equal(element("send").disabled, false);
+  const [deadline, calls] = v3.decodeFunctionData("multicall", element("calldata").textContent);
+  const [params] = v3.decodeFunctionData("exactInput", calls[0]);
+  const path = decodePath(params[0]);
+  assert.deepEqual(path.fees, [3000, 10000]);
+  assert.deepEqual(path.tokens, [ethers.utils.getAddress(E.USDG), MANUAL_PONS, ethers.utils.getAddress(E.USDG)], "token pair comes from the pools, not the hidden fields");
+  assert.equal(deadline.toNumber(), provider.now + 1200);
+  await element("send").click();
+  assert.match(element("status").textContent, /Swap confirmed/);
+  assert.equal(provider.sent[1].to.toLowerCase(), E.V3_ROUTER.toLowerCase());
+  assert.equal(element("send").disabled, true);
+  assert.ok(provider.rpcCalls.every((c) => c.method !== "eth_getLogs" || c.id <= 20), "no log scan after switching to manual");
+  // The transfer buttons address the pools' tokens.
+  element("transfer-to").input(OTHER);
+  element("transfer-ack").change(true);
+  await element("transfer-a").click();
+  assert.equal(provider.sent[2].to.toLowerCase(), E.PONS.toLowerCase());
+});
+
+test("Manual mode shows the brief's errors: different pairs, invalid address, 42-char rule and no liquidity; auto mode stays locked out", async () => {
+  const provider = liveManualMock();
+  const page = await readyPage(provider), { element, timers } = page;
+  await chooseMode(page, "Manual");
+  // The brief's two pools: WETH/PONS, fee() 1.00% and 0.30% as the chain answers, 0.73% spread, RED.
+  const row = element("manual-body").children[0];
+  const short = (address) => { const a = ethers.utils.getAddress(address); return a.slice(0, 6) + "…" + a.slice(-4); };
+  assert.equal(row.children[0].textContent, "1.00% · " + Math.pow(1.0001, 93992).toPrecision(6) + " (tick 93992) · " + short(LIVE_POOL_A));
+  assert.equal(row.children[1].textContent, "0.30% · " + Math.pow(1.0001, 94065).toPrecision(6) + " (tick 94065) · " + short(LIVE_POOL_B));
+  assert.match(row.children[0].textContent, /^1\.00% · 12073\.0 \(tick 93992\)/, "about 12073 PONS per WETH, both 18 decimals");
+  assert.equal(row.children[3].textContent, "1.300");
+  assert.equal(row.children[5].textContent, "RED");
+  assert.match(element("pair-info").textContent, /^Pair WETH\/PONS/);
+  element("auto-mode").change(true);
+  assert.equal(provider.calls.length, 0, "a RED row never executes");
+
+  element("pool-b").value = MANUAL_POOL_A; // PONS/USDG
+  await readPrices(page);
+  assert.match(element("manual-status").textContent, /^Pools are different pairs · next read in 30s/);
+  assert.equal(element("manual-status").className, "error");
+  assert.equal(element("manual-body").children.length, 0, "no row for an invalid pair");
+  assert.match(element("poll-status").textContent, /Manual mode · Pools are different pairs/);
+
+  element("pool-b").value = E.PONS; // a token, not a pool
+  const calls = await readPrices(page);
+  assert.match(element("manual-status").textContent, /^Pool B: Invalid pool address \(0x39dBED3a2bd333467115dE45665cC57F813C4571: token0\(\) reverted\)/);
+  assert.ok(calls.every((c) => c.method === "eth_call"));
+
+  element("pool-b").value = "0x" + "ab".repeat(32); // a 66-char V4 poolId
+  const none = await readPrices(page);
+  assert.equal(element("manual-status").textContent, "Pool B: Enter a 42-char V3 pool address");
+  assert.equal(none.length, 0, "nothing is requested for a malformed address");
+  assert.equal(timers.length, 0, "no poll is scheduled");
+  assert.match(element("pair-info").textContent, /Paste two 42-character V3 pool addresses/);
+
+  const EMPTY = "0x0f5F5bCC08cAe61d19c9a2d2594C252f1Baddae6";
+  provider.setPool(EMPTY, manualPool(MANUAL_WETH, MANUAL_PONS, 100, 93990, { sqrtPriceX96: 0 }));
+  element("pool-b").value = EMPTY;
+  await readPrices(page);
+  assert.match(element("manual-status").textContent, /^Pool has no liquidity \(Pool B 0x0f5F5bCC08cAe61d19c9a2d2594C252f1Baddae6\)/);
+
+  // A healthy pair again, with a GREEN net above the threshold: auto mode executes nothing without a wallet.
+  provider.setPool(EMPTY, manualPool(MANUAL_WETH, MANUAL_PONS, 100, 93992));
+  element("pool-a").value = LIVE_POOL_B; // 0.30% at tick 94065 against 0.01% at tick 93992: 0.733% - 0.31% = 0.42% net
+  await readPrices(page);
+  assert.equal(element("manual-body").children[0].children[5].textContent, "RED");
+  element("threshold").input("0.4");
+  assert.equal(element("manual-body").children[0].children[5].textContent, "GREEN");
+  assert.equal(element("manual-body").children[0].children[3].textContent, "0.310");
+  assert.equal(provider.calls.length, 0);
+  element("auto-mode").change(false);
+  // While a read is in flight the controls lock with the rest of the page.
+  await element("connect").click();
+  assert.equal(element("mode").disabled, false);
+  assert.equal(element("pool-a").disabled, false);
+});
