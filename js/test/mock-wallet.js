@@ -39,6 +39,7 @@ class MockWallet extends EventEmitter {
     this.block = 108394834;
     this.calls = [];
     this.rpcCalls = [];
+    this.httpCalls = [];
     this.sent = [];
     this.pending = new Map();
     this.permits = new Map();
@@ -175,7 +176,7 @@ class MockWallet extends EventEmitter {
     if (method === "eth_getLogs") {
       const filter = params[0];
       const from = ethers.BigNumber.from(filter.fromBlock).toNumber();
-      const to = ethers.BigNumber.from(filter.toBlock).toNumber();
+      const to = filter.toBlock === "latest" ? this.block : ethers.BigNumber.from(filter.toBlock).toNumber();
       if (to - from + 1 > 50000) throw new Error("block range too large");
       const [topic0, topic1] = filter.topics;
       return this.logs.filter((log) => {
@@ -278,20 +279,24 @@ class MockWallet extends EventEmitter {
   /** The direct JSON-RPC surface the page's `fetch` uses. Only POST JSON-RPC to the RPC URL is answered. */
   async fetch(url, init) {
     const body = JSON.parse(init.body);
-    this.rpcCalls.push({ url, ...body });
-    if (this.beforeRpc) await this.beforeRpc(body);
+    this.httpCalls.push({ url, body });
+    const calls = Array.isArray(body) ? body : [body];
+    this.rpcCalls.push(...calls.map(call => ({ url, ...call })));
     if (url !== E.RPC_URL) return { ok: false, status: 404, json: async () => ({}) };
     if (this.httpFailures > 0) { this.httpFailures--; return { ok: false, status: 429, json: async () => ({}) }; }
-    const reply = (payload) => ({ ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: body.id, ...payload }) });
-    if (this.rpcFailures > 0) {
-      this.rpcFailures--;
-      return reply({ error: { code: -32005, message: "rate limited" } });
-    }
-    try {
-      return reply({ result: this.handle(body.method, body.params || []) });
-    } catch (error) {
-      return reply({ error: { code: error.code === undefined ? -32000 : error.code, message: error.message, data: error.data } });
-    }
+    const fail = this.rpcFailures > 0;
+    if (fail) this.rpcFailures--;
+    const replies = await Promise.all(calls.map(async call => {
+      if (this.beforeRpc) await this.beforeRpc(call);
+      const reply = payload => ({ jsonrpc: "2.0", id: call.id, ...payload });
+      if (fail) return reply({ error: { code: -32005, message: "rate limited" } });
+      try { return reply({ result: this.handle(call.method, call.params || []) }); }
+      catch (error) {
+        return reply({ error: { code: error.code === undefined ? -32000 : error.code, message: error.message, data: error.data } });
+      }
+    }));
+    // The protocol allows responses in any order. Exercise id matching in every monitor/UI test.
+    return { ok: true, status: 200, json: async () => Array.isArray(body) ? replies.reverse() : replies[0] };
   }
 }
 

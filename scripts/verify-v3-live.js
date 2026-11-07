@@ -7,14 +7,18 @@ const { ethers } = require("../js/vendor/ethers-5.7.2.umd.min.js");
 const E = require("../js/v4-arb-encoder.js");
 
 (async () => {
-  const rpc = E.createRpcClient(E.RPC_URL, fetch).request;
+  const client = E.createRpcClient(E.RPC_URL, fetch);
+  const rpc = client.request;
   assert.equal(Number(await rpc("eth_chainId", [])), E.CHAIN_ID);
   const block = await rpc("eth_blockNumber", []);
   // Pin every read and quote to the same block, including the monitor's 'latest' health calls.
-  const request = (method, params) => {
+  const pinnedCall = (method, params) => {
     assert.ok(["eth_call", "eth_getCode", "eth_getBlockByNumber", "eth_getLogs"].includes(method));
-    return rpc(method, params.map(value => value === "latest" ? block : value));
+    return { method, params: params.map(value => value === "latest" ? block :
+      method === "eth_getLogs" ? { ...value, toBlock: value.toBlock === "latest" ? block : value.toBlock } : value) };
   };
+  const request = (method, params) => { const call = pinnedCall(method, params); return rpc(call.method, call.params); };
+  const batchRequest = calls => client.batchRequest(calls.map(call => pinnedCall(call.method, call.params)));
   const contracts = {};
   for (const [name, address] of [["factory", E.V3_FACTORY], ["router", E.V3_ROUTER]]) {
     const code = await request("eth_getCode", [address, "latest"]);
@@ -42,7 +46,7 @@ const E = require("../js/v4-arb-encoder.js");
   assert.ok(windowBlocks, "window must be from 50 to 50000 blocks");
   const observations = [];
   for (const tokens of pairs) {
-    const monitor = E.createPoolMonitor({ request, windowBlocks });
+    const monitor = E.createPoolMonitor({ request, batchRequest, windowBlocks });
     try {
       await monitor.start(tokens[0], tokens[1], "Both");
       const state = monitor.getState();

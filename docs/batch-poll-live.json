@@ -1,0 +1,190 @@
+{
+  "checkedAt": "2026-11-07T17:26:51.309Z",
+  "rpc": "https://rpc.mainnet.chain.robinhood.com",
+  "chainId": 4663,
+  "pair": [
+    "PONS",
+    "USDG"
+  ],
+  "protocol": "Both",
+  "startupHttpPosts": 3,
+  "pollHttpPosts": 2,
+  "batches": [
+    {
+      "httpStatus": 200,
+      "calls": 3,
+      "methods": [
+        "eth_getBlockByNumber",
+        "eth_getLogs",
+        "eth_getLogs"
+      ],
+      "responseIds": [
+        15,
+        16,
+        17
+      ]
+    },
+    {
+      "httpStatus": 200,
+      "calls": 2,
+      "methods": [
+        "eth_getBlockByNumber",
+        "eth_call"
+      ],
+      "responseIds": [
+        18,
+        19
+      ]
+    }
+  ],
+  "fromBlock": 108575736,
+  "blockNumber": 108578735,
+  "blockTimestamp": 1794072410,
+  "windowBlocks": 3000,
+  "pools": [
+    {
+      "protocol": "V4",
+      "poolId": "0xa1dcc773a7cbfc8bf54eeb794d7038f5eb3d5568d70b8c22f063ec96a4b04f2c",
+      "fee": 0,
+      "tickSpacing": 1,
+      "swaps": 0,
+      "tick": null,
+      "price": null,
+      "lastBlock": null,
+      "swapTimestamp": null,
+      "elapsedSeconds": null,
+      "empty": null,
+      "status": "INACTIVE"
+    },
+    {
+      "protocol": "V4",
+      "poolId": "0xb0c2edb57f02ffa2e00a1700395c816c166b02dd49b56195944343ea75b1c1b7",
+      "fee": 0,
+      "tickSpacing": 10,
+      "swaps": 0,
+      "tick": null,
+      "price": null,
+      "lastBlock": null,
+      "swapTimestamp": null,
+      "elapsedSeconds": null,
+      "empty": null,
+      "status": "INACTIVE"
+    },
+    {
+      "protocol": "V4",
+      "poolId": "0x24a3cdfa2b9725528ec56c6c71f6499428f6596a3c923ff145e96d58eacc597a",
+      "fee": 500,
+      "tickSpacing": 10,
+      "swaps": 0,
+      "tick": null,
+      "price": null,
+      "lastBlock": null,
+      "swapTimestamp": null,
+      "elapsedSeconds": null,
+      "empty": null,
+      "status": "INACTIVE"
+    },
+    {
+      "protocol": "V4",
+      "poolId": "0xfcb3ac1562a590e0c96f24a0e664dbe9dcc2f98e05f3311be02eba6909af5c7d",
+      "fee": 2500,
+      "tickSpacing": 25,
+      "swaps": 0,
+      "tick": null,
+      "price": null,
+      "lastBlock": null,
+      "swapTimestamp": null,
+      "elapsedSeconds": null,
+      "empty": null,
+      "status": "INACTIVE"
+    },
+    {
+      "protocol": "V4",
+      "poolId": "0x4be9657ec9002e528f4f17a5c43edc525a07f888f7b180c2afbf75e096c4f38a",
+      "fee": 3000,
+      "tickSpacing": 60,
+      "swaps": 5,
+      "tick": -293279,
+      "price": 0.1835234940302618,
+      "lastBlock": 108578339,
+      "swapTimestamp": 1794072369,
+      "elapsedSeconds": 41,
+      "empty": false,
+      "status": "OK"
+    },
+    {
+      "protocol": "V4",
+      "poolId": "0x280bddb292e8f374acaad05b17b242ad46af7f665a9ae7105fb9d55ff1686778",
+      "fee": 10000,
+      "tickSpacing": 200,
+      "swaps": 0,
+      "tick": null,
+      "price": null,
+      "lastBlock": null,
+      "swapTimestamp": null,
+      "elapsedSeconds": null,
+      "empty": null,
+      "status": "INACTIVE"
+    },
+    {
+      "protocol": "V4",
+      "poolId": "0x2e7ba084e848fb5af806efaeccfc9676a1a4c459f696e852b53c1a4f650c39b6",
+      "fee": 30000,
+      "tickSpacing": 600,
+      "swaps": 0,
+      "tick": null,
+      "price": null,
+      "lastBlock": null,
+      "swapTimestamp": null,
+      "elapsedSeconds": null,
+      "empty": null,
+      "status": "INACTIVE"
+    },
+    {
+      "protocol": "V3",
+      "poolId": "0x46534760b24abe79aafdd82d4a37681dec311133",
+      "address": "0x46534760B24aBE79AafdD82d4a37681DEc311133",
+      "fee": 500,
+      "tickSpacing": null,
+      "swaps": 0,
+      "tick": null,
+      "price": null,
+      "lastBlock": null,
+      "swapTimestamp": null,
+      "elapsedSeconds": null,
+      "empty": null,
+      "status": "INACTIVE"
+    },
+    {
+      "protocol": "V3",
+      "poolId": "0x0652d61511f3a96b8721be6825680f5954d9baf3",
+      "address": "0x0652d61511f3A96B8721bE6825680F5954D9BAF3",
+      "fee": 3000,
+      "tickSpacing": null,
+      "swaps": 0,
+      "tick": null,
+      "price": null,
+      "lastBlock": null,
+      "swapTimestamp": null,
+      "elapsedSeconds": null,
+      "empty": null,
+      "status": "INACTIVE"
+    },
+    {
+      "protocol": "V3",
+      "poolId": "0x7a192e71564ec66ee0763e328a3ac274942de4e1",
+      "address": "0x7A192E71564ec66eE0763e328a3Ac274942dE4e1",
+      "fee": 10000,
+      "tickSpacing": null,
+      "swaps": 0,
+      "tick": null,
+      "price": null,
+      "lastBlock": null,
+      "swapTimestamp": null,
+      "elapsedSeconds": null,
+      "empty": null,
+      "status": "INACTIVE"
+    }
+  ],
+  "note": "Read-only HTTP batches. Startup includes metadata/discovery plus its first poll; pollHttpPosts measures one subsequent cycle. No quotes, wallet calls, signing, deployments or transactions."
+}

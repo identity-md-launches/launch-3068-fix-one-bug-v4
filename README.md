@@ -7,6 +7,101 @@ on chain 4663, with the evidence for the fix.
 The deliverables are [`index.html`](index.html) and [`js/v4-arb-encoder.js`](js/v4-arb-encoder.js):
 plain JavaScript and the existing vendored ethers v5, with no install or CDN required.
 
+## Follow-up 4.1: batch polling
+
+An active poll now sends **two HTTP POSTs**, regardless of the number of active pools:
+
+1. One JSON-RPC array containing the latest block header, V4 Swap logs when enabled, and V3
+   Swap logs when enabled and discovery found pools.
+2. One array containing each active pool's swap-block header and its existing health read:
+   V4 `extsload` for slot0 or V3 `liquidity()`. No active pools means **one POST**; an empty
+   JSON-RPC batch is never sent.
+
+The window, tick prices, timestamp ages, status precedence, spreads, auto mode, quotes,
+approvals, encoders, wallet transfers and UI are unchanged. Quotes remain individual `eth_call`
+requests. Phase 1 errors keep the previous table and retry in **60 seconds**. Phase 2 failures
+affect only the relevant health fields/pools; an HTTP failure for that phase leaves all active
+pools UNKNOWN. Existing EMPTY/STALE precedence still applies to individual failed reads.
+Successful polls, including ones with unknown health, schedule the next cycle in **30 seconds**.
+
+### RPC API and fallback
+
+```js
+const rpc = V4ArbEncoder.createRpcClient(V4ArbEncoder.RPC_URL, fetch);
+const monitor = V4ArbEncoder.createPoolMonitor({
+  request: rpc.request,
+  batchRequest: rpc.batchRequest,
+  protocol: "Both",
+});
+await monitor.start(V4ArbEncoder.PONS, V4ArbEncoder.USDG);
+// monitor.stop() cancels scheduled polling.
+```
+
+`batchRequest([{ method, params }, ...])` assigns sequential IDs shared with `request` and
+returns values in **input order**, matching responses by ID. Reverted calls, missing replies,
+duplicate IDs and malformed entries return `{ error }` at that index; RPC errors preserve
+`message`, `code` and revert `data`. Response order is not assumed, as required by the
+[JSON-RPC batch specification](https://www.jsonrpc.org/specification#batch).
+
+Batch HTTP requests have a **30-second timeout** (`batchTimeoutMs`); individual calls keep
+their 20-second timeout (`timeoutMs`). A single-object reply or batch rejection, including
+an HTTP 400 JSON-RPC invalid-request error, switches that client to sequential requests.
+Fallback waits **500 ms** after the rejection and between single calls, including phase
+boundaries and concurrent fallback batches. The capability decision lasts until a new RPC
+client is created (page reload). Individual call errors keep their positions and do not stop
+successful sibling reads. HTTP 429/503, network failures, timeouts and malformed JSON fail
+the batch rather than creating a burst of fallback requests; a later cycle still tries batching.
+
+### Initialization and window assumptions
+
+On start/restart, one setup batch reads token symbols/decimals, discovers V3 pools when enabled,
+and seeds a block number. Setup is cached for subsequent polls: a cold start with active pools
+uses **three POSTs total** (setup + the two poll phases); a regular active poll uses two.
+This is necessary because an [`eth_getLogs` filter](https://ethereum.org/developers/docs/apis/json-rpc/#eth_getlogs)
+cannot reference a sibling batch result or express `latest - N`.
+
+Phase 1 scans from the previous observed head minus the chosen window through `latest`, then
+discards logs outside `[max(0, newHead - window + 1), newHead]`. Thus newly mined blocks are
+included and older over-fetched logs never affect swap counts or activity. Windows above
+25,000 blocks use two disjoint filters per enabled protocol **inside the same POST**, reserving
+room under the RPC's 50,000-block range limit for blocks mined between polls. After a very long
+pause, a range failure retains the newly returned head, so the next retry uses a fresh bound.
+A backwards head fails the poll and refreshes that bound for the retry instead of publishing
+an incomplete window. Changing the window still takes effect on the next poll.
+
+JSON-RPC batches are not atomic chain snapshots: `latest` calls may resolve at slightly
+different heads. Logs beyond the returned header are excluded; swaps mined after a log query
+has resolved are picked up next cycle. V4 health still reads `latest`, while V3 liquidity is
+pinned to the returned header, as before. This remains a live monitor, not a finalized indexer.
+
+### Verification and operations
+
+`node --test js/test/*.test.js` covers reversed IDs, partial/missing/duplicate replies, empty
+logs, inactive pools, both protocols, exact window boundaries, head regression, phase failures,
+30/60-second scheduling, 30-second aborts, and sequential fallback with a virtual 500-ms clock.
+Existing encoder, quote, wallet and UI tests run with the batch-aware mock RPC.
+
+`node scripts/verify-batch-live.js` performs initialization and measures one subsequent read-only
+poll. It validates IDs, swap counts, latest ticks, prices, timestamps and health against the raw
+batch replies without extra verification requests. It sends no transactions and uses no wallet.
+The saved [live result](docs/batch-poll-live.json), **2026-11-07 17:26:51 UTC**, records
+**two HTTP 200 POSTs** at block **108578735**, window **3000**: three calls in phase 1, two in
+phase 2. V4 3000/60 had five swaps, tick **-293279**, price **0.1835234940302618 USDG/PONS**,
+and age **41 seconds**, status **OK**. Other selected V3/V4 pools were inactive in that window.
+This is a dated observation, not a prediction of subsequent activity.
+
+`forge build`, `forge test` with fuzz seed
+`0xab52a62a4275149a83148f42337cc96dc5e14141fb093a4f0c5b65c0636b083b`, and
+`forge fmt --check` pass using the unchanged pinned **solc 0.8.26** (77 Solidity tests).
+
+No contract deployment, new dependency, owner setting or address change is required. Publish
+`index.html` and `js/v4-arb-encoder.js` together on the existing static host, retaining the
+vendored ethers asset. This repository uses the direct public RPC and contains no Worker.
+If an operator uses an external proxy, it must forward JSON arrays unchanged and preserve its
+retry-on-429 handling; its old per-request 500-ms delay may be removed. The client fallback's
+500-ms delay must remain. Operators remain responsible for RPC/CORS availability, refreshing
+cached assets, and the wallet/auto-mode responsibilities documented below.
+
 ## Follow-up 4: dual-protocol monitoring and execution
 
 The same page now has **Protocol: V4 / V3 / Both**, default **Both**. Changing it restarts the
@@ -43,8 +138,8 @@ or protocol restart, including across a later log-scan failure; it is not repeat
 An unsuccessful discovery is retried after 60 seconds. Newly created pools therefore require
 **WATCH PAIR** (or a protocol change) to rediscover them.
 
-Each poll reads the latest block once, then one V4 singleton log request if enabled and **one V3
-address-array log request** if enabled and at least one V3 pool exists. Both requests use the same
+Each poll reads the latest block and the enabled protocols' logs in one HTTP batch, as described
+in follow-up 4.1 above. V3 uses an address-array filter and both protocols share the displayed
 window and head. An empty V3 address array is never sent. Each active V3 pool gets a swap-block
 timestamp read and `liquidity()` at that head; zero liquidity means **EMPTY**. A failed health read
 means **UNKNOWN**, and excess elapsed time means **STALE**, using the existing status functions.
@@ -220,7 +315,8 @@ span. These defaults are the brief's and are unchanged.
   and block range the last poll used. It stays editable during a pending transaction.
 - **Polling**: `eth_blockNumber` is gone. Each poll is `eth_getBlockByNumber("latest", false)`, one
   `eth_getLogs`, then for each active pool one `eth_getBlockByNumber(lastSwapBlock, false)` and one
-  slot0 `eth_call`: 2 + 2 × active pools requests, all on the public RPC. Timestamps are not cached.
+  slot0 `eth_call`: 2 + 2 × active pools RPC calls, now grouped into two HTTP batches by
+  follow-up 4.1 above. Timestamps are not cached.
 - **Last Swap** column: latest block timestamp minus the swap block's timestamp, as `Xm ago` or
   `Xh Ym ago`, rounded down to the minute; green under 30 min, yellow from 30 min to 2 h inclusive, red above.
 - **Max staleness (seconds)**: beside the threshold, default 7200, applied to the table at once. It
@@ -386,9 +482,9 @@ optional `pair`.
 | `decodeSwapLog(log)`, `summarisePools(keys, logs)` | Swap-log parsing and the pools table |
 | `spreadPercent`, `feeCostPercent`, `rankSpreads(pools, threshold, limit = 5)` | the spreads table |
 | `applySlippage(amount, bps = 50)` | the bridge amount |
-| `createRpcClient(url, fetch?)` | JSON-RPC over HTTP; errors carry `code` and revert `data` |
+| `createRpcClient(url, fetch?, options?)` | `request(method, params)` and `batchRequest(calls)`; errors carry `code` and revert `data` |
 | `quoteExactIn(request, { poolKey, zeroForOne, amountIn, from? })` | exact quote via the router's price-check revert |
-| `createPoolMonitor({ request, pollIntervalMs, retryIntervalMs, windowBlocks, thresholdPercent, onUpdate, onError })` | `start(a, b)`, `stop()`, `pollOnce()`, `getState()` |
+| `createPoolMonitor({ request, batchRequest, pollIntervalMs, retryIntervalMs, windowBlocks, thresholdPercent, onUpdate, onError })` | `start(a, b)`, `stop()`, `pollOnce()`, `getState()` |
 | wallet client: `readBalances(tokens, account?)`, `transferAllToken(token, to)`, `transferAllEth(to)` | balances and whole-balance transfers |
 
 ### Follow-up 3 verification

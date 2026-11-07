@@ -445,7 +445,8 @@
       if (!state.lastError) maybeAutoExecute(state);
     }
 
-    const monitor = E.createPoolMonitor({ request: rpc.request, thresholdPercent: thresholdOrDefault, windowBlocks: () => windowBlocks,
+    const monitor = E.createPoolMonitor({ request: rpc.request, batchRequest: rpc.batchRequest,
+      thresholdPercent: thresholdOrDefault, windowBlocks: () => windowBlocks,
       maxStalenessSeconds: () => maxStaleness, onUpdate: renderMonitor });
 
     function startMonitor() {

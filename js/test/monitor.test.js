@@ -188,7 +188,7 @@ function monitorWithFakeTimers(provider, options = {}) {
   const errors = [];
   let now = 1700000000000;
   const monitor = context.V4ArbEncoder.createPoolMonitor({
-    request: rpcFor(provider), now: () => now,
+    ...E.createRpcClient(E.RPC_URL, provider.fetch), now: () => now,
     onUpdate: (state) => updates.push(JSON.parse(JSON.stringify({ polls: state.polls, errors: state.errors, lastError: state.lastError,
       active: state.pools.filter((p) => p.active).length, spreads: state.spreads.length, block: state.blockNumber }))),
     onError: (error) => errors.push(error.message),
@@ -224,7 +224,8 @@ test("monitor: first poll on start, 30 s schedule, 60 s back-off on any RPC erro
   assert.equal(logsCall.params[0].address, E.POOL_MANAGER);
   assert.equal(logsCall.params[0].topics[0], E.SWAP_TOPIC);
   assert.equal(logsCall.params[0].topics[1].length, 7);
-  assert.equal(ethers.BigNumber.from(logsCall.params[0].toBlock).sub(logsCall.params[0].fromBlock).toNumber(), 2999);
+  assert.equal(logsCall.params[0].toBlock, "latest");
+  assert.equal(provider.block - Number(logsCall.params[0].fromBlock), 2999);
   // Symbols are read once, not on every poll.
   const symbolCalls = () => provider.rpcCalls.filter((c) => c.method === "eth_call" && c.params[0].data === erc20.getSighash("symbol")).length;
   assert.equal(symbolCalls(), 2);
@@ -296,7 +297,7 @@ test("monitor: a pair whose token has no symbol() keeps retrying, a bad pair nev
   assert.equal(monitor.getState().pair.symbolA, "USDG");
   assert.equal(monitor.getState().polls, 1);
   monitor.stop();
-  await assert.rejects(E.createPoolMonitor({ request: rpcFor(provider) }).pollOnce(), /start\(/);
+  await assert.rejects(E.createPoolMonitor(E.createRpcClient(E.RPC_URL, provider.fetch)).pollOnce(), /start\(/);
   assert.throws(() => E.createPoolMonitor({}), /request function/);
   assert.throws(() => E.createPoolMonitor({ request: () => {}, windowBlocks: 0 }), /windowBlocks/);
 });
@@ -317,11 +318,18 @@ test("monitor: a threshold function is consulted on every poll", async () => {
 
 test("monitor with real short intervals keeps polling until stopped", async () => {
   const provider = new MockWallet();
-  const monitor = E.createPoolMonitor({ request: rpcFor(provider), pollIntervalMs: 2, retryIntervalMs: 4 });
-  await monitor.start(E.PONS, E.USDG);
-  provider.rpcFailures = 1;
-  await new Promise((resolve) => setTimeout(resolve, 80));
-  monitor.stop();
+  let done, timeout;
+  const completed = new Promise((resolve, reject) => {
+    done = resolve;
+    timeout = setTimeout(() => reject(new Error("monitor did not recover")), 10000);
+  });
+  const monitor = E.createPoolMonitor({ ...E.createRpcClient(E.RPC_URL, provider.fetch), pollIntervalMs: 2, retryIntervalMs: 4,
+    onUpdate: state => { if (state.polls >= 3) done(); } });
+  try {
+    await monitor.start(E.PONS, E.USDG);
+    provider.rpcFailures = 1;
+    await completed;
+  } finally { monitor.stop(); clearTimeout(timeout); }
   const state = monitor.getState();
   assert.ok(state.polls >= 3, "polls " + state.polls);
   assert.equal(state.errors, 1);
@@ -436,7 +444,7 @@ test("autoDecision fires only on two tradeable pools and names the pool that blo
   assert.equal(E.autoDecision([health(0, 1, 1), health(0, 10, 1.3)], 0.5).spread.verdict, "GREEN");
 });
 
-test("a poll reads the latest block once, never eth_blockNumber, then one block and one slot0 per active pool", async () => {
+test("a poll uses two HTTP batches: latest and logs, then one block and one slot0 per active pool", async () => {
   const provider = new MockWallet();
   provider.addSwap(3000, 60, -292916, provider.block - 2000, { ageSeconds: 600 });
   provider.addSwap(3000, 60, -292900, provider.block - 1000, { ageSeconds: 300 }); // the later swap is the one timed
@@ -444,6 +452,7 @@ test("a poll reads the latest block once, never eth_blockNumber, then one block 
   const { monitor } = monitorWithFakeTimers(provider);
   await monitor.start(E.PONS, E.USDG);
   const before = provider.rpcCalls.length;
+  const httpBefore = provider.httpCalls.length;
   await monitor.pollOnce();
   const calls = pollCalls(provider, before);
   assert.equal(calls.filter((c) => c.method === "eth_blockNumber").length, 0);
@@ -456,6 +465,9 @@ test("a poll reads the latest block once, never eth_blockNumber, then one block 
   assert.equal(slot0.length, 2);
   assert.ok(slot0.every((c) => c.params[0].to === E.POOL_MANAGER && c.params[0].data.startsWith("0x1e2eaeaf")));
   assert.equal(calls.length, 2 + 2 + 2);
+  const posts = provider.httpCalls.slice(httpBefore);
+  assert.equal(posts.length, 2);
+  assert.deepEqual(posts.map(post => post.body.length), [2, 4]);
   assert.ok(calls.every((c) => c.url === E.RPC_URL));
   const state = monitor.getState();
   assert.equal(state.blockTimestamp, provider.now);
@@ -475,7 +487,7 @@ test("a window function is read on every poll and needs no restart; an out-of-ra
   let blocks = 3000;
   const { monitor, timers, fire } = monitorWithFakeTimers(provider, { windowBlocks: () => blocks });
   await monitor.start(E.PONS, E.USDG);
-  const span = () => { const f = provider.rpcCalls.filter((c) => c.method === "eth_getLogs").at(-1).params[0]; return Number(f.toBlock) - Number(f.fromBlock) + 1; };
+  const span = () => monitor.getState().blockNumber - monitor.getState().fromBlock + 1;
   assert.equal(span(), 3000);
   blocks = 50;
   await fire();

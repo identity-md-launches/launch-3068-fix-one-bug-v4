@@ -158,18 +158,30 @@
 
   function formatV3Fee(fee) { return (v3Fee(fee) / 10000).toFixed(2) + "%"; }
 
-  /** Four factory reads per pair, cached by the monitor even if the following log scan fails. */
-  async function discoverV3Pools(request, tokenA, tokenB) {
-    var pair = sortPair(tokenA, tokenB);
-    var pools = await Promise.all(V3_FEE_TIERS.map(async function (fee) {
-      var result = await request("eth_call", [{ to: V3_FACTORY,
-        data: v3FactoryInterface.encodeFunctionData("getPool", [pair.currency0, pair.currency1, fee]) }, "latest"]);
+  function v3DiscoveryCalls(pair) {
+    return V3_FEE_TIERS.map(function (fee) {
+      return { method: "eth_call", params: [{ to: V3_FACTORY,
+        data: v3FactoryInterface.encodeFunctionData("getPool", [pair.currency0, pair.currency1, fee]) }, "latest"] };
+    });
+  }
+
+  function decodeV3Pools(pair, results) {
+    var pools = V3_FEE_TIERS.map(function (fee, i) {
+      var result = rpcResult(results[i]);
       var address = v3FactoryInterface.decodeFunctionResult("getPool", result)[0];
       if (address === ethers.constants.AddressZero) return null;
       return { protocol: "V3", address: address, poolId: address.toLowerCase(), fee: fee,
         currency0: pair.currency0, currency1: pair.currency1, tickSpacing: null };
-    }));
+    });
     return pools.filter(function (pool) { return pool !== null; });
+  }
+
+  /** Four factory reads per pair, cached by the monitor even if the following log scan fails. */
+  async function discoverV3Pools(request, tokenA, tokenB) {
+    var pair = sortPair(tokenA, tokenB);
+    return decodeV3Pools(pair, await Promise.all(v3DiscoveryCalls(pair).map(function (call) {
+      return request(call.method, call.params);
+    })));
   }
 
   function decodeV3SwapLog(log) {
@@ -751,6 +763,19 @@
 
   // ------------------------------------------------------------------ JSON-RPC and quotes
 
+  function rpcError(detail) {
+    var error = new Error("RPC error: " + (detail.message || "unknown"));
+    error.code = detail.code;
+    error.data = detail.data;
+    return error;
+  }
+
+  /** Unwrap one batch entry without discarding successful sibling calls. */
+  function rpcResult(result) {
+    if (result && result.error) throw result.error;
+    return result;
+  }
+
   /** Minimal JSON-RPC over HTTP client. Errors carry the node's `code` and revert `data`. */
   function createRpcClient(url, fetchImpl, options) {
     options = options || {};
@@ -758,32 +783,115 @@
     if (typeof doFetch !== "function") fail("fetch is not available; pass a fetch implementation");
     if (typeof url !== "string" || !/^https?:\/\//.test(url)) fail("RPC url must be an http(s) URL");
     var timeoutMs = options.timeoutMs === undefined ? 20000 : options.timeoutMs;
+    var batchTimeoutMs = options.batchTimeoutMs === undefined ? 30000 : options.batchTimeoutMs;
     var nextId = 0;
-    async function request(method, params) {
+    var batchSupported = true;
+    var sequentialTail = Promise.resolve();
+
+    function envelope(method, params) {
+      return { jsonrpc: "2.0", id: ++nextId, method: method, params: params || [] };
+    }
+
+    async function post(payload, timeout) {
       var controller = typeof AbortController === "function" ? new AbortController() : null;
-      var timer = controller ? setTimeout(function () { controller.abort(); }, timeoutMs) : null;
+      var timer = controller ? setTimeout(function () { controller.abort(); }, timeout) : null;
       try {
         var response = await doFetch(url, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ jsonrpc: "2.0", id: ++nextId, method: method, params: params || [] }),
+          body: JSON.stringify(payload),
           signal: controller ? controller.signal : undefined,
         });
-        if (!response || !response.ok) fail("RPC HTTP error " + (response ? response.status : "no response"));
-        var body = await response.json();
-        if (!body || typeof body !== "object") fail("RPC returned no JSON object");
-        if (body.error) {
-          var error = new Error("RPC error: " + (body.error.message || "unknown"));
-          error.code = body.error.code;
-          error.data = body.error.data;
+        // A 429/outage must back off, not fan out into individual HTTP requests.
+        if (!response || response.status === 429 || response.status === 503) {
+          fail("RPC HTTP error " + (response ? response.status : "no response"));
+        }
+        var body;
+        try { body = await response.json(); } catch (error) {
+          if (!response.ok) fail("RPC HTTP error " + response.status);
           throw error;
         }
-        return body.result;
+        return { ok: response.ok, status: response.status, body: body };
       } finally {
         if (timer !== null) clearTimeout(timer);
       }
     }
-    return { request: request, url: url };
+
+    function resultOf(body, id) {
+      if (!body || Array.isArray(body) || body.jsonrpc !== "2.0" || body.id !== id) {
+        fail("RPC returned an invalid response for id " + id);
+      }
+      if (body.error) throw rpcError(body.error);
+      if (!Object.prototype.hasOwnProperty.call(body, "result")) fail("RPC response missing result for id " + id);
+      return body.result;
+    }
+
+    async function request(method, params) {
+      var call = envelope(method, params);
+      var reply = await post(call, timeoutMs);
+      if (!reply.ok) fail("RPC HTTP error " + reply.status);
+      var body = reply.body;
+      if (!body || typeof body !== "object") fail("RPC returned no JSON object");
+      if (body.error) throw rpcError(body.error);
+      return body.result;
+    }
+
+    // Serialize fallback batches, including the boundary between phases/cycles. Wait after the
+    // rejected batch and between every single request, even if the preceding call failed.
+    function sequential(calls) {
+      var pending = sequentialTail.then(async function () {
+        var results = [];
+        for (var i = 0; i < calls.length; i++) {
+          await new Promise(function (resolve) { setTimeout(resolve, 500); });
+          try { results.push(await request(calls[i].method, calls[i].params)); }
+          catch (error) { results.push({ error: error }); }
+        }
+        return results;
+      });
+      sequentialTail = pending.catch(function () {});
+      return pending;
+    }
+
+    async function batchRequest(calls) {
+      if (!Array.isArray(calls)) fail("batch calls must be an array");
+      calls.forEach(function (call) {
+        if (!call || typeof call.method !== "string" || !call.method ||
+          (call.params !== undefined && !Array.isArray(call.params))) fail("invalid batch call");
+      });
+      if (!calls.length) return [];
+      if (!batchSupported) return sequential(calls);
+      var requests = calls.map(function (call) { return envelope(call.method, call.params); });
+      var reply = await post(requests, batchTimeoutMs);
+      var body = reply.body;
+      var rejection = Array.isArray(body) && body.length === 1 && body[0] && body[0].id === null ? body[0] : body;
+      if (rejection && rejection.error && (rejection.error.code === -32005 ||
+        /rate.?limit|too many requests/i.test(rejection.error.message || ""))) throw rpcError(rejection.error);
+      // Some nodes reject arrays with an HTTP 400 JSON-RPC error, others return one object
+      // with HTTP 200. Remember the capability for this client so each poll doesn't probe again.
+      if (rejection && !Array.isArray(rejection) && typeof rejection === "object" &&
+        (reply.ok || (rejection.error && (rejection.error.code === -32600 ||
+          /batch/i.test(rejection.error.message || ""))))) {
+        batchSupported = false;
+        return sequential(calls);
+      }
+      if (!reply.ok) fail("RPC HTTP error " + reply.status);
+      if (!Array.isArray(body)) fail("RPC batch returned no JSON array");
+      var byId = new Map();
+      var duplicates = new Set();
+      body.forEach(function (entry) {
+        if (!entry || typeof entry !== "object") return;
+        if (byId.has(entry.id)) duplicates.add(entry.id);
+        byId.set(entry.id, entry);
+      });
+      return requests.map(function (call) {
+        try {
+          if (duplicates.has(call.id)) fail("RPC batch has duplicate response id " + call.id);
+          return resultOf(byId.get(call.id), call.id);
+        } catch (error) { return { error: error }; }
+      });
+    }
+
+    return { request: request, batchRequest: batchRequest, url: url };
   }
 
   /** Revert data from the shapes wallets and nodes use: a string, nested objects, or inside the message. */
@@ -856,7 +964,8 @@
   /**
    * Polls the PoolManager's Swap logs for the seven fee tiers of one pair.
    *
-   * options: request(method, params) (required), pollIntervalMs (30000), retryIntervalMs (60000),
+   * options: request(method, params), batchRequest(calls) (both required),
+   *          pollIntervalMs (30000), retryIntervalMs (60000),
    *          windowBlocks (number or function, 3000, read on every poll, 50 to 50000),
    *          maxStalenessSeconds (number or function, 7200), thresholdPercent (number or function,
    *          0.5), onUpdate(state), onError(error, state), now().
@@ -885,6 +994,8 @@
       return blocks;
     }
     if (typeof windowOption !== "function") readWindow();
+    var batchRequest = options.batchRequest;
+    if (typeof batchRequest !== "function") fail("batchRequest function is required");
     var onUpdate = options.onUpdate || function () {};
     var onError = options.onError || function () {};
     var now = options.now || function () { return Date.now(); };
@@ -899,26 +1010,32 @@
 
     function freshState() {
       return { pair: null, pools: [], spreads: [], blockNumber: null, blockTimestamp: null, fromBlock: null,
-        protocol: normaliseProtocol(options.protocol || "V4"), v3Pools: null,
+        protocol: normaliseProtocol(options.protocol || "V4"), v3Pools: null, scanHead: null,
         windowBlocks: null, lastPoll: null,
         lastError: null, retryAt: null, nextPollMs: null, polls: 0, errors: 0 };
     }
 
-    async function readString(token, name) {
-      var result = await request("eth_call", [{ to: token, data: tokenInterface.encodeFunctionData(name, []) }, "latest"]);
-      if (!result || result === "0x") fail("no " + name + "() at " + token);
-      return tokenInterface.decodeFunctionResult(name, result)[0];
+    function metadataCalls(pair) {
+      return [pair.currency0, pair.currency1].reduce(function (calls, token) {
+        return calls.concat(["symbol", "decimals"].map(function (name) {
+          return { method: "eth_call", params: [{ to: token, data: tokenInterface.encodeFunctionData(name, []) }, "latest"] };
+        }));
+      }, []);
     }
 
-    /** Sort the pair and read symbol() and decimals() of both tokens. */
-    async function loadPair(tokenA, tokenB) {
+    function decodePair(tokenA, tokenB, results) {
       var sorted = sortPair(tokenA, tokenB);
       var pair = { tokenA: utils.getAddress(tokenA), tokenB: utils.getAddress(tokenB),
         currency0: sorted.currency0, currency1: sorted.currency1, keys: poolKeysFor(sorted.currency0, sorted.currency1) };
-      pair.symbol0 = String(await readString(pair.currency0, "symbol"));
-      pair.decimals0 = BigNumber.from(await readString(pair.currency0, "decimals")).toNumber();
-      pair.symbol1 = String(await readString(pair.currency1, "symbol"));
-      pair.decimals1 = BigNumber.from(await readString(pair.currency1, "decimals")).toNumber();
+      function read(i, name, token) {
+        var result = rpcResult(results[i]);
+        if (!result || result === "0x") fail("no " + name + "() at " + token);
+        return tokenInterface.decodeFunctionResult(name, result)[0];
+      }
+      pair.symbol0 = String(read(0, "symbol", pair.currency0));
+      pair.decimals0 = BigNumber.from(read(1, "decimals", pair.currency0)).toNumber();
+      pair.symbol1 = String(read(2, "symbol", pair.currency1));
+      pair.decimals1 = BigNumber.from(read(3, "decimals", pair.currency1)).toNumber();
       pair.symbolA = pair.tokenA === pair.currency0 ? pair.symbol0 : pair.symbol1;
       pair.symbolB = pair.tokenB === pair.currency0 ? pair.symbol0 : pair.symbol1;
       pair.decimalsA = pair.tokenA === pair.currency0 ? pair.decimals0 : pair.decimals1;
@@ -926,47 +1043,67 @@
       return pair;
     }
 
+    /** Sort the pair and read symbol() and decimals() of both tokens in one batch. */
+    async function loadPair(tokenA, tokenB) {
+      return decodePair(tokenA, tokenB, await batchRequest(metadataCalls(sortPair(tokenA, tokenB))));
+    }
+
     /** A block's number and timestamp from eth_getBlockByNumber. Throws on a missing or partial block. */
-    async function readBlock(tag) {
-      var block = await request("eth_getBlockByNumber", [tag, false]);
+    function decodeBlock(result, tag) {
+      var block = rpcResult(result);
       if (!block || !block.number || !block.timestamp) fail("eth_getBlockByNumber returned no block for " + tag);
       return { number: BigNumber.from(block.number).toNumber(), timestamp: BigNumber.from(block.timestamp).toNumber() };
     }
 
     function messageOf(error) { return error && error.message ? error.message : String(error); }
 
-    /**
-     * Swap block timestamp and slot0 of one active pool. Each read has its own failure: it marks
-     * this pool, and never fails the poll.
-     */
-    async function readPoolHealth(pool, latest) {
-      await Promise.all([
-        readBlock(utils.hexValue(pool.lastBlock)).then(function (block) {
-          pool.swapTimestamp = block.timestamp;
-          pool.elapsedSeconds = Math.max(0, latest.timestamp - block.timestamp);
-        }, function (error) {
-          pool.healthError = "swap block read failed: " + messageOf(error);
-        }),
-        request("eth_call", [encodeSlot0Call(pool.poolId), "latest"]).then(function (word) {
-          pool.empty = decodeSlot0(word).sqrtPriceX96.isZero();
-        }).catch(function (error) {
-          pool.healthError = "slot0 read failed: " + messageOf(error);
-        }),
-      ]);
+    // A numeric lower bound cannot refer to another call's result inside a JSON-RPC batch.
+    // Seed it once alongside cached pair metadata and discovery, then refresh it in phase 1.
+    async function initialise(current, tokenA, tokenB) {
+      var pair = current.pair || sortPair(tokenA, tokenB);
+      var calls = [{ method: "eth_getBlockByNumber", params: ["latest", false] }];
+      var needsPair = !current.pair;
+      var needsV3 = current.protocol !== "V4" && current.v3Pools === null;
+      if (needsPair) calls = calls.concat(metadataCalls(pair));
+      if (needsV3) calls = calls.concat(v3DiscoveryCalls(pair));
+      var results = await batchRequest(calls);
+      current.scanHead = decodeBlock(results[0], "latest").number;
+      if (needsPair) current.pair = decodePair(tokenA, tokenB, results.slice(1, 5));
+      if (needsV3) current.v3Pools = decodeV3Pools(pair, results.slice(needsPair ? 5 : 1));
     }
 
-    async function readV3PoolHealth(pool, latest) {
-      await Promise.all([
-        readBlock(utils.hexValue(pool.lastBlock)).then(function (block) {
+    /** Phase 2: all active pools' timestamp and health reads, with per-call failures. */
+    async function readPoolHealth(pools, latest) {
+      var active = pools.filter(function (pool) { return pool.active; });
+      if (!active.length) return; // JSON-RPC forbids an empty batch.
+      var calls = [];
+      active.forEach(function (pool) {
+        calls.push({ method: "eth_getBlockByNumber", params: [utils.hexValue(pool.lastBlock), false] });
+        calls.push(protocolOf(pool) === "V3" ?
+          { method: "eth_call", params: [{ to: pool.address, data: v3PoolInterface.encodeFunctionData("liquidity") },
+            utils.hexValue(latest.number)] } :
+          { method: "eth_call", params: [encodeSlot0Call(pool.poolId), "latest"] });
+      });
+      var results;
+      try { results = await batchRequest(calls); }
+      catch (error) { results = calls.map(function () { return { error: error }; }); }
+      active.forEach(function (pool, i) {
+        try {
+          var block = decodeBlock(results[i * 2], utils.hexValue(pool.lastBlock));
           pool.swapTimestamp = block.timestamp;
           pool.elapsedSeconds = Math.max(0, latest.timestamp - block.timestamp);
-        }, function (error) { pool.healthError = "swap block read failed: " + messageOf(error); }),
-        request("eth_call", [{ to: pool.address, data: v3PoolInterface.encodeFunctionData("liquidity") },
-          utils.hexValue(latest.number)]).then(function (result) {
-          pool.liquidity = v3PoolInterface.decodeFunctionResult("liquidity", result)[0];
-          pool.empty = pool.liquidity.isZero();
-        }).catch(function (error) { pool.healthError = "liquidity read failed: " + messageOf(error); }),
-      ]);
+        } catch (error) { pool.healthError = "swap block read failed: " + messageOf(error); }
+        try {
+          var result = rpcResult(results[i * 2 + 1]);
+          if (protocolOf(pool) === "V3") {
+            pool.liquidity = v3PoolInterface.decodeFunctionResult("liquidity", result)[0];
+            pool.empty = pool.liquidity.isZero();
+          } else pool.empty = decodeSlot0(result).sqrtPriceX96.isZero();
+        } catch (error) {
+          pool.healthError = (pool.healthError ? pool.healthError + "; " : "") +
+            (protocolOf(pool) === "V3" ? "liquidity" : "slot0") + " read failed: " + messageOf(error);
+        }
+      });
     }
 
     /** One scan: latest block, Swap logs of the seven pools over the window, pool health, table and spreads. */
@@ -975,29 +1112,53 @@
       // A restart replaces `state` while this poll is awaiting; a stale poll only writes to its own.
       var current = state;
       var blocks = readWindow();
-      var pair = current.pair || await loadPair(tokens[0], tokens[1]);
-      if (current.protocol !== "V4") {
-        current.pair = pair;
-        if (current.v3Pools === null) current.v3Pools = await discoverV3Pools(request, pair.currency0, pair.currency1);
+      if (!current.pair || current.scanHead === null || (current.protocol !== "V4" && current.v3Pools === null)) {
+        await initialise(current, tokens[0], tokens[1]);
       }
-      var latest = await readBlock("latest");
+      var pair = current.pair;
+      var previousHead = current.scanHead;
+      var scanFrom = Math.max(0, previousHead - (blocks - 1));
+      var phase1 = [{ method: "eth_getBlockByNumber", params: ["latest", false] }];
+      var v4Indexes = [], v3Indexes = [];
+      function addLogs(address, topics, indexes) {
+        // Reserve headroom for blocks mined between polls when using the 50000-block window.
+        // Long windows use two disjoint filters in the SAME HTTP batch; never truncate the window.
+        var tailFrom = Math.max(scanFrom, previousHead - 24999);
+        if (tailFrom > scanFrom) {
+          indexes.push(phase1.length);
+          phase1.push({ method: "eth_getLogs", params: [{ address: address, topics: topics,
+            fromBlock: utils.hexValue(scanFrom), toBlock: utils.hexValue(tailFrom - 1) }] });
+        }
+        indexes.push(phase1.length);
+        phase1.push({ method: "eth_getLogs", params: [{ address: address, topics: topics,
+          fromBlock: utils.hexValue(tailFrom), toBlock: "latest" }] });
+      }
+      if (current.protocol !== "V3") addLogs(POOL_MANAGER, [SWAP_TOPIC, pair.keys.map(poolId)], v4Indexes);
+      // Never send address: []: some nodes interpret an empty filter as ALL addresses.
+      if (current.protocol !== "V4" && current.v3Pools.length) {
+        addLogs(current.v3Pools.map(function (pool) { return pool.address; }), [V3_SWAP_TOPIC], v3Indexes);
+      }
+      var results = await batchRequest(phase1);
+      var latest = decodeBlock(results[0], "latest");
+      // Even when a log read fails, keep a fresh bound so a long outage cannot wedge retries.
+      current.scanHead = latest.number;
+      if (latest.number < previousHead) fail("latest block moved backwards; retrying with refreshed log window");
       var fromBlock = Math.max(0, latest.number - (blocks - 1));
-      var logs = current.protocol === "V3" ? [] : await request("eth_getLogs", [{
-        address: POOL_MANAGER,
-        fromBlock: utils.hexValue(fromBlock),
-        toBlock: utils.hexValue(latest.number),
-        topics: [SWAP_TOPIC, pair.keys.map(poolId)],
-      }]);
-      if (!Array.isArray(logs)) fail("eth_getLogs did not return a list");
-      var pools = current.protocol === "V3" ? [] : summarisePools(pair.keys, logs);
+      function logsInWindow(indexes) {
+        return indexes.reduce(function (logs, i) {
+          var entries = rpcResult(results[i]);
+          if (!Array.isArray(entries)) fail("eth_getLogs did not return a list");
+          return logs.concat(entries.filter(function (log) {
+            if (!log || log.removed) return false;
+            var number = BigNumber.from(log.blockNumber).toNumber();
+            return number >= fromBlock && number <= latest.number;
+          }));
+        }, []);
+      }
+      var pools = current.protocol === "V3" ? [] : summarisePools(pair.keys, logsInWindow(v4Indexes));
       pools.forEach(function (pool) { pool.protocol = "V4"; });
       if (current.protocol !== "V4") {
-        // Never send address: []: some nodes interpret an empty filter as ALL addresses.
-        var v3Logs = current.v3Pools.length ? await request("eth_getLogs", [{
-          address: current.v3Pools.map(function (pool) { return pool.address; }), topics: [V3_SWAP_TOPIC],
-          fromBlock: utils.hexValue(fromBlock), toBlock: utils.hexValue(latest.number),
-        }]) : [];
-        pools = pools.concat(summariseV3Pools(current.v3Pools, v3Logs));
+        pools = pools.concat(summariseV3Pools(current.v3Pools, logsInWindow(v3Indexes)));
       }
       var scale = Math.pow(10, pair.decimals0 - pair.decimals1);
       pools.forEach(function (pool) {
@@ -1007,9 +1168,7 @@
         pool.empty = null; // true or false once slot0 has been read
         pool.healthError = null;
       });
-      await Promise.all(pools.filter(function (pool) { return pool.active; }).map(function (pool) {
-        return protocolOf(pool) === "V3" ? readV3PoolHealth(pool, latest) : readPoolHealth(pool, latest);
-      }));
+      await readPoolHealth(pools, latest);
       annotatePools(pools, maxStaleness());
       current.pair = pair;
       current.pools = pools;

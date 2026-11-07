@@ -20,7 +20,7 @@ function monitorFor(p, options = {}) {
     setTimeout: (fn, ms) => { const timer = { fn, ms }; timers.push(timer); return timer; },
     clearTimeout: timer => { const i = timers.indexOf(timer); if (i >= 0) timers.splice(i, 1); } });
   for (const file of ["../vendor/ethers-5.7.2.umd.min.js", "../v4-arb-encoder.js"]) vm.runInContext(fs.readFileSync(require.resolve(file), "utf8"), context);
-  const monitor = context.V4ArbEncoder.createPoolMonitor({ request: rpc(p), ...options });
+  const monitor = context.V4ArbEncoder.createPoolMonitor({ ...E.createRpcClient(E.RPC_URL, p.fetch), ...options });
   return { monitor, timers, fire: async () => { const due = timers.splice(0); for (const timer of due) await timer.fn(); } };
 }
 
@@ -101,7 +101,9 @@ test("Both shares one block window, includes every protocol combination, and cac
   assert.equal(logs.length, 2);
   assert.equal(logs[0].params[0].fromBlock, logs[1].params[0].fromBlock);
   assert.equal(logs[0].params[0].toBlock, logs[1].params[0].toBlock);
-  assert.equal(p.rpcCalls.filter(c => c.method === "eth_getBlockByNumber" && c.params[0] === "latest").length, 1);
+  // One head read during initialization, one in the poll's first batch.
+  assert.equal(p.rpcCalls.filter(c => c.method === "eth_getBlockByNumber" && c.params[0] === "latest").length, 2);
+  assert.deepEqual(p.httpCalls.map(call => call.body.length), [9, 3, 8]);
   const good = monitor.getState().pools;
   const original = p.handle.bind(p);
   p.handle = (method, params) => { if (method === "eth_getLogs") throw new Error("log failure"); return original(method, params); };

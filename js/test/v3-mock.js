@@ -120,7 +120,7 @@ class V3Mock extends MockWallet {
       assert.equal(filter.topics[0], E.V3_SWAP_TOPIC);
       assert.ok(filter.address.length > 0);
       return this.v3Logs.filter(l => filter.address.map(lower).includes(lower(l.address)) &&
-        bn(l.blockNumber).gte(filter.fromBlock) && bn(l.blockNumber).lte(filter.toBlock));
+        bn(l.blockNumber).gte(filter.fromBlock) && bn(l.blockNumber).lte(filter.toBlock === "latest" ? this.block : filter.toBlock));
     }
     if (method === "eth_call") {
       const tx = params[0];

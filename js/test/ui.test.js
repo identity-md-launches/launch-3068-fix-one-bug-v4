@@ -350,6 +350,11 @@ test("changing the pair restarts polling for the new tokens; a bad address is re
 const id = (fee, tickSpacing) => E.poolId({ currency0: E.PONS, currency1: E.USDG, fee, tickSpacing, hooks: E.NO_HOOKS });
 const FEES = { 3000: 4, 2500: 3, 30000: 6 }; // row index in the pools table
 const logsFilter = (provider) => provider.rpcCalls.filter((c) => c.method === "eth_getLogs").at(-1).params[0];
+const logsSpan = provider => {
+  const filters = provider.httpCalls.filter(c => Array.isArray(c.body) && c.body.some(call => call.method === "eth_getLogs"))
+    .at(-1).body.filter(call => call.method === "eth_getLogs").map(call => call.params[0]);
+  return provider.block - Math.min(...filters.map(filter => Number(filter.fromBlock)));
+};
 
 test("the Window field defaults to 3000 within 50 to 50000, is live, and the status bar shows it", async () => {
   const { provider, element, poll, html } = await readyPage();
@@ -357,14 +362,14 @@ test("the Window field defaults to 3000 within 50 to 50000, is live, and the sta
   assert.ok(html.indexOf('id="window-blocks"') < html.indexOf('id="pools-heading"'));
   assert.equal(element("window-status").textContent, "3000 blocks");
   assert.match(element("poll-status").textContent, /window 3000 blocks/);
-  assert.equal(Number(logsFilter(provider).toBlock) - Number(logsFilter(provider).fromBlock), 2999);
+  assert.equal(logsSpan(provider), 2999);
   const startCalls = provider.rpcCalls.filter((c) => c.params[0] && c.params[0].data === erc20.getSighash("symbol")).length;
 
   element("window-blocks").input("500");
   assert.equal(element("window-status").textContent, "500 blocks"); // shown at once
   assert.match(element("poll-status").textContent, /window 3000 blocks/); // the last poll is still the last poll
   await poll();
-  assert.equal(Number(logsFilter(provider).toBlock) - Number(logsFilter(provider).fromBlock), 499);
+  assert.equal(logsSpan(provider), 499);
   assert.match(element("poll-status").textContent, /window 500 blocks/);
   assert.equal(element("swaps-heading").textContent, "Swaps (500 blocks)");
   // Not restarted: the pair's symbols were not read again.
@@ -376,13 +381,13 @@ test("the Window field defaults to 3000 within 50 to 50000, is live, and the sta
     assert.match(element("window-status").textContent, /^500 blocks \(enter a whole number from 50 to 50000/);
     assert.equal(element("window-status").className, "error");
     await poll();
-    assert.equal(Number(logsFilter(provider).toBlock) - Number(logsFilter(provider).fromBlock), 499);
+    assert.equal(logsSpan(provider), 499);
   }
   element("window-blocks").input("50000");
   assert.equal(element("window-status").textContent, "50000 blocks");
   assert.equal(element("window-status").className, "");
   await poll();
-  assert.equal(Number(logsFilter(provider).toBlock) - Number(logsFilter(provider).fromBlock), 49999);
+  assert.equal(logsSpan(provider), 49999);
   assert.ok(provider.rpcCalls.every((c) => c.method !== "eth_blockNumber"));
 });
 
