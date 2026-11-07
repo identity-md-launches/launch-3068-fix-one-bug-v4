@@ -57,6 +57,11 @@ class MockWallet extends EventEmitter {
       const [fee, tickSpacing] = tier.split("/").map(Number);
       this.quotes.set(E.poolId({ currency0: E.PONS, currency1: E.USDG, fee, tickSpacing, hooks: E.NO_HOOKS }), price);
     }
+    this.blockTimes = new Map(); // block number -> timestamp; other blocks are 0.1 s apart back from `now`
+    this.slot0Words = new Map(); // poolId -> Slot0 word; a pool with a swap log is initialised by default
+    this.slot0Slots = new Map(); // storage slot -> poolId, as extsload sees it
+    this.slot0Fail = new Set(); // poolIds whose slot0 read fails
+    this.blockFail = new Set(); // historic block numbers whose read fails
     this.pendingPolls = 1;
     this.failReceipt = 0;
     this.rejectSend = 0;
@@ -90,7 +95,35 @@ class MockWallet extends EventEmitter {
     const log = { address: lower(E.POOL_MANAGER), topics: [E.SWAP_TOPIC, E.poolId(key)], data,
       blockNumber: ethers.utils.hexValue(blockNumber), logIndex: ethers.utils.hexValue(this.logs.length) };
     this.logs.push(log);
+    this.slot0Slots.set(E.slot0StorageSlot(E.poolId(key)), E.poolId(key));
+    if (extra.ageSeconds !== undefined) this.blockTimes.set(blockNumber, this.now - extra.ageSeconds);
     return log;
+  }
+
+  /** Set a pool's Slot0 word, as the PoolManager's extsload would return it. */
+  setSlot0(id, word) {
+    this.slot0Slots.set(E.slot0StorageSlot(id), id);
+    this.slot0Words.set(id, word);
+  }
+
+  /** A real block answers with number and timestamp; a block past the head answers null. */
+  blockByNumber(tag) {
+    if (tag === "latest") return { timestamp: ethers.utils.hexValue(this.now), number: ethers.utils.hexValue(this.block) };
+    const number = ethers.BigNumber.from(tag).toNumber();
+    if (this.blockFail.has(number)) throw new Error("block read failed");
+    if (number > this.block) return null;
+    const timestamp = this.blockTimes.has(number) ? this.blockTimes.get(number) : this.now - Math.floor((this.block - number) / 10);
+    return { timestamp: ethers.utils.hexValue(timestamp), number: ethers.utils.hexValue(number) };
+  }
+
+  /** PoolManager.extsload(slot). Like the live contract it has no getSlot0(bytes32). */
+  poolManagerCall(tx) {
+    if (tx.data.slice(0, 10) !== "0x1e2eaeaf") throw Object.assign(new Error("execution reverted"), { code: 3, data: "0x" });
+    const id = this.slot0Slots.get("0x" + tx.data.slice(10));
+    if (id && this.slot0Fail.has(id)) throw new Error("slot0 node timeout");
+    if (id && this.slot0Words.has(id)) return this.slot0Words.get(id);
+    // Initialised at tick -292984 with fee 3000, the 3000/60 pool's live word on 2026-11-07.
+    return id ? "0x000000000bb81f41f4fb878800000000000000000000074b56c05cb633d71d40" : ethers.constants.HashZero;
   }
 
   /** A quote-style router call (one command, minHopPriceX36 = max) reverts with the pool's price. */
@@ -134,7 +167,7 @@ class MockWallet extends EventEmitter {
     if (method === "eth_chainId") return this.chain;
     if (method === "eth_accounts" || method === "eth_requestAccounts") return this.account ? [this.account] : [];
     if (method === "eth_getCode") return this.code;
-    if (method === "eth_getBlockByNumber") return { timestamp: ethers.utils.hexValue(this.now), number: ethers.utils.hexValue(this.block) };
+    if (method === "eth_getBlockByNumber") return this.blockByNumber(params[0]);
     if (method === "eth_blockNumber") return ethers.utils.hexValue(this.block);
     if (method === "eth_gasPrice") return this.gasPrice.toHexString();
     if (method === "eth_estimateGas") return this.gasEstimate.toHexString();
@@ -143,7 +176,7 @@ class MockWallet extends EventEmitter {
       const filter = params[0];
       const from = ethers.BigNumber.from(filter.fromBlock).toNumber();
       const to = ethers.BigNumber.from(filter.toBlock).toNumber();
-      if (to - from + 1 > 100) throw new Error("block range too large");
+      if (to - from + 1 > 50000) throw new Error("block range too large");
       const [topic0, topic1] = filter.topics;
       return this.logs.filter((log) => {
         const block = ethers.BigNumber.from(log.blockNumber).toNumber();
@@ -155,6 +188,7 @@ class MockWallet extends EventEmitter {
     }
     if (method === "eth_call") {
       const tx = params[0];
+      if (lower(tx.to) === lower(E.POOL_MANAGER)) return this.poolManagerCall(tx);
       if (lower(tx.to) === lower(E.PERMIT2)) {
         const [owner, token, spender] = permit.decodeFunctionData("allowance", tx.data);
         return permit.encodeFunctionResult("allowance", this.readPermit(owner, token, spender));

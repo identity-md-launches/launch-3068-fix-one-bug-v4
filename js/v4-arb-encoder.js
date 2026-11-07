@@ -27,6 +27,11 @@
  * 30 s and backs off 60 s on RPC errors (createPoolMonitor), pairwise spread ranking
  * (rankSpreads), an exact-input quote recovered from the router's price-check revert
  * (quoteExactIn), and whole-balance token / ETH transfers in the wallet client.
+ *
+ * Follow-up 3.5 adds: a user-settable log window (50 to 50000 blocks, default 3000), the elapsed
+ * time since each pool's last swap (latest block timestamp minus swap block timestamp), a slot0
+ * read per active pool, and pool statuses (OK, STALE, EMPTY, UNKNOWN) that keep a pool out of the
+ * spreads and auto mode (poolStatus, annotatePools, autoDecision).
  */
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
@@ -57,7 +62,16 @@
   var SWAP_DATA_TYPES = ["int128", "int128", "uint160", "uint128", "int24", "uint24"];
   // The seven fee / tick spacing combinations the monitor scans, in the brief's order.
   var FEE_TIERS = [[0, 1], [0, 10], [500, 10], [2500, 25], [3000, 60], [10000, 200], [30000, 600]];
-  var LOG_WINDOW_BLOCKS = 100;
+  var LOG_WINDOW_BLOCKS = 3000;
+  var MIN_WINDOW_BLOCKS = 50;
+  var MAX_WINDOW_BLOCKS = 50000;
+  var MAX_STALENESS_SECONDS = 7200; // default of the page's "Max staleness" field
+  var STALENESS_YELLOW_SECONDS = 1800; // Last Swap colour: green below 30 min
+  var STALENESS_RED_SECONDS = 7200; // Last Swap colour: red above 2 h
+  // The deployed PoolManager has no getSlot0(bytes32): that call reverts with empty data on chain
+  // 4663 (checked 2026-11-07). Uniswap's own StateLibrary.getSlot0 reads the same value this way:
+  // extsload(keccak256(abi.encode(poolId, POOLS_SLOT))).
+  var POOLS_SLOT = 6;
   var POLL_INTERVAL_MS = 30000;
   var RPC_RETRY_MS = 60000;
   var SLIPPAGE_BPS = 50; // 0.5%
@@ -97,6 +111,8 @@
     "function decimals() view returns (uint8)",
     "function transfer(address to,uint256 amount) returns (bool)",
   ]);
+
+  var poolManagerInterface = new utils.Interface(["function extsload(bytes32 slot) view returns (bytes32)"]);
 
   var POOL_KEY_TYPE = "tuple(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks)";
   var EXACT_IN_SINGLE_TYPE =
@@ -413,21 +429,13 @@
     return Math.abs(a - b) / Math.min(a, b) * 100;
   }
 
-  /**
-   * Every pair of active pools, best net first, at most `limit` rows. `buy` is the pool with the
-   * lower price (currency0 is cheaper there: sell currency1 into it, zeroForOne=false) and `sell`
-   * the pool with the higher price (zeroForOne=true). GREEN means net% is above the threshold.
-   */
-  function rankSpreads(pools, thresholdPercent, limit) {
-    var threshold = thresholdPercent === undefined ? 0.5 : Number(thresholdPercent);
-    if (!Number.isFinite(threshold) || threshold < 0) fail("threshold must be a non-negative percent");
-    var max = limit === undefined ? 5 : limit;
-    var active = pools.filter(function (pool) { return pool.active && pool.price !== null && pool.price > 0; });
+  /** Every pair of the given priced pools, best net first. */
+  function pairSpreads(pools, threshold) {
     var spreads = [];
-    for (var i = 0; i < active.length; i++) {
-      for (var j = i + 1; j < active.length; j++) {
-        var buy = active[i].price <= active[j].price ? active[i] : active[j];
-        var sell = buy === active[i] ? active[j] : active[i];
+    for (var i = 0; i < pools.length; i++) {
+      for (var j = i + 1; j < pools.length; j++) {
+        var buy = pools[i].price <= pools[j].price ? pools[i] : pools[j];
+        var sell = buy === pools[i] ? pools[j] : pools[i];
         var spread = spreadPercent(buy.price, sell.price);
         var feeCost = feeCostPercent(buy.fee, sell.fee);
         var net = spread - feeCost;
@@ -436,7 +444,147 @@
       }
     }
     spreads.sort(function (x, y) { return y.netPercent - x.netPercent; });
-    return spreads.slice(0, max);
+    return spreads;
+  }
+
+  function readThreshold(thresholdPercent) {
+    var threshold = thresholdPercent === undefined ? 0.5 : Number(thresholdPercent);
+    if (!Number.isFinite(threshold) || threshold < 0) fail("threshold must be a non-negative percent");
+    return threshold;
+  }
+
+  function isPriced(pool) { return pool.active && pool.price !== null && pool.price > 0; }
+
+  /** Rows straight from summarisePools have no status yet; the monitor always sets one. */
+  function isTradeable(pool) { return isPriced(pool) && (pool.status === undefined || pool.status === STATUS_OK); }
+
+  /**
+   * Every pair of tradeable pools (active, and not STALE, EMPTY or UNKNOWN), best net first, at
+   * most `limit` rows. `buy` is the pool with the lower price (currency0 is cheaper there: sell
+   * currency1 into it, zeroForOne=false) and `sell` the pool with the higher price
+   * (zeroForOne=true). GREEN means net% is above the threshold.
+   */
+  function rankSpreads(pools, thresholdPercent, limit) {
+    var threshold = readThreshold(thresholdPercent);
+    var max = limit === undefined ? 5 : limit;
+    return pairSpreads(pools.filter(isTradeable), threshold).slice(0, max);
+  }
+
+  // ------------------------------------------------------------------ staleness and pool status
+
+  var STATUS_OK = "OK";
+  var STATUS_INACTIVE = "INACTIVE";
+  var STATUS_STALE = "STALE";
+  var STATUS_EMPTY = "EMPTY";
+  var STATUS_UNKNOWN = "UNKNOWN";
+
+  /** "45m", "3h 12m"; whole minutes, rounded down. */
+  function formatDuration(seconds) {
+    var s = Number(seconds);
+    if (!Number.isFinite(s) || s < 0) fail("elapsed time must be a non-negative number of seconds");
+    var minutes = Math.floor(s / 60);
+    return minutes < 60 ? minutes + "m" : Math.floor(minutes / 60) + "h " + (minutes % 60) + "m";
+  }
+
+  /** "Xm ago" or "Xh Ym ago". */
+  function formatElapsed(seconds) { return formatDuration(seconds) + " ago"; }
+
+  /** Last Swap colour: green below 30 min, yellow from 30 min to 2 h, red above 2 h. */
+  function stalenessColor(seconds) {
+    if (seconds < STALENESS_YELLOW_SECONDS) return "green";
+    return seconds > STALENESS_RED_SECONDS ? "red" : "yellow";
+  }
+
+  /** A whole number within [min, max] from a number or digit string, else null. */
+  function parseWhole(value, min, max) {
+    var text = String(value === undefined || value === null ? "" : value).trim();
+    if (!/^\d+$/.test(text)) return null;
+    var number = Number(text);
+    return Number.isSafeInteger(number) && number >= min && number <= max ? number : null;
+  }
+
+  /** The window in blocks, 50 to 50000, or null when the input is not valid. */
+  function parseWindowBlocks(value) { return parseWhole(value, MIN_WINDOW_BLOCKS, MAX_WINDOW_BLOCKS); }
+
+  /** The maximum staleness in whole seconds, or null when the input is not valid. */
+  function parseMaxStaleness(value) { return parseWhole(value, 0, Number.MAX_SAFE_INTEGER); }
+
+  /** The storage slot of a pool's Slot0 in the PoolManager: keccak256(abi.encode(poolId, 6)). */
+  function slot0StorageSlot(id) {
+    return utils.keccak256(abi.encode(["bytes32", "uint256"], [id, POOLS_SLOT]));
+  }
+
+  /** The eth_call that reads a pool's Slot0 word from the PoolManager. */
+  function encodeSlot0Call(id) {
+    return { to: POOL_MANAGER, data: poolManagerInterface.encodeFunctionData("extsload", [slot0StorageSlot(id)]) };
+  }
+
+  /**
+   * Slot0 packs, from the low bits: sqrtPriceX96 (160), tick (24), protocolFee (24), lpFee (24).
+   * Returned in the brief's getSlot0 order. Throws on a reply that is not one 32-byte word.
+   */
+  function decodeSlot0(word) {
+    if (typeof word !== "string" || !utils.isHexString(word, 32)) fail("slot0 reply is not a 32-byte word");
+    var packed = BigNumber.from(word);
+    return {
+      tick: packed.shr(160).and(0xffffff).fromTwos(24).toNumber(),
+      sqrtPriceX96: packed.and(MAX_UINT160),
+      protocolFee: packed.shr(184).and(0xffffff).toNumber(),
+      lpFee: packed.shr(208).and(0xffffff).toNumber(),
+    };
+  }
+
+  /**
+   * INACTIVE no swap in the window; EMPTY sqrtPriceX96 is 0; STALE elapsed above the maximum;
+   * UNKNOWN the slot0 read or the swap block's timestamp failed; OK otherwise. A definite fact is
+   * reported ahead of a failed read. Only OK pools reach the spreads and auto mode.
+   */
+  function poolStatus(pool, maxStalenessSeconds) {
+    if (!pool.active) return STATUS_INACTIVE;
+    if (pool.empty === true) return STATUS_EMPTY;
+    if (pool.elapsedSeconds !== null && pool.elapsedSeconds !== undefined && pool.elapsedSeconds > maxStalenessSeconds) {
+      return STATUS_STALE;
+    }
+    if (pool.empty !== false || pool.elapsedSeconds === null || pool.elapsedSeconds === undefined) return STATUS_UNKNOWN;
+    return STATUS_OK;
+  }
+
+  /** Set `status` on each pool for this maximum staleness (a changed field applies at once). */
+  function annotatePools(pools, maxStalenessSeconds) {
+    var max = maxStalenessSeconds === undefined ? MAX_STALENESS_SECONDS : Number(maxStalenessSeconds);
+    if (!Number.isFinite(max) || max < 0) fail("max staleness must be a non-negative number of seconds");
+    pools.forEach(function (pool) { pool.status = poolStatus(pool, max); });
+    return pools;
+  }
+
+  /** Why auto mode will not use this pool, for the activity log. */
+  function autoSkipReason(pool) {
+    var label = "auto skipped: pool " + pool.fee + "/" + pool.tickSpacing + " ";
+    if (pool.status === STATUS_STALE) return label + "stale (" + formatDuration(pool.elapsedSeconds) + ")";
+    if (pool.status === STATUS_EMPTY) return label + "empty (sqrtPriceX96 = 0)";
+    return label + "unknown (" + (pool.healthError || "health read failed") + ")";
+  }
+
+  /**
+   * What auto mode does with these pools. `spread` is the best GREEN spread whose two pools are
+   * both tradeable, or null. `skips` has one { poolId, status, reason } for each excluded pool that
+   * sits in a GREEN spread better than `spread`: the pools that kept a better trade from firing.
+   */
+  function autoDecision(pools, thresholdPercent) {
+    var threshold = readThreshold(thresholdPercent);
+    var skips = [];
+    var seen = {};
+    var candidates = pairSpreads(pools.filter(isPriced), threshold);
+    for (var i = 0; i < candidates.length && candidates[i].verdict === "GREEN"; i++) {
+      var legs = [candidates[i].buy, candidates[i].sell];
+      if (legs.every(isTradeable)) return { spread: candidates[i], skips: skips };
+      legs.forEach(function (pool) {
+        if (isTradeable(pool) || seen[pool.poolId]) return;
+        seen[pool.poolId] = true;
+        skips.push({ poolId: pool.poolId, status: pool.status, reason: autoSkipReason(pool) });
+      });
+    }
+    return { spread: null, skips: skips };
   }
 
   /** amount * (10000 - bps) / 10000, rounded down. */
@@ -554,12 +702,14 @@
    * Polls the PoolManager's Swap logs for the seven fee tiers of one pair.
    *
    * options: request(method, params) (required), pollIntervalMs (30000), retryIntervalMs (60000),
-   *          windowBlocks (100), thresholdPercent (number or function, 0.5), onUpdate(state),
-   *          onError(error, state), now().
+   *          windowBlocks (number or function, 3000, read on every poll, 50 to 50000),
+   *          maxStalenessSeconds (number or function, 7200), thresholdPercent (number or function,
+   *          0.5), onUpdate(state), onError(error, state), now().
    *
    * start(tokenA, tokenB) resolves after the first poll attempt and keeps polling until stop().
-   * Any RPC failure (metadata, block number, logs) is caught: the state records the error, the
-   * next attempt is scheduled after retryIntervalMs, and polling never stops by itself.
+   * A failure of the metadata, latest block or logs requests is caught: the state records the
+   * error, the next attempt is scheduled after retryIntervalMs, and polling never stops by itself.
+   * A failure of one active pool's slot0 or block read marks only that pool UNKNOWN.
    */
   function createPoolMonitor(options) {
     options = options || {};
@@ -567,9 +717,19 @@
     if (typeof request !== "function") fail("request function is required");
     var pollMs = options.pollIntervalMs === undefined ? POLL_INTERVAL_MS : options.pollIntervalMs;
     var retryMs = options.retryIntervalMs === undefined ? RPC_RETRY_MS : options.retryIntervalMs;
-    var windowBlocks = options.windowBlocks === undefined ? LOG_WINDOW_BLOCKS : options.windowBlocks;
+    var windowOption = options.windowBlocks === undefined ? LOG_WINDOW_BLOCKS : options.windowBlocks;
+    var windowBlocks = typeof windowOption === "function" ? windowOption : function () { return windowOption; };
+    var stalenessOption = options.maxStalenessSeconds === undefined ? MAX_STALENESS_SECONDS : options.maxStalenessSeconds;
+    var maxStaleness = typeof stalenessOption === "function" ? stalenessOption : function () { return stalenessOption; };
     if (!Number.isFinite(pollMs) || pollMs < 0 || !Number.isFinite(retryMs) || retryMs < 0) fail("invalid intervals");
-    if (!Number.isInteger(windowBlocks) || windowBlocks < 1) fail("windowBlocks must be a positive integer");
+    function readWindow() {
+      var blocks = windowBlocks();
+      if (!Number.isInteger(blocks) || blocks < MIN_WINDOW_BLOCKS || blocks > MAX_WINDOW_BLOCKS) {
+        fail("windowBlocks must be a whole number from " + MIN_WINDOW_BLOCKS + " to " + MAX_WINDOW_BLOCKS);
+      }
+      return blocks;
+    }
+    if (typeof windowOption !== "function") readWindow();
     var onUpdate = options.onUpdate || function () {};
     var onError = options.onError || function () {};
     var now = options.now || function () { return Date.now(); };
@@ -583,7 +743,8 @@
     var state = freshState();
 
     function freshState() {
-      return { pair: null, pools: [], spreads: [], blockNumber: null, fromBlock: null, lastPoll: null,
+      return { pair: null, pools: [], spreads: [], blockNumber: null, blockTimestamp: null, fromBlock: null,
+        windowBlocks: null, lastPoll: null,
         lastError: null, retryAt: null, nextPollMs: null, polls: 0, errors: 0 };
     }
 
@@ -609,32 +770,76 @@
       return pair;
     }
 
-    /** One scan: latest block, Swap logs of the seven pools over the window, table and spreads. */
+    /** A block's number and timestamp from eth_getBlockByNumber. Throws on a missing or partial block. */
+    async function readBlock(tag) {
+      var block = await request("eth_getBlockByNumber", [tag, false]);
+      if (!block || !block.number || !block.timestamp) fail("eth_getBlockByNumber returned no block for " + tag);
+      return { number: BigNumber.from(block.number).toNumber(), timestamp: BigNumber.from(block.timestamp).toNumber() };
+    }
+
+    function messageOf(error) { return error && error.message ? error.message : String(error); }
+
+    /**
+     * Swap block timestamp and slot0 of one active pool. Each read has its own failure: it marks
+     * this pool, and never fails the poll.
+     */
+    async function readPoolHealth(pool, latest) {
+      await Promise.all([
+        readBlock(utils.hexValue(pool.lastBlock)).then(function (block) {
+          pool.swapTimestamp = block.timestamp;
+          pool.elapsedSeconds = Math.max(0, latest.timestamp - block.timestamp);
+        }, function (error) {
+          pool.healthError = "swap block read failed: " + messageOf(error);
+        }),
+        request("eth_call", [encodeSlot0Call(pool.poolId), "latest"]).then(function (word) {
+          pool.empty = decodeSlot0(word).sqrtPriceX96.isZero();
+        }).catch(function (error) {
+          pool.healthError = "slot0 read failed: " + messageOf(error);
+        }),
+      ]);
+    }
+
+    /** One scan: latest block, Swap logs of the seven pools over the window, pool health, table and spreads. */
     async function pollOnce() {
       if (!tokens) fail("start(tokenA, tokenB) first");
-      var pair = state.pair || await loadPair(tokens[0], tokens[1]);
-      var latest = BigNumber.from(await request("eth_blockNumber", [])).toNumber();
-      var fromBlock = Math.max(0, latest - (windowBlocks - 1));
+      // A restart replaces `state` while this poll is awaiting; a stale poll only writes to its own.
+      var current = state;
+      var blocks = readWindow();
+      var pair = current.pair || await loadPair(tokens[0], tokens[1]);
+      var latest = await readBlock("latest");
+      var fromBlock = Math.max(0, latest.number - (blocks - 1));
       var logs = await request("eth_getLogs", [{
         address: POOL_MANAGER,
         fromBlock: utils.hexValue(fromBlock),
-        toBlock: utils.hexValue(latest),
+        toBlock: utils.hexValue(latest.number),
         topics: [SWAP_TOPIC, pair.keys.map(poolId)],
       }]);
       if (!Array.isArray(logs)) fail("eth_getLogs did not return a list");
       var pools = summarisePools(pair.keys, logs);
       var scale = Math.pow(10, pair.decimals0 - pair.decimals1);
-      pools.forEach(function (pool) { pool.displayPrice = pool.price === null ? null : pool.price * scale; });
-      state.pair = pair;
-      state.pools = pools;
-      state.spreads = rankSpreads(pools, threshold());
-      state.blockNumber = latest;
-      state.fromBlock = fromBlock;
-      state.lastPoll = now();
-      state.lastError = null;
-      state.retryAt = null;
-      state.polls += 1;
-      return state;
+      pools.forEach(function (pool) {
+        pool.displayPrice = pool.price === null ? null : pool.price * scale;
+        pool.swapTimestamp = null;
+        pool.elapsedSeconds = null;
+        pool.empty = null; // true or false once slot0 has been read
+        pool.healthError = null;
+      });
+      await Promise.all(pools.filter(function (pool) { return pool.active; }).map(function (pool) {
+        return readPoolHealth(pool, latest);
+      }));
+      annotatePools(pools, maxStaleness());
+      current.pair = pair;
+      current.pools = pools;
+      current.spreads = rankSpreads(pools, threshold());
+      current.blockNumber = latest.number;
+      current.blockTimestamp = latest.timestamp;
+      current.fromBlock = fromBlock;
+      current.windowBlocks = blocks;
+      current.lastPoll = now();
+      current.lastError = null;
+      current.retryAt = null;
+      current.polls += 1;
+      return current;
     }
 
     async function cycle() {
@@ -1042,6 +1247,10 @@
     SWAP_TOPIC: SWAP_TOPIC,
     FEE_TIERS: FEE_TIERS,
     LOG_WINDOW_BLOCKS: LOG_WINDOW_BLOCKS,
+    MIN_WINDOW_BLOCKS: MIN_WINDOW_BLOCKS,
+    MAX_WINDOW_BLOCKS: MAX_WINDOW_BLOCKS,
+    MAX_STALENESS_SECONDS: MAX_STALENESS_SECONDS,
+    POOLS_SLOT: POOLS_SLOT,
     POLL_INTERVAL_MS: POLL_INTERVAL_MS,
     RPC_RETRY_MS: RPC_RETRY_MS,
     SLIPPAGE_BPS: SLIPPAGE_BPS,
@@ -1055,6 +1264,17 @@
     feeCostPercent: feeCostPercent,
     spreadPercent: spreadPercent,
     rankSpreads: rankSpreads,
+    formatDuration: formatDuration,
+    formatElapsed: formatElapsed,
+    stalenessColor: stalenessColor,
+    parseWindowBlocks: parseWindowBlocks,
+    parseMaxStaleness: parseMaxStaleness,
+    slot0StorageSlot: slot0StorageSlot,
+    encodeSlot0Call: encodeSlot0Call,
+    decodeSlot0: decodeSlot0,
+    poolStatus: poolStatus,
+    annotatePools: annotatePools,
+    autoDecision: autoDecision,
     applySlippage: applySlippage,
     createRpcClient: createRpcClient,
     extractRevertData: extractRevertData,

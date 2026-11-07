@@ -30,6 +30,10 @@ contract MonitorHarness {
     function decodeSwapTick(bytes memory data) external pure returns (int24) {
         return V4PoolMonitor.decodeSwapTick(data);
     }
+
+    function windowStart(uint256 latest, uint256 blocks) external pure returns (uint256) {
+        return V4PoolMonitor.windowStart(latest, blocks);
+    }
 }
 
 contract V4PoolMonitorTest is Test {
@@ -242,5 +246,120 @@ contract V4PoolMonitorTest is Test {
         assertEq(
             V4PoolMonitor.poolId(keys[i]), keccak256(abi.encode(c0, c1, keys[i].fee, keys[i].tickSpacing, address(0)))
         );
+    }
+
+    // ---------------------------------------------------------------- follow-up 3.5
+
+    // Read through PoolManager.extsload on 2026-11-07: pools 3000/60 and 10000/200 of PONS/USDG.
+    bytes32 internal constant LIVE_SLOT0 = 0x000000000bb81f41f4fb878800000000000000000000074b56c05cb633d71d40;
+    bytes32 internal constant LIVE_SLOT0_POSITIVE_TICK =
+        0x0000000027103e83e80d89e7fffd8963efd1fc6a506488495d951d5263988d25;
+
+    function _health(bool slot0Read, uint160 sqrtPrice, bool timestampRead, uint256 elapsed)
+        internal
+        pure
+        returns (V4PoolMonitor.PoolHealth memory)
+    {
+        return V4PoolMonitor.PoolHealth({
+            active: true,
+            slot0Read: slot0Read,
+            sqrtPriceX96: sqrtPrice,
+            timestampRead: timestampRead,
+            elapsedSeconds: elapsed
+        });
+    }
+
+    function _statusIs(V4PoolMonitor.PoolHealth memory pool, uint256 max, V4PoolMonitor.PoolStatus want)
+        internal
+        pure
+        returns (bool)
+    {
+        return V4PoolMonitor.poolStatus(pool, max) == want;
+    }
+
+    function test_WindowDefaultsAndBoundsMatchTheBrief() public pure {
+        assertEq(V4PoolMonitor.LOG_WINDOW_BLOCKS, 3000);
+        assertEq(V4PoolMonitor.MIN_WINDOW_BLOCKS, 50);
+        assertEq(V4PoolMonitor.MAX_WINDOW_BLOCKS, 50_000);
+        assertEq(V4PoolMonitor.MAX_STALENESS_SECONDS, 7200);
+    }
+
+    function test_WindowStartIncludesTheLatestBlock() public pure {
+        assertEq(V4PoolMonitor.windowStart(108_394_834, 3000), 108_391_835);
+        assertEq(V4PoolMonitor.windowStart(108_394_834, 50), 108_394_785);
+        assertEq(V4PoolMonitor.windowStart(10, 50), 0);
+    }
+
+    function test_RevertWhen_WindowIsOutOfRange() public {
+        vm.expectRevert(V4PoolMonitor.WindowOutOfRange.selector);
+        harness.windowStart(1000, 49);
+        vm.expectRevert(V4PoolMonitor.WindowOutOfRange.selector);
+        harness.windowStart(1000, 50_001);
+    }
+
+    function test_DecodeSlot0OfTheLiveWords() public pure {
+        (int24 tick, uint160 sqrtPrice, uint24 protocolFee, uint24 lpFee) = V4PoolMonitor.decodeSlot0(LIVE_SLOT0);
+        assertEq(tick, -292_984);
+        assertEq(sqrtPrice, 0x074b56c05cb633d71d40);
+        assertEq(protocolFee, 0x1f41f4);
+        assertEq(lpFee, 3000);
+        (tick,,, lpFee) = V4PoolMonitor.decodeSlot0(LIVE_SLOT0_POSITIVE_TICK);
+        assertEq(tick, 887_271);
+        assertEq(lpFee, 10_000);
+    }
+
+    function test_DecodeSlot0OfAnUninitialisedPoolIsZero() public pure {
+        (int24 tick, uint160 sqrtPrice,,) = V4PoolMonitor.decodeSlot0(bytes32(0));
+        assertEq(tick, 0);
+        assertEq(sqrtPrice, 0);
+    }
+
+    function test_Slot0SlotIsTheHashOfIdAndPoolsSlot() public pure {
+        assertEq(V4PoolMonitor.slot0Slot(POOL_A_ID), keccak256(abi.encode(POOL_A_ID, uint256(6))));
+    }
+
+    function test_StalenessColourBoundaries() public pure {
+        assertTrue(V4PoolMonitor.stalenessColor(0) == V4PoolMonitor.StalenessColor.Green);
+        assertTrue(V4PoolMonitor.stalenessColor(1799) == V4PoolMonitor.StalenessColor.Green);
+        assertTrue(V4PoolMonitor.stalenessColor(1800) == V4PoolMonitor.StalenessColor.Yellow);
+        assertTrue(V4PoolMonitor.stalenessColor(7200) == V4PoolMonitor.StalenessColor.Yellow);
+        assertTrue(V4PoolMonitor.stalenessColor(7201) == V4PoolMonitor.StalenessColor.Red);
+    }
+
+    function test_PoolStatusSuccessAndEachExclusion() public pure {
+        uint256 max = V4PoolMonitor.MAX_STALENESS_SECONDS;
+        assertTrue(_statusIs(_health(true, 1, true, max), max, V4PoolMonitor.PoolStatus.Ok));
+        assertTrue(_statusIs(_health(true, 1, true, max + 1), max, V4PoolMonitor.PoolStatus.Stale));
+        assertTrue(_statusIs(_health(true, 0, true, 0), max, V4PoolMonitor.PoolStatus.Empty));
+        assertTrue(_statusIs(_health(false, 0, true, 0), max, V4PoolMonitor.PoolStatus.Unknown));
+        assertTrue(_statusIs(_health(true, 1, false, 0), max, V4PoolMonitor.PoolStatus.Unknown));
+        assertTrue(_statusIs(_health(false, 0, true, max + 1), max, V4PoolMonitor.PoolStatus.Stale));
+        V4PoolMonitor.PoolHealth memory inactive = _health(true, 1, true, 0);
+        inactive.active = false;
+        assertTrue(_statusIs(inactive, max, V4PoolMonitor.PoolStatus.Inactive));
+    }
+
+    function testFuzz_WindowSpansExactlyTheRequestedBlocks(uint64 latest, uint256 blocks) public pure {
+        blocks = bound(blocks, V4PoolMonitor.MIN_WINDOW_BLOCKS, V4PoolMonitor.MAX_WINDOW_BLOCKS);
+        vm.assume(latest >= blocks);
+        assertEq(latest - V4PoolMonitor.windowStart(latest, blocks) + 1, blocks);
+    }
+
+    function testFuzz_Slot0RoundTrips(uint160 sqrtPrice, int24 tick, uint24 protocolFee, uint24 lpFee) public pure {
+        uint256 packed = uint256(sqrtPrice) | (uint256(uint24(tick)) << 160) | (uint256(protocolFee) << 184)
+            | (uint256(lpFee) << 208);
+        (int24 outTick, uint160 outPrice, uint24 outProtocol, uint24 outLp) = V4PoolMonitor.decodeSlot0(bytes32(packed));
+        assertEq(outTick, tick);
+        assertEq(outPrice, sqrtPrice);
+        assertEq(outProtocol, protocolFee);
+        assertEq(outLp, lpFee);
+    }
+
+    function testFuzz_OnlyAFreshInitialisedPoolIsTradeable(uint160 sqrtPrice, uint256 elapsed, uint256 max)
+        public
+        pure
+    {
+        V4PoolMonitor.PoolStatus status = V4PoolMonitor.poolStatus(_health(true, sqrtPrice, true, elapsed), max);
+        assertEq(status == V4PoolMonitor.PoolStatus.Ok, sqrtPrice != 0 && elapsed <= max);
     }
 }

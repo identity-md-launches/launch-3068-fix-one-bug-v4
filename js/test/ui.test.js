@@ -121,8 +121,8 @@ test("page loads offline, polls the public RPC without any wallet call, and show
   assert.deepEqual(element("pools-body").children.map((row) => row.children[0].textContent), ["0", "0", "500", "2500", "3000", "10000", "30000"]);
   assert.ok(element("pools-body").children.every((row) => row.children[4].textContent.startsWith("no")));
   assert.equal(element("spreads-body").children.length, 0);
-  assert.match(element("spreads-note").textContent, /at least two active/);
-  assert.match(element("poll-status").textContent, /Last poll .* block 108394834 .* window 108394735–108394834/);
+  assert.match(element("spreads-note").textContent, /^No tradeable spreads/);
+  assert.match(element("poll-status").textContent, /Last poll .* block 108394834 .* window 3000 blocks \(108391835–108394834\)/);
   assert.match(element("pair-info").textContent, /Token A PONS · Token B USDG · currency0 = PONS/);
   assert.deepEqual(timers.map((t) => t.ms), [E.POLL_INTERVAL_MS]);
   assert.equal(element("send").disabled, true);
@@ -147,7 +147,7 @@ test("active pools render prices and the top spreads; the full flow runs with th
   assert.equal(spreads[0].children[3].textContent, "3.300");
   assert.equal(spreads[0].children[5].textContent, "GREEN");
   assert.equal(spreads[2].children[5].textContent, "RED");
-  assert.match(element("spreads-note").textContent, /3 spread\(s\) from 3 active pool\(s\)/);
+  assert.match(element("spreads-note").textContent, /3 spread\(s\) from 3 tradeable pool\(s\)/);
 
   // Click the best row: the pool keys are filled and swap 1 is quoted through the public RPC.
   await spreads[0].click();
@@ -342,6 +342,206 @@ test("changing the pair restarts polling for the new tokens; a bad address is re
   await element("apply-pair").click();
   await until(() => timers.length > 0, "polling to resume");
   assert.match(element("pair-info").textContent, /Token B USDG/);
+});
+
+// ------------------------------------------------------------------ follow-up 3.5
+
+const id = (fee, tickSpacing) => E.poolId({ currency0: E.PONS, currency1: E.USDG, fee, tickSpacing, hooks: E.NO_HOOKS });
+const FEES = { 3000: 4, 2500: 3, 30000: 6 }; // row index in the pools table
+const logsFilter = (provider) => provider.rpcCalls.filter((c) => c.method === "eth_getLogs").at(-1).params[0];
+
+test("the Window field defaults to 3000 within 50 to 50000, is live, and the status bar shows it", async () => {
+  const { provider, element, poll, html } = await readyPage();
+  assert.match(html, /<label>Window \(blocks\)<input id="window-blocks" type="number" value="3000" min="50" max="50000"/);
+  assert.ok(html.indexOf('id="window-blocks"') < html.indexOf('id="pools-heading"'));
+  assert.equal(element("window-status").textContent, "3000 blocks");
+  assert.match(element("poll-status").textContent, /window 3000 blocks/);
+  assert.equal(Number(logsFilter(provider).toBlock) - Number(logsFilter(provider).fromBlock), 2999);
+  const startCalls = provider.rpcCalls.filter((c) => c.params[0] && c.params[0].data === erc20.getSighash("symbol")).length;
+
+  element("window-blocks").input("500");
+  assert.equal(element("window-status").textContent, "500 blocks"); // shown at once
+  assert.match(element("poll-status").textContent, /window 3000 blocks/); // the last poll is still the last poll
+  await poll();
+  assert.equal(Number(logsFilter(provider).toBlock) - Number(logsFilter(provider).fromBlock), 499);
+  assert.match(element("poll-status").textContent, /window 500 blocks/);
+  assert.equal(element("swaps-heading").textContent, "Swaps (500 blocks)");
+  // Not restarted: the pair's symbols were not read again.
+  assert.equal(provider.rpcCalls.filter((c) => c.params[0] && c.params[0].data === erc20.getSighash("symbol")).length, startCalls);
+
+  // Out of range or malformed: the last valid value stays and the bar says so.
+  for (const bad of ["49", "50001", "", "abc"]) {
+    element("window-blocks").input(bad);
+    assert.match(element("window-status").textContent, /^500 blocks \(enter a whole number from 50 to 50000/);
+    assert.equal(element("window-status").className, "error");
+    await poll();
+    assert.equal(Number(logsFilter(provider).toBlock) - Number(logsFilter(provider).fromBlock), 499);
+  }
+  element("window-blocks").input("50000");
+  assert.equal(element("window-status").textContent, "50000 blocks");
+  assert.equal(element("window-status").className, "");
+  await poll();
+  assert.equal(Number(logsFilter(provider).toBlock) - Number(logsFilter(provider).fromBlock), 49999);
+  assert.ok(provider.rpcCalls.every((c) => c.method !== "eth_blockNumber"));
+});
+
+test("Last Swap shows elapsed chain time in green, yellow and red; the price stays 1.0001^tick", async () => {
+  const provider = new MockWallet();
+  provider.addSwap(3000, 60, -292916, provider.block - 300, { ageSeconds: 1799 });
+  provider.addSwap(2500, 25, -292902, provider.block - 200, { ageSeconds: 1800 });
+  provider.addSwap(30000, 600, -292000, provider.block - 100, { ageSeconds: 11520 });
+  const { element, html } = await readyPage(provider);
+  assert.match(html, /<th>Active\?<\/th><th>Last Swap<\/th>/);
+  assert.match(html, /\.yellow \{/);
+  const rows = element("pools-body").children;
+  const lastSwap = (fee) => rows[FEES[fee]].children[5];
+  assert.equal(lastSwap(3000).textContent, "29m ago");
+  assert.equal(lastSwap(3000).className, "green");
+  assert.equal(lastSwap(2500).textContent, "30m ago");
+  assert.equal(lastSwap(2500).className, "yellow");
+  assert.equal(lastSwap(30000).textContent, "3h 12m ago");
+  assert.equal(lastSwap(30000).className, "red");
+  assert.equal(rows[0].children[5].textContent, "—");
+  assert.match(rows[FEES[3000]].children[2].textContent, /\(tick -292916\)$/);
+  assert.equal(rows[FEES[3000]].children.length, 6);
+});
+
+test("a pool past Max staleness is marked STALE and leaves the spreads; the field applies at once and a typo keeps the last value", async () => {
+  const provider = new MockWallet();
+  provider.addSwap(3000, 60, -292916, provider.block - 300, { ageSeconds: 11520 });
+  provider.addSwap(30000, 600, -292000, provider.block - 100, { ageSeconds: 60 });
+  const { element, html, poll } = await readyPage(provider);
+  assert.match(html, /<label>Max staleness \(seconds\)<input id="max-staleness" type="number" value="7200"/);
+  assert.ok(html.indexOf('id="max-staleness"') - html.indexOf('id="threshold"') < 300);
+  const rows = () => element("pools-body").children;
+  assert.equal(rows()[FEES[3000]].children[4].textContent, "yes · STALE");
+  assert.equal(rows()[FEES[3000]].children[4].className, "red");
+  assert.notEqual(rows()[FEES[3000]].children[2].textContent, "—"); // still shown in the table
+  assert.equal(element("spreads-body").children.length, 0);
+  assert.match(element("spreads-note").textContent, /^No tradeable spreads\. Active pools: 2, tradeable: 1\.$/);
+
+  element("max-staleness").input("20000");
+  assert.equal(rows()[FEES[3000]].children[4].textContent, "yes");
+  assert.equal(element("spreads-body").children.length, 1);
+  element("max-staleness").input("abc");
+  assert.match(element("auto-status").textContent, /Using 20000 until fixed/);
+  assert.equal(element("auto-status").className, "error");
+  await poll();
+  assert.equal(element("spreads-body").children.length, 1); // the typo did not change the limit
+  element("max-staleness").input("100");
+  assert.equal(element("spreads-body").children.length, 0);
+  await poll();
+  assert.equal(rows()[FEES[3000]].children[4].textContent, "yes · STALE");
+});
+
+test("EMPTY and UNKNOWN pools are marked and excluded while the rest of the table keeps working", async () => {
+  const provider = withActivePools();
+  provider.setSlot0(id(30000, 600), ethers.constants.HashZero);
+  provider.slot0Fail.add(id(2500, 25));
+  const { element, poll, timers } = await readyPage(provider);
+  const rows = () => element("pools-body").children;
+  assert.equal(rows()[FEES[30000]].children[4].textContent, "yes · EMPTY");
+  assert.equal(rows()[FEES[2500]].children[4].textContent, "yes · UNKNOWN");
+  assert.equal(rows()[FEES[3000]].children[4].textContent, "yes");
+  assert.equal(rows()[FEES[2500]].children[3].textContent, "1"); // other columns still display
+  assert.equal(element("spreads-body").children.length, 0);
+  assert.match(element("spreads-note").textContent, /^No tradeable spreads/);
+  assert.equal(element("poll-status").className, "success");
+  assert.deepEqual(timers.map((t) => t.ms), [E.POLL_INTERVAL_MS]);
+  provider.slot0Fail.clear();
+  await poll();
+  assert.equal(rows()[FEES[2500]].children[4].textContent, "yes");
+  assert.equal(element("spreads-body").children.length, 1);
+  assert.equal(element("spreads-body").children[0].children[5].textContent, "RED");
+});
+
+test("auto mode logs why it skips a stale pool, sends nothing, repeats no log line, and fires on a clean pair", async () => {
+  const provider = withActivePools();
+  const { element, poll, flush, until } = await readyPage(provider);
+  await element("connect").click();
+  await element("spreads-body").children[0].click();
+  await flush();
+  await element("approve-permit2").click();
+  assert.equal(provider.sent.length, 2);
+
+  // Replace the logs: 3000/60 (cheap) and 30000/600 (dear) form the only GREEN spread; 3000/60 goes stale.
+  provider.logs.length = 0;
+  provider.addSwap(3000, 60, -292916, provider.block - 300, { ageSeconds: 11520 });
+  provider.addSwap(30000, 600, -292000, provider.block - 100, { ageSeconds: 60 });
+  await poll();
+  await element("auto-mode").change(true);
+  await flush();
+  assert.equal(provider.sent.length, 2);
+  assert.match(element("activity").textContent, /auto skipped: pool 3000\/60 stale \(3h 12m\)/);
+  const count = () => element("activity").textContent.split("auto skipped:").length - 1;
+  assert.equal(count(), 1);
+  await poll();
+  await flush();
+  assert.equal(count(), 1, "one line per pool until its status changes");
+  assert.equal(provider.sent.length, 2);
+  assert.equal(element("auto-mode").checked, true); // a skip is not a failure
+
+  // Now the same pool is EMPTY: a new reason gets a new line. Still nothing is sent.
+  provider.setSlot0(id(3000, 60), ethers.constants.HashZero);
+  await poll();
+  await flush();
+  assert.match(element("activity").textContent, /auto skipped: pool 3000\/60 empty/);
+  assert.equal(provider.sent.length, 2);
+
+  // UNKNOWN on the other leg blocks too.
+  provider.slot0Words.delete(id(3000, 60));
+  provider.blockTimes.set(provider.block - 300, provider.now - 60);
+  provider.slot0Fail.add(id(30000, 600));
+  await poll();
+  await flush();
+  assert.match(element("activity").textContent, /auto skipped: pool 30000\/600 unknown \(slot0 read failed/);
+  assert.equal(provider.sent.length, 2);
+
+  // Both clean: the swap fires with those pools.
+  provider.slot0Fail.clear();
+  await poll();
+  await until(() => provider.sent.length === 3, "the auto-mode swap");
+  assert.equal(provider.sent[2].to, E.ROUTER);
+  assert.match(element("activity").textContent, /Auto mode: best spread 3000 \/ 60 → 30000 \/ 600/);
+  await element("auto-mode").change(false);
+});
+
+test("auto mode trades the best clean spread when a stale pool holds the better one, and logs the stale pool", async () => {
+  const provider = new MockWallet();
+  provider.addSwap(3000, 60, -292916, provider.block - 300, { ageSeconds: 60 });
+  provider.addSwap(2500, 25, -292000, provider.block - 200, { ageSeconds: 60 }); // clean GREEN against 3000/60
+  provider.addSwap(30000, 600, -280000, provider.block - 100, { ageSeconds: 9000 }); // far better, but stale
+  const { element, flush, until, poll } = await readyPage(provider);
+  await poll();
+  await element("connect").click();
+  await element("spreads-body").children[0].click();
+  await flush();
+  await element("approve-permit2").click();
+  assert.equal(provider.sent.length, 2);
+  await element("auto-mode").change(true);
+  await until(() => provider.sent.length === 3, "the auto-mode swap");
+  assert.match(element("activity").textContent, /auto skipped: pool 30000\/600 stale \(2h 30m\)/);
+  assert.match(element("activity").textContent, /Auto mode: best spread 3000 \/ 60 → 2500 \/ 25/);
+  await until(() => element("send").disabled && /Swap confirmed/.test(element("status").textContent), "the receipt");
+  await element("auto-mode").change(false);
+});
+
+test("the Window field stays usable while a transaction is pending; Max staleness locks with the threshold", async () => {
+  const { provider, element, poll, flush } = await readyPage(withActivePools());
+  await poll();
+  await element("connect").click();
+  await element("spreads-body").children[0].click();
+  await flush();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  provider.beforeRequest = async ({ method }) => { if (method === "eth_getTransactionReceipt") await gate; };
+  const first = element("approve-permit2").click();
+  assert.equal(element("max-staleness").disabled, true);
+  assert.equal(element("threshold").disabled, true);
+  assert.equal(element("window-blocks").disabled, false);
+  release();
+  await first;
+  assert.equal(element("max-staleness").disabled, false);
 });
 
 test("transfer buttons need a connection, an acknowledgement and a valid other address; token A and ETH transfers send everything", async () => {

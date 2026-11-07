@@ -16,7 +16,7 @@
     .danger { border-color: #ff8a7a; }
     .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 18px; }
     label { display: block; }
-    input[type=text] { box-sizing: border-box; width: 100%; margin-top: 6px; padding: 10px; background: #101721; color: inherit;
+    input[type=text], input[type=number] { box-sizing: border-box; width: 100%; margin-top: 6px; padding: 10px; background: #101721; color: inherit;
       border: 1px solid #687e98; border-radius: 6px; font: inherit; }
     input[readonly] { color: #a9b9cc; }
     button { padding: 12px 16px; border: 0; border-radius: 6px; background: #83dfbd; color: #12221c;
@@ -34,6 +34,7 @@
     tbody tr.selectable:hover { background: #22324a; }
     tbody tr.selected { background: #2a4a3f; }
     .green { color: #83dfbd; font-weight: 700; }
+    .yellow { color: #f3be57; font-weight: 700; }
     .red { color: #ffb4a9; font-weight: 700; }
     .error { color: #ffb4a9; }
     .success { color: #83dfbd; }
@@ -56,6 +57,7 @@
     <div><small>Token A balance</small><br><span id="bal-a">—</span></div>
     <div><small>Token B balance</small><br><span id="bal-b">—</span></div>
     <div><small>ETH balance</small><br><span id="bal-eth">—</span></div>
+    <div><small>Window</small><br><span id="window-status">3000 blocks</span></div>
     <div style="flex: 1 1 100%"><small>Polling</small><br><span id="poll-status" role="status" aria-live="polite">Not started.</span></div>
   </div>
 
@@ -64,13 +66,14 @@
     <div class="fields">
       <label>Token A<input id="token-a" type="text" value="0x39dbed3a2bd333467115de45665cc57f813c4571" autocomplete="off" spellcheck="false"></label>
       <label>Token B<input id="token-b" type="text" value="0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" autocomplete="off" spellcheck="false"></label>
+      <label>Window (blocks)<input id="window-blocks" type="number" value="3000" min="50" max="50000" step="1" inputmode="numeric" autocomplete="off"></label>
     </div>
     <button id="apply-pair" type="button">WATCH PAIR</button>
     <p id="pair-info" class="muted">currency0 is the lower address. Symbols are read from each token's symbol().</p>
-    <p class="muted">Every 30 s the page reads the PoolManager's Swap logs of the last 100 blocks for fee / tick
+    <p class="muted">Every 30 s the page reads the PoolManager's Swap logs of the window for fee / tick
       spacing (0,1) (0,10) (500,10) (2500,25) (3000,60) (10000,200) (30000,600). Price = 1.0001^tick of the latest
-      swap, shown as currency1 per currency0 after decimals. No swap in the window means inactive. On an RPC error the
-      page waits 60 s and keeps polling.</p>
+      swap, shown as currency1 per currency0 after decimals. No swap in the window means inactive. A new window
+      applies from the next poll, with no restart. On an RPC error the page waits 60 s and keeps polling.</p>
   </section>
 
   <section aria-labelledby="wallet-heading">
@@ -84,7 +87,7 @@
   <section aria-labelledby="pools-heading">
     <h2 id="pools-heading">3. Live pools</h2>
     <table aria-describedby="pools-heading">
-      <thead><tr><th>Fee</th><th>TickSpacing</th><th>Price</th><th>Swaps (100 blocks)</th><th>Active?</th></tr></thead>
+      <thead><tr><th>Fee</th><th>TickSpacing</th><th>Price</th><th id="swaps-heading">Swaps (3000 blocks)</th><th>Active?</th><th>Last Swap</th></tr></thead>
       <tbody id="pools-body"></tbody>
     </table>
     <h3>Top 5 pairwise spreads (click a row to select it)</h3>
@@ -92,14 +95,16 @@
       <thead><tr><th>Pool A (buy)</th><th>Pool B (sell)</th><th>Spread%</th><th>Fee Cost%</th><th>Net%</th><th>Verdict</th></tr></thead>
       <tbody id="spreads-body"></tbody>
     </table>
-    <p id="spreads-note" class="muted">Spreads need at least two active pools.</p>
+    <p id="spreads-note" class="muted">No tradeable spreads.</p>
     <div class="fields">
       <label><input id="auto-mode" type="checkbox"> Auto mode: execute when Net% is above the threshold</label>
       <label>Net% threshold<input id="threshold" type="text" value="0.5" inputmode="decimal" autocomplete="off"></label>
+      <label>Max staleness (seconds)<input id="max-staleness" type="number" value="7200" min="0" step="1" inputmode="numeric" autocomplete="off"></label>
     </div>
     <p id="auto-status" class="muted">Auto mode OFF. With it ON, each poll with a GREEN best spread runs quote → dry run →
       send without a click; your wallet still asks for the signature. One transaction at a time: nothing is submitted
-      while another is waiting for its receipt. Auto mode turns itself off after any failed attempt.</p>
+      while another is waiting for its receipt. Auto mode turns itself off after any failed attempt. Pools marked
+      STALE, EMPTY or UNKNOWN are left out of the spreads and of auto mode.</p>
   </section>
 
   <section aria-labelledby="swap-heading">
@@ -162,6 +167,9 @@
     let auto = false;
     let pendingHash = null;     // a submitted transaction whose receipt never arrived
     let balances = null;
+    let windowBlocks = E.LOG_WINDOW_BLOCKS;      // last valid field value; the next poll reads it
+    let maxStaleness = E.MAX_STALENESS_SECONDS;  // last valid field value; a typo never loosens the guard
+    let autoSkipsLogged = new Map();             // poolId → status already in the activity log
     const activity = [];
     const rpc = E.createRpcClient(E.RPC_URL, typeof fetch === "function" ? fetch.bind(window) : undefined);
 
@@ -198,6 +206,7 @@
       element("amount-in").disabled = busy;
       element("min-out").disabled = busy;
       element("threshold").disabled = busy;
+      element("max-staleness").disabled = busy;
       const canTransfer = ready && element("transfer-ack").checked && validTransferTarget();
       element("transfer-a").disabled = !canTransfer;
       element("transfer-b").disabled = !canTransfer;
@@ -348,7 +357,10 @@
         cell(row, String(pool.tickSpacing));
         cell(row, pool.displayPrice === null ? "—" : pool.displayPrice.toPrecision(6) + " (tick " + pool.tick + ")");
         cell(row, String(pool.swaps));
-        cell(row, pool.active ? "yes" : "no (inactive)", pool.active ? "green" : "muted");
+        const marked = pool.status && pool.status !== "OK" && pool.status !== "INACTIVE";
+        cell(row, !pool.active ? "no (inactive)" : marked ? "yes · " + pool.status : "yes", !pool.active ? "muted" : marked ? "red" : "green");
+        if (pool.elapsedSeconds === null || pool.elapsedSeconds === undefined) cell(row, "—", "muted");
+        else cell(row, E.formatElapsed(pool.elapsedSeconds), E.stalenessColor(pool.elapsedSeconds));
         body.appendChild(row);
       });
     }
@@ -372,8 +384,9 @@
         body.appendChild(row);
       });
       const active = state.pools.filter((pool) => pool.active).length;
-      element("spreads-note").textContent = spreads.length ? spreads.length + " spread(s) from " + active + " active pool(s). Pool A has the lower price (buy currency0 there), Pool B the higher (sell there)."
-        : "Spreads need at least two active pools. Active now: " + active + ".";
+      const tradeable = state.pools.filter((pool) => pool.status === "OK").length;
+      element("spreads-note").textContent = spreads.length ? spreads.length + " spread(s) from " + tradeable + " tradeable pool(s). Pool A has the lower price (buy currency0 there), Pool B the higher (sell there)."
+        : "No tradeable spreads. Active pools: " + active + ", tradeable: " + tradeable + ".";
       return spreads;
     }
 
@@ -389,16 +402,18 @@
           (state.lastPoll ? " · last successful poll " + when(state.lastPoll) : " · no successful poll yet") + " · errors: " + state.errors;
         element("poll-status").className = "error";
       } else if (state.lastPoll) {
-        element("poll-status").textContent = "Last poll " + when(state.lastPoll) + " · block " + state.blockNumber + " · window " + state.fromBlock + "–" +
-          state.blockNumber + " · " + state.pools.filter((pool) => pool.active).length + " active pool(s) · next poll in " + Math.round(E.POLL_INTERVAL_MS / 1000) + "s";
+        element("poll-status").textContent = "Last poll " + when(state.lastPoll) + " · block " + state.blockNumber + " · window " + state.windowBlocks + " blocks (" + state.fromBlock + "–" +
+          state.blockNumber + ") · " + state.pools.filter((pool) => pool.active).length + " active pool(s) · next poll in " + Math.round(E.POLL_INTERVAL_MS / 1000) + "s";
         element("poll-status").className = "success";
       }
+      if (state.windowBlocks) element("swaps-heading").textContent = "Swaps (" + state.windowBlocks + " blocks)";
       renderPools(state);
-      const spreads = renderSpreads(state);
-      if (!state.lastError && spreads.length) maybeAutoExecute(spreads[0]);
+      renderSpreads(state);
+      if (!state.lastError) maybeAutoExecute(state);
     }
 
-    const monitor = E.createPoolMonitor({ request: rpc.request, thresholdPercent: thresholdOrDefault, onUpdate: renderMonitor });
+    const monitor = E.createPoolMonitor({ request: rpc.request, thresholdPercent: thresholdOrDefault, windowBlocks: () => windowBlocks,
+      maxStalenessSeconds: () => maxStaleness, onUpdate: renderMonitor });
 
     function startMonitor() {
       clearSelection();
@@ -474,8 +489,22 @@
       await refreshBalances();
     }
 
-    function maybeAutoExecute(best) {
-      if (!auto || busy || !account || !wallet || pendingHash) return;
+    /** Log each pool that blocks a better trade once, until its status changes or it clears. */
+    function logAutoSkips(skips) {
+      const current = new Map();
+      skips.forEach((skip) => {
+        current.set(skip.poolId, skip.status);
+        if (autoSkipsLogged.get(skip.poolId) !== skip.status) log(skip.reason);
+      });
+      autoSkipsLogged = current;
+    }
+
+    function maybeAutoExecute(state) {
+      if (!auto || busy) return;
+      const decision = E.autoDecision(state.pools, thresholdOrDefault());
+      logAutoSkips(decision.skips);
+      const best = decision.spread;
+      if (!best || !account || !wallet || pendingHash) return;
       if (best.verdict !== "GREEN" || !(best.netPercent > thresholdOrDefault())) return;
       log("Auto mode: best spread " + poolLabel(best.buy) + " → " + poolLabel(best.sell) + " net " + best.netPercent.toFixed(3) + "% is above the threshold; executing.");
       runAction(async () => {
@@ -539,16 +568,37 @@
       renderSpreads(monitor.getState());
     });
 
+    element("window-blocks").addEventListener("input", () => {
+      const parsed = E.parseWindowBlocks(element("window-blocks").value);
+      if (parsed !== null) windowBlocks = parsed;
+      element("window-status").textContent = windowBlocks + " blocks" + (parsed === null ? " (enter a whole number from " + E.MIN_WINDOW_BLOCKS + " to " + E.MAX_WINDOW_BLOCKS + "; keeping this value)" : "");
+      element("window-status").className = parsed === null ? "error" : "";
+    });
+
+    element("max-staleness").addEventListener("input", () => {
+      const parsed = E.parseMaxStaleness(element("max-staleness").value);
+      if (parsed === null) {
+        element("auto-status").textContent = "Enter Max staleness as whole seconds. Using " + maxStaleness + " until fixed.";
+        element("auto-status").className = "error";
+        return;
+      }
+      maxStaleness = parsed;
+      element("auto-status").className = "muted";
+      const state = monitor.getState();
+      E.annotatePools(state.pools, maxStaleness);
+      renderPools(state);
+      renderSpreads(state);
+    });
+
     element("auto-mode").addEventListener("change", () => {
       auto = element("auto-mode").checked;
       if (auto) {
         pendingHash = null;
+        autoSkipsLogged = new Map();
         element("auto-status").textContent = "Auto mode ON: the next poll with a GREEN best spread above " + thresholdOrDefault() + "% executes automatically.";
         element("auto-status").className = "success";
         log("Auto mode ON (threshold " + thresholdOrDefault() + "%).");
-        const state = monitor.getState();
-        const spreads = state.pools.length ? E.rankSpreads(state.pools, thresholdOrDefault()) : [];
-        if (spreads.length) maybeAutoExecute(spreads[0]);
+        maybeAutoExecute(monitor.getState());
       } else {
         element("auto-status").textContent = "Auto mode OFF. Sending needs a click.";
         element("auto-status").className = "muted";

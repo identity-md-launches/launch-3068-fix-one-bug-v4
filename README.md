@@ -7,7 +7,99 @@ on chain 4663, with the evidence for the fix.
 The deliverables are [`index.html`](index.html) and [`js/v4-arb-encoder.js`](js/v4-arb-encoder.js):
 plain JavaScript and the existing vendored ethers v5, with no install or CDN required.
 
+## Follow-up 3.5: window, staleness, slot0 check
+
+The 100-block window showed almost nothing, so the monitor now reads a wider, user-set window and
+says how old each pool's last swap is. Three things differ from what the brief assumed; all three
+were measured read-only on the live chain on 2026-11-07.
+
+**1. The PoolManager has no `getSlot0`.** `eth_call` of `getSlot0(bytes32)` on
+`0x8366a39C…e40951` reverts with empty data, and selector `0xc815641c` is not in its bytecode. Called
+as written, every active pool would be UNKNOWN and there would never be a spread. The page reads the
+same value the way Uniswap's own `StateLibrary.getSlot0` does: one `eth_call` of
+`PoolManager.extsload(keccak256(abi.encode(poolId, 6)))`, unpacked by `decodeSlot0` into the brief's
+`(tick, sqrtPriceX96, protocolFee, lpFee)`. Same contract, same number of calls, same meaning.
+
+**2. `sqrtPriceX96 == 0` does not detect an empty pool that has ever traded.** Zero means "never
+initialised", and such a pool cannot have a swap in the window, so EMPTY will rarely if ever appear
+in practice. The real empty pool passes the check: PONS/USDG 30000/600 has liquidity 0 and
+`sqrtPriceX96` at the protocol minimum (tick −887272, price about 3e-27). When its last swap is in
+the window (for example at 50 000 blocks) it is **OK**, and its spreads top the table as **GREEN**
+with a net near 6e27%. No funds are at risk from this: the quote returns 0, sending stays disabled,
+and in auto mode that failed attempt **turns auto mode off**. Checking `liquidity` as well would fix
+it; that goes beyond the brief's rule, so it is left for the requester to decide.
+
+**3. Blocks are about 0.105 s apart**, so block counts are short in time:
+
+| Window | Time covered | PONS/USDG result on 2026-11-07 |
+|---|---|---|
+| 3 000 (default) | about 5 min | 1 active pool (3000/60): "No tradeable spreads" |
+| 50 000 (maximum) | about 88 min | 3 active pools: 3000/60, 2500/25, 30000/600 |
+
+A swap older than the window makes its pool **inactive**, not stale, so at the largest window nothing
+can be older than about 88 minutes. The default 7200 s limit therefore does not trigger on this chain,
+and the red colour (over 2 h) cannot appear. STALE becomes reachable by setting Max staleness below the window's
+span. These defaults are the brief's and are unchanged.
+
+### What changed
+
+- **Window (blocks)**: field in section 1, default 3000 (`LOG_WINDOW_BLOCKS`), whole numbers from 50
+  to 50000. The next poll uses a new value with no restart. An invalid entry keeps the last valid
+  value and says so. The status bar shows the current value at once, and the poll line shows the window
+  and block range the last poll used. It stays editable during a pending transaction.
+- **Polling**: `eth_blockNumber` is gone. Each poll is `eth_getBlockByNumber("latest", false)`, one
+  `eth_getLogs`, then for each active pool one `eth_getBlockByNumber(lastSwapBlock, false)` and one
+  slot0 `eth_call`: 2 + 2 × active pools requests, all on the public RPC. Timestamps are not cached.
+- **Last Swap** column: latest block timestamp minus the swap block's timestamp, as `Xm ago` or
+  `Xh Ym ago`, rounded down to the minute; green under 30 min, yellow from 30 min to 2 h inclusive, red above.
+- **Max staleness (seconds)**: beside the threshold, default 7200, applied to the table at once. It
+  locks with the threshold during a transaction. An invalid entry keeps the last valid value, so a typo
+  cannot loosen the guard while auto mode is on. Exactly at the limit is not stale.
+- **Pool marks**, in the Active? column as `yes · STALE`, `yes · EMPTY` or `yes · UNKNOWN`. Price and
+  swap count stay visible. The price is still `1.0001^tick` of the last Swap log; slot0's tick is never shown.
+
+| Mark | Condition |
+|---|---|
+| EMPTY | slot0 read succeeded and `sqrtPriceX96 == 0` |
+| STALE | elapsed above Max staleness |
+| UNKNOWN | the slot0 read failed or was malformed, or the swap block read failed or returned nothing |
+
+  A definite fact wins over a failed read, in that order. One pool's failed read never fails the poll or
+  triggers the 60 s back-off. Failure of the latest block or `eth_getLogs` still does, as before.
+  The brief names only slot0 for UNKNOWN; a failed swap block read is treated the same way, because
+  without the timestamp the pool's freshness cannot be shown.
+- **Spreads** use only active pools with none of those marks. Fewer than two gives **"No tradeable
+  spreads"**. Columns, top 5 and GREEN/RED are unchanged.
+- **Auto mode** fires on the best GREEN spread whose two pools are both tradeable. An excluded pool in a
+  better GREEN spread is logged, e.g. `auto skipped: pool 3000/60 stale (3h 12m)`, once per pool until
+  its status changes or auto mode is switched on again. A skip is not a failure and leaves auto mode on.
+- **Repair**: a poll still in flight when the pair changes now writes only to its own discarded state.
+  The extra per-pool calls made that existing race more likely.
+
+Unchanged: the 30 s cadence, the 60 s retry, the router-revert quote, dry run → send, Permit2, button
+locking, the 20-minute deadline, wallet transfers, balances and the activity log. A spread already
+selected keeps its Dry run and Send buttons if one of its pools later gets a mark; that guard covers
+the table and auto mode, as the brief says, and each send is still simulated first.
+
+New in `js/v4-arb-encoder.js`: `formatElapsed`, `formatDuration`, `stalenessColor`,
+`parseWindowBlocks`, `parseMaxStaleness`, `slot0StorageSlot`, `encodeSlot0Call`, `decodeSlot0`,
+`poolStatus`, `annotatePools`, `autoDecision`. `createPoolMonitor` now takes `windowBlocks` and
+`maxStalenessSeconds` as a number or a function read on every poll.
+
+### Follow-up 3.5 verification
+
+- **Offline:** 34 monitor cases and 22 page cases, the last group of each new, cover the success and failure paths
+  above: call counts, live window changes, each boundary, EMPTY, UNKNOWN and recovery, skip logging, and
+  the race. Seven deliberate code mutations were each caught. The DOM is a minimal mock, not a browser; no browser or real
+  wallet was run.
+- **Foundry:** `src/V4PoolMonitor.sol` mirrors the window bounds, Slot0 layout, colours and statuses,
+  with 11 new tests (3 of them fuzz) pinned to the live Slot0 words.
+- **Live, read-only:** the real `createPoolMonitor` ran against the public RPC at 3 000 and 50 000 blocks with
+  the results in the table above. `eth_getLogs` answered the full 50 000-block range. Nothing was sent.
+
 ## Follow-up 3: live pool monitor, arbitrage execution, wallet transfer
+
+The window, polling calls and pool table below were updated by follow-up 3.5 above.
 
 The static pool inputs are gone. The page now watches a token pair, ranks the spreads between its
 pools, quotes the selected route, and runs the unchanged Permit2 → dry run → send flow against the
@@ -26,8 +118,8 @@ without `symbol()` is reported in the status bar and retried.
 ### Polling
 
 Every **30 s** the page, through the public RPC `https://rpc.mainnet.chain.robinhood.com` (no wallet
-needed), does one `eth_blockNumber` and one `eth_getLogs` on the PoolManager
-`0x8366a39CC670B4001A1121B8F6A443A643e40951` for the last **100 blocks**, topic0 =
+needed), reads the latest block and does one `eth_getLogs` on the PoolManager
+`0x8366a39CC670B4001A1121B8F6A443A643e40951` for the window (default **3000 blocks**), topic0 =
 `0x40e9cecb…ad7112f` (the V4 `Swap` event) and topic1 = the seven pool ids of the pair:
 
 | Fee | Tick spacing | Pool id = keccak256(abi.encode(currency0, currency1, fee, tickSpacing, 0x0)) |
@@ -46,18 +138,12 @@ swap in the window is **inactive** and has no price. Any failure in the cycle (H
 error such as a rate limit, a malformed reply, a token without `symbol()`) is caught: the status bar
 shows **"RPC error, retrying in 60s"** with the message, the last good table stays on screen, the
 next attempt is scheduled after **60 s**, and polling never stops on its own. The seven pool ids are
-one OR filter in a single `eth_getLogs`, so a poll costs two requests.
-
-Note on this pair: when checked on 2026-11-07, the PONS/USDG pools had **13 swaps in 5 000 blocks**
-(12 on 3000/60, 1 on 30000/600). With the brief's 100-block window the pools will usually all be
-inactive and the spread table empty; this is the definition the brief asked for, not a fault. A
-longer window is a one-constant change (`LOG_WINDOW_BLOCKS`, also `windowBlocks` in
-`createPoolMonitor`), but widening it makes the "last tick" staler.
+one OR filter in a single `eth_getLogs`.
 
 ### Display
 
-- **Pools table**: Fee · TickSpacing · Price (tick) · Swaps (100 blocks) · Active?.
-- **Top 5 pairwise spreads** between active pools: Pool A (buy) · Pool B (sell) · Spread% · Fee Cost% ·
+- **Pools table**: Fee · TickSpacing · Price (tick) · Swaps (window) · Active? · Last Swap.
+- **Top 5 pairwise spreads** between tradeable pools: Pool A (buy) · Pool B (sell) · Spread% · Fee Cost% ·
   Net% · Verdict. Pool A is the pool with the **lower** price, where currency0 is cheaper (swap 1 sells
   currency1 there, `zeroForOne = false`); Pool B is the higher-priced pool (swap 2 sells currency0 there,
   `zeroForOne = true`). `Spread% = (high − low) / low × 100`. `Fee Cost% = (feeA + feeB) / 10 000`
@@ -403,16 +489,16 @@ These were visible on chain while testing. None of them is fixed by an encoder.
 | `js/v4-arb-encoder.js` | corrected encoder, Permit2 wallet client, pool monitor, quote, transfers |
 | `js/test/encoder.test.js` | offline test of the encoder, 18 cases |
 | `js/test/permit2.test.js` | approval and transaction-flow success/failure tests, 43 cases |
-| `js/test/monitor.test.js` | pool ids, spreads, monitor schedule and errors, quote, transfers, 21 cases |
-| `js/test/ui.test.js` | actual page script event-handler tests, 15 cases |
-| `js/test/mock-wallet.js` | stateful EIP-1193 and JSON-RPC test double (allowances, balances, Swap logs, quotes) |
+| `js/test/monitor.test.js` | pool ids, spreads, monitor schedule and errors, window, staleness, slot0, quote, transfers, 34 cases |
+| `js/test/ui.test.js` | actual page script event-handler tests, 22 cases |
+| `js/test/mock-wallet.js` | stateful EIP-1193 and JSON-RPC test double (allowances, balances, Swap logs, block times, Slot0, quotes) |
 | `js/vendor/ethers-5.7.2.umd.min.js` | ethers v5, vendored so the test runs without a network |
 | `src/V4SwapCalldata.sol` | the same encoder in Solidity, internal and pure |
 | `src/V4SwapCalldataCheck.sol` | an offline shape check that applies the router's length rules |
-| `src/V4PoolMonitor.sol` | pool ids, spread / fee / net bps, slippage, quote-revert and Swap-log decoding |
+| `src/V4PoolMonitor.sol` | pool ids, spread / fee / net bps, slippage, quote-revert, Swap-log and Slot0 decoding, pool status |
 | `test/Vectors.sol` | the two transactions' inputs and the JavaScript encoder's outputs |
 | `test/V4SwapCalldata.t.sol` | 37 Foundry tests, 4 of them fuzz tests |
-| `test/V4PoolMonitor.t.sol` | 20 Foundry tests, 4 of them fuzz tests, sharing vectors with the JavaScript |
+| `test/V4PoolMonitor.t.sol` | 31 Foundry tests, 7 of them fuzz tests, sharing vectors with the JavaScript |
 | `lib/forge-std` | forge-std v1.9.7, vendored as plain files |
 
 The two encoders are tied together through `test/Vectors.sol`: the JavaScript test asserts the
@@ -420,7 +506,7 @@ JavaScript produces those bytes, the Foundry tests assert the Solidity produces 
 
 ```sh
 forge build
-FOUNDRY_FUZZ_SEED=0x7363613b963c638bcd9c7841cc95581055d780db0b15e0e3b05aeed7bb796d4e forge test
+FOUNDRY_FUZZ_SEED=0xe6b28ac28482a0fc8caab7337860b50a5f4d736b636ed2ad9e629e73e3345aa8 forge test
 forge fmt --check
 node js/test/encoder.test.js
 node --test js/test/permit2.test.js js/test/monitor.test.js js/test/ui.test.js
@@ -462,9 +548,13 @@ node --test js/test/permit2.test.js js/test/monitor.test.js js/test/ui.test.js
   V4 layout, with `tick` as the fifth data word.
 - "Price" is `1.0001^tick` of the **last swap in the window**, not the pool's current slot0. It is as
   stale as that swap, and a pool with liquidity but no recent swap counts as inactive.
+- Slot0 is read through `extsload` at `keccak256(abi.encode(poolId, 6))`, the `pools` mapping's slot in
+  the public V4 PoolManager, confirmed against the live word's fee and tick. Elapsed time is chain time,
+  latest block minus swap block, not the browser's clock.
+- A pool's status does not measure liquidity. See follow-up 3.5, point 2.
 - Token A and Token B are ERC20 tokens with `symbol()` and `decimals()`; the native currency
   (`currency0 = 0x0`) is not supported as a pair member.
-- The public RPC in the brief answers `eth_getLogs` over 100 blocks with a seven-id topic filter and
+- The public RPC in the brief answers `eth_getLogs` over up to 50 000 blocks with a seven-id topic filter and
   returns revert data on `eth_call`. Quoting goes through that RPC, not the wallet, because some
   wallets strip revert data.
 - Spread, fee cost and net are price-ratio arithmetic on the two last-swap ticks. They ignore price
@@ -486,7 +576,9 @@ The follow-up page uses these existing deployments, without creating contracts:
 | Swap topic | `0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f` |
 | Fee tiers scanned | (0,1) (0,10) (500,10) (2500,25) (3000,60) (10000,200) (30000,600), hooks `0x0` |
 | Pool A / B | Selected from the live spread table (lower-priced pool buys, higher-priced sells); the encoder's defaults 3000/60 and 30000/600 remain its fallback |
-| Poll / retry / window | 30 s / 60 s after an RPC error / last 100 blocks (`POLL_INTERVAL_MS`, `RPC_RETRY_MS`, `LOG_WINDOW_BLOCKS`) |
+| Poll / retry / window | 30 s / 60 s after an RPC error / user-set, default 3000 blocks, 50 to 50000 (`POLL_INTERVAL_MS`, `RPC_RETRY_MS`, `LOG_WINDOW_BLOCKS`) |
+| Max staleness | user-set in the page, default 7200 s (`MAX_STALENESS_SECONDS`) |
+| Slot0 read | `PoolManager.extsload(keccak256(abi.encode(poolId, 6)))` (`POOLS_SLOT`) |
 | Slippage | 0.5% (`SLIPPAGE_BPS = 50`) off the quoted swap-1 output |
 | Auto-mode threshold | user-set in the page, default 0.5% net, strictly above |
 | Input amount | 0.01 of currency1 by default, editable in the page |
@@ -525,6 +617,8 @@ Whoever sends the transaction is responsible for:
   answer. Pool and spread data are only as fresh as the last successful poll shown in the status bar;
 - re-approving Permit2 when a new quote's bridge amount, times the test count, exceeds the earlier
   limit, and raising the minimum return above 0 before trading more than a test amount;
+- choosing a window and Max staleness that suit the pair: blocks are about 0.105 s apart, so a window's
+  time span is short, and the status marks do not show that a pool has liquidity (a quote does);
 - verifying the new wallet address before a whole-balance transfer. The page checks the format, the
   zero address and self-transfers only. A transfer to a wrong address cannot be undone. The ETH
   transfer leaves a gas reserve as dust by design; a second transfer later can move most of it.

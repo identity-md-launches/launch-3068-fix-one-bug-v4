@@ -7,7 +7,8 @@ import {V4SwapCalldata} from "./V4SwapCalldata.sol";
 /// @notice Reference arithmetic for the live pool monitor in js/v4-arb-encoder.js: pool ids of
 ///         the seven fee tiers of a pair, spread / fee / net in basis points, the 0.5% slippage
 ///         applied to a quote, and the decoding of the router's price-check revert that the page
-///         uses as an exact-input quote.
+///         uses as an exact-input quote. Follow-up 3.5 adds the window bounds, the Slot0 storage
+///         slot and word layout, staleness colours and the pool status that gates spreads.
 /// @dev All functions are internal and pure: nothing is deployed, called or held. Prices are
 ///      unitless fixed-point numbers at any common scale (the JavaScript uses 1.0001^tick as a
 ///      float); only their ratio matters to the spread.
@@ -24,6 +25,38 @@ library V4PoolMonitor {
     error NotPriceRevert();
     /// @notice A Swap log's data is not the six-word layout of the PoolManager event.
     error MalformedSwapLog();
+    /// @notice A log window outside MIN_WINDOW_BLOCKS to MAX_WINDOW_BLOCKS.
+    error WindowOutOfRange();
+
+    /// @notice Colour of the Last Swap column.
+    enum StalenessColor {
+        Green,
+        Yellow,
+        Red
+    }
+
+    /// @notice Why a pool is or is not tradeable. Only Ok reaches the spreads and auto mode.
+    enum PoolStatus {
+        Inactive,
+        Ok,
+        Stale,
+        Empty,
+        Unknown
+    }
+
+    /// @notice One active pool's readings from a poll.
+    /// @param active The pool has a swap in the window.
+    /// @param slot0Read The slot0 read succeeded.
+    /// @param sqrtPriceX96 The slot0 price; meaningful only when slot0Read.
+    /// @param timestampRead The swap block's timestamp read succeeded.
+    /// @param elapsedSeconds Latest block timestamp minus swap block timestamp; meaningful only when timestampRead.
+    struct PoolHealth {
+        bool active;
+        bool slot0Read;
+        uint160 sqrtPriceX96;
+        bool timestampRead;
+        uint256 elapsedSeconds;
+    }
 
     /// @dev PoolManager Swap(PoolId indexed id, address indexed sender, int128 amount0, int128 amount1,
     ///      uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee).
@@ -37,7 +70,15 @@ library V4PoolMonitor {
     uint256 internal constant FEE_PIPS_PER_BP = 100;
     uint256 internal constant SLIPPAGE_BPS = 50;
     uint256 internal constant TIER_COUNT = 7;
-    uint256 internal constant LOG_WINDOW_BLOCKS = 100;
+    uint256 internal constant LOG_WINDOW_BLOCKS = 3000;
+    uint256 internal constant MIN_WINDOW_BLOCKS = 50;
+    uint256 internal constant MAX_WINDOW_BLOCKS = 50_000;
+    uint256 internal constant MAX_STALENESS_SECONDS = 7200;
+    uint256 internal constant STALENESS_YELLOW_SECONDS = 1800;
+    uint256 internal constant STALENESS_RED_SECONDS = 7200;
+    /// @dev The storage slot of PoolManager's `pools` mapping, used by Uniswap's StateLibrary. The
+    ///      deployed PoolManager has no getSlot0(bytes32), so the page reads Slot0 through extsload.
+    uint256 internal constant POOLS_SLOT = 6;
 
     /// @notice The seven fee / tick spacing combinations the monitor scans, in the brief's order.
     function feeTiers() internal pure returns (uint24[TIER_COUNT] memory fees, int24[TIER_COUNT] memory spacings) {
@@ -119,6 +160,50 @@ library V4PoolMonitor {
         }
         (, uint256 actualPriceX36) = abi.decode(args, (uint256, uint256));
         amountOut = actualPriceX36 * amountIn / X36;
+    }
+
+    /// @notice fromBlock of the eth_getLogs call: the window ends at `latest` and includes it.
+    function windowStart(uint256 latest, uint256 blocks) internal pure returns (uint256) {
+        if (blocks < MIN_WINDOW_BLOCKS || blocks > MAX_WINDOW_BLOCKS) revert WindowOutOfRange();
+        return latest >= blocks - 1 ? latest - (blocks - 1) : 0;
+    }
+
+    /// @notice The PoolManager storage slot holding a pool's Slot0 word.
+    function slot0Slot(bytes32 id) internal pure returns (bytes32) {
+        return keccak256(abi.encode(id, POOLS_SLOT));
+    }
+
+    /// @notice Unpacks Slot0, from the low bits: sqrtPriceX96 (160), tick (24), protocolFee (24), lpFee (24).
+    function decodeSlot0(bytes32 word)
+        internal
+        pure
+        returns (int24 tick, uint160 sqrtPriceX96, uint24 protocolFee, uint24 lpFee)
+    {
+        uint256 packed = uint256(word);
+        // casting is safe because each value is masked to the width of its target type
+        // forge-lint: disable-next-line(unsafe-typecast)
+        sqrtPriceX96 = uint160(packed & type(uint160).max);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        tick = int24(uint24((packed >> 160) & type(uint24).max));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        protocolFee = uint24((packed >> 184) & type(uint24).max);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        lpFee = uint24((packed >> 208) & type(uint24).max);
+    }
+
+    /// @notice Green below 30 minutes, yellow from 30 minutes to 2 hours, red above 2 hours.
+    function stalenessColor(uint256 elapsedSeconds) internal pure returns (StalenessColor) {
+        if (elapsedSeconds < STALENESS_YELLOW_SECONDS) return StalenessColor.Green;
+        return elapsedSeconds > STALENESS_RED_SECONDS ? StalenessColor.Red : StalenessColor.Yellow;
+    }
+
+    /// @notice A definite fact (Empty, Stale) is reported ahead of a failed read (Unknown).
+    function poolStatus(PoolHealth memory pool, uint256 maxStalenessSeconds) internal pure returns (PoolStatus) {
+        if (!pool.active) return PoolStatus.Inactive;
+        if (pool.slot0Read && pool.sqrtPriceX96 == 0) return PoolStatus.Empty;
+        if (pool.timestampRead && pool.elapsedSeconds > maxStalenessSeconds) return PoolStatus.Stale;
+        if (!pool.slot0Read || !pool.timestampRead) return PoolStatus.Unknown;
+        return PoolStatus.Ok;
     }
 
     /// @notice The tick of a PoolManager Swap log, from its six-word data.

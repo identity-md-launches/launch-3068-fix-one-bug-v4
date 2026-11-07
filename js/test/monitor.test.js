@@ -216,14 +216,15 @@ test("monitor: first poll on start, 30 s schedule, 60 s back-off on any RPC erro
   assert.equal(state.spreads[0].buy.fee, 3000);
   assert.equal(state.spreads[0].verdict, "RED"); // 0.14% gap, 0.55% fees
   assert.equal(state.blockNumber, provider.block);
-  assert.equal(state.fromBlock, provider.block - 99);
+  assert.equal(state.fromBlock, provider.block - 2999);
+  assert.equal(state.windowBlocks, 3000);
   assert.equal(state.lastError, null);
   assert.deepEqual(timers.map((t) => t.ms), [E.POLL_INTERVAL_MS]);
   const logsCall = provider.rpcCalls.find((c) => c.method === "eth_getLogs");
   assert.equal(logsCall.params[0].address, E.POOL_MANAGER);
   assert.equal(logsCall.params[0].topics[0], E.SWAP_TOPIC);
   assert.equal(logsCall.params[0].topics[1].length, 7);
-  assert.equal(ethers.BigNumber.from(logsCall.params[0].toBlock).sub(logsCall.params[0].fromBlock).toNumber(), 99);
+  assert.equal(ethers.BigNumber.from(logsCall.params[0].toBlock).sub(logsCall.params[0].fromBlock).toNumber(), 2999);
   // Symbols are read once, not on every poll.
   const symbolCalls = () => provider.rpcCalls.filter((c) => c.method === "eth_call" && c.params[0].data === erc20.getSighash("symbol")).length;
   assert.equal(symbolCalls(), 2);
@@ -328,6 +329,296 @@ test("monitor with real short intervals keeps polling until stopped", async () =
   const polls = state.polls;
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(monitor.getState().polls, polls);
+});
+
+// ------------------------------------------------------------------ follow-up 3.5: window, staleness, slot0
+
+// The 3000/60 pool's Slot0 word read through extsload on 2026-11-07.
+const LIVE_SLOT0 = "0x000000000bb81f41f4fb878800000000000000000000074b56c05cb633d71d40";
+const idOf = (fee, tickSpacing) => E.poolId(key(fee, tickSpacing));
+const poolOf = (state, fee) => state.pools.find((p) => p.fee === fee);
+const pollCalls = (provider, from) => provider.rpcCalls.slice(from);
+
+test("defaults: window 3000 within 50 to 50000, staleness 7200; parsers refuse anything else", () => {
+  assert.equal(E.LOG_WINDOW_BLOCKS, 3000);
+  assert.equal(E.MIN_WINDOW_BLOCKS, 50);
+  assert.equal(E.MAX_WINDOW_BLOCKS, 50000);
+  assert.equal(E.MAX_STALENESS_SECONDS, 7200);
+  assert.equal(E.POLL_INTERVAL_MS, 30000);
+  assert.equal(E.RPC_RETRY_MS, 60000);
+  assert.equal(E.parseWindowBlocks("50"), 50);
+  assert.equal(E.parseWindowBlocks(" 50000 "), 50000);
+  for (const bad of ["49", "50001", "", "abc", "1e3", "100.5", "-100", null, undefined]) assert.equal(E.parseWindowBlocks(bad), null, String(bad));
+  assert.equal(E.parseMaxStaleness("0"), 0);
+  assert.equal(E.parseMaxStaleness(7200), 7200);
+  for (const bad of ["", "abc", "-1", "1.5", "99999999999999999999"]) assert.equal(E.parseMaxStaleness(bad), null, bad);
+});
+
+test("elapsed time formats as Xm ago or Xh Ym ago, and colours switch at exactly 30 min and 2 h", () => {
+  assert.equal(E.formatElapsed(0), "0m ago");
+  assert.equal(E.formatElapsed(59), "0m ago");
+  assert.equal(E.formatElapsed(3599), "59m ago");
+  assert.equal(E.formatElapsed(3600), "1h 0m ago");
+  assert.equal(E.formatElapsed(11520), "3h 12m ago");
+  assert.equal(E.formatDuration(11520), "3h 12m");
+  assert.throws(() => E.formatElapsed(-1), /non-negative/);
+  assert.equal(E.stalenessColor(0), "green");
+  assert.equal(E.stalenessColor(1799), "green");
+  assert.equal(E.stalenessColor(1800), "yellow");
+  assert.equal(E.stalenessColor(7200), "yellow");
+  assert.equal(E.stalenessColor(7201), "red");
+});
+
+test("decodeSlot0 unpacks the live word; the read goes to the PoolManager's extsload at the pool's slot", () => {
+  const slot0 = E.decodeSlot0(LIVE_SLOT0);
+  assert.equal(slot0.tick, -292984);
+  assert.equal(slot0.lpFee, 3000);
+  assert.equal(slot0.protocolFee, 0x1f41f4);
+  assert.equal(slot0.sqrtPriceX96.toString(), ethers.BigNumber.from("0x074b56c05cb633d71d40").toString());
+  assert.ok(E.decodeSlot0(ethers.constants.HashZero).sqrtPriceX96.isZero());
+  assert.equal(E.decodeSlot0("0x0000000027103e83e80d89e7fffd8963efd1fc6a506488495d951d5263988d25").tick, 887271); // live 10000/200 word
+  assert.equal(E.decodeSlot0("0x0000000027103e83e80d89e7fffd8963efd1fc6a506488495d951d5263988d25").lpFee, 10000);
+  for (const bad of ["0x", "0x1234", null, undefined, 7]) assert.throws(() => E.decodeSlot0(bad), /32-byte word/);
+  const call = E.encodeSlot0Call(POOL_A_ID);
+  assert.equal(call.to, E.POOL_MANAGER);
+  assert.equal(call.data, "0x1e2eaeaf" + ethers.utils.keccak256(abi.encode(["bytes32", "uint256"], [POOL_A_ID, 6])).slice(2));
+});
+
+test("poolStatus: inactive, OK, the staleness boundary, EMPTY, and UNKNOWN for a failed read", () => {
+  const base = { active: true, empty: false, elapsedSeconds: 7200 };
+  assert.equal(E.poolStatus({ ...base, active: false }, 7200), "INACTIVE");
+  assert.equal(E.poolStatus(base, 7200), "OK"); // exactly at the limit is not stale
+  assert.equal(E.poolStatus({ ...base, elapsedSeconds: 7201 }, 7200), "STALE");
+  assert.equal(E.poolStatus({ ...base, empty: true }, 7200), "EMPTY");
+  assert.equal(E.poolStatus({ ...base, empty: null }, 7200), "UNKNOWN");
+  assert.equal(E.poolStatus({ ...base, elapsedSeconds: null }, 7200), "UNKNOWN");
+  assert.equal(E.poolStatus({ ...base, empty: null, elapsedSeconds: 9000 }, 7200), "STALE");
+  assert.throws(() => E.annotatePools([], -1), /max staleness/);
+});
+
+const health = (fee, tickSpacing, price, fields = {}) => ({ fee, tickSpacing, price, poolId: "0x" + fee, active: true, empty: false, elapsedSeconds: 60, status: "OK", ...fields });
+
+test("rankSpreads leaves out STALE, EMPTY, UNKNOWN and inactive pools; fewer than two tradeable gives nothing", () => {
+  const ok1 = health(3000, 60, 1);
+  const ok2 = health(2500, 25, 1.2);
+  assert.equal(E.rankSpreads([ok1, ok2], 0.5).length, 1);
+  for (const status of ["STALE", "EMPTY", "UNKNOWN", "INACTIVE"]) {
+    assert.deepEqual(E.rankSpreads([ok1, ok2, health(500, 10, 9, { status })], 0.5).map((s) => s.sell.fee), [2500]);
+    assert.deepEqual(E.rankSpreads([ok1, health(500, 10, 9, { status })], 0.5), []);
+  }
+});
+
+test("autoDecision fires only on two tradeable pools and names the pool that blocked a better trade", () => {
+  const stale = health(3000, 60, 1, { status: "STALE", elapsedSeconds: 11520 });
+  const empty = health(500, 10, 1.5, { status: "EMPTY", empty: true });
+  const unknown = health(2500, 25, 1.4, { status: "UNKNOWN", empty: null, healthError: "slot0 read failed: timeout" });
+  const fresh = health(0, 1, 1.3);
+  const fresh2 = health(0, 10, 1.31);
+
+  let decision = E.autoDecision([stale, fresh], 0.5);
+  assert.equal(decision.spread, null);
+  assert.deepEqual(decision.skips.map((s) => s.reason), ["auto skipped: pool 3000/60 stale (3h 12m)"]);
+  assert.match(E.autoDecision([empty, fresh], 0.5).skips[0].reason, /^auto skipped: pool 500\/10 empty/);
+  assert.equal(E.autoDecision([unknown, fresh], 0.5).skips[0].reason, "auto skipped: pool 2500/25 unknown (slot0 read failed: timeout)");
+
+  // A worse but clean spread still fires, and the stale pool's better spreads are reported once.
+  decision = E.autoDecision([stale, fresh, health(0, 10, 1.02)], 0.5);
+  assert.equal(decision.spread.sell.fee, 0);
+  assert.equal(decision.spread.sell.tickSpacing, 1);
+  assert.equal(decision.skips.length, 1);
+  assert.equal(decision.skips[0].status, "STALE");
+
+  // A clean best spread reports nothing; a RED spread with a bad pool is no skip: it would not fire.
+  const clean = E.autoDecision([health(0, 1, 1), health(0, 10, 1.3), stale], 90);
+  assert.equal(clean.spread, null);
+  assert.deepEqual(clean.skips, []);
+  assert.equal(E.autoDecision([fresh, fresh2], 90).spread, null);
+  assert.equal(E.autoDecision([health(0, 1, 1), health(0, 10, 1.3)], 0.5).spread.verdict, "GREEN");
+});
+
+test("a poll reads the latest block once, never eth_blockNumber, then one block and one slot0 per active pool", async () => {
+  const provider = new MockWallet();
+  provider.addSwap(3000, 60, -292916, provider.block - 2000, { ageSeconds: 600 });
+  provider.addSwap(3000, 60, -292900, provider.block - 1000, { ageSeconds: 300 }); // the later swap is the one timed
+  provider.addSwap(2500, 25, -292902, provider.block - 500, { ageSeconds: 100 });
+  const { monitor } = monitorWithFakeTimers(provider);
+  await monitor.start(E.PONS, E.USDG);
+  const before = provider.rpcCalls.length;
+  await monitor.pollOnce();
+  const calls = pollCalls(provider, before);
+  assert.equal(calls.filter((c) => c.method === "eth_blockNumber").length, 0);
+  assert.deepEqual(calls[0].params, ["latest", false]);
+  assert.equal(calls[1].method, "eth_getLogs");
+  const blocks = calls.filter((c) => c.method === "eth_getBlockByNumber" && c.params[0] !== "latest");
+  assert.deepEqual(blocks.map((c) => Number(c.params[0])).sort(), [provider.block - 1000, provider.block - 500].sort());
+  assert.ok(blocks.every((c) => c.params[1] === false));
+  const slot0 = calls.filter((c) => c.method === "eth_call");
+  assert.equal(slot0.length, 2);
+  assert.ok(slot0.every((c) => c.params[0].to === E.POOL_MANAGER && c.params[0].data.startsWith("0x1e2eaeaf")));
+  assert.equal(calls.length, 2 + 2 + 2);
+  assert.ok(calls.every((c) => c.url === E.RPC_URL));
+  const state = monitor.getState();
+  assert.equal(state.blockTimestamp, provider.now);
+  assert.equal(poolOf(state, 3000).elapsedSeconds, 300);
+  assert.equal(poolOf(state, 2500).elapsedSeconds, 100);
+  assert.equal(poolOf(state, 2500).status, "OK");
+  assert.equal(poolOf(state, 500).status, "INACTIVE");
+  assert.equal(poolOf(state, 500).elapsedSeconds, null);
+  assert.equal(state.spreads.length, 1);
+  // The displayed price still comes from the Swap log's tick, not slot0's -292984.
+  assert.equal(poolOf(state, 3000).tick, -292900);
+  monitor.stop();
+});
+
+test("a window function is read on every poll and needs no restart; an out-of-range one is an RPC-style retry", async () => {
+  const provider = new MockWallet();
+  let blocks = 3000;
+  const { monitor, timers, fire } = monitorWithFakeTimers(provider, { windowBlocks: () => blocks });
+  await monitor.start(E.PONS, E.USDG);
+  const span = () => { const f = provider.rpcCalls.filter((c) => c.method === "eth_getLogs").at(-1).params[0]; return Number(f.toBlock) - Number(f.fromBlock) + 1; };
+  assert.equal(span(), 3000);
+  blocks = 50;
+  await fire();
+  assert.equal(span(), 50);
+  assert.equal(monitor.getState().windowBlocks, 50);
+  blocks = 50000;
+  await fire();
+  assert.equal(span(), 50000);
+  assert.equal(monitor.getState().polls, 3);
+  blocks = 49;
+  await fire();
+  assert.match(monitor.getState().lastError, /windowBlocks/);
+  assert.deepEqual(timers.map((t) => t.ms), [E.RPC_RETRY_MS]);
+  monitor.stop();
+  for (const windowBlocks of [49, 50001, 1.5]) assert.throws(() => E.createPoolMonitor({ request: () => {}, windowBlocks }), /windowBlocks/);
+  // A swap older than the window makes its pool inactive rather than stale.
+  provider.addSwap(3000, 60, -292916, provider.block - 4000, { ageSeconds: 500 });
+  const short = monitorWithFakeTimers(provider).monitor;
+  await short.start(E.PONS, E.USDG);
+  assert.equal(poolOf(short.getState(), 3000).status, "INACTIVE");
+  short.stop();
+});
+
+test("staleness: above the maximum is STALE and leaves the spreads; a staleness function applies on the next poll", async () => {
+  const provider = new MockWallet();
+  provider.addSwap(3000, 60, -292916, provider.block - 2000, { ageSeconds: 7201 });
+  provider.addSwap(2500, 25, -292902, provider.block - 1000, { ageSeconds: 7200 });
+  provider.addSwap(30000, 600, -292000, provider.block - 500, { ageSeconds: 60 });
+  let max = 7200;
+  const { monitor, fire } = monitorWithFakeTimers(provider, { maxStalenessSeconds: () => max });
+  await monitor.start(E.PONS, E.USDG);
+  let state = monitor.getState();
+  assert.equal(poolOf(state, 3000).status, "STALE");
+  assert.equal(poolOf(state, 2500).status, "OK");
+  assert.equal(state.spreads.length, 1);
+  assert.equal(state.spreads[0].buy.fee, 2500);
+  max = 100;
+  await fire();
+  state = monitor.getState();
+  assert.equal(poolOf(state, 2500).status, "STALE");
+  assert.equal(state.spreads.length, 0);
+  max = 8000;
+  await fire();
+  assert.equal(monitor.getState().spreads.length, 3);
+  monitor.stop();
+});
+
+test("slot0: zero sqrtPriceX96 is EMPTY; a failed or malformed read is UNKNOWN for that pool only", async () => {
+  const provider = new MockWallet();
+  provider.addSwap(3000, 60, -292916);
+  provider.addSwap(2500, 25, -292902);
+  provider.addSwap(30000, 600, -292000);
+  provider.setSlot0(idOf(30000, 600), ethers.constants.HashZero);
+  provider.slot0Fail.add(idOf(2500, 25));
+  const { monitor, timers, errors, fire } = monitorWithFakeTimers(provider);
+  await monitor.start(E.PONS, E.USDG);
+  let state = monitor.getState();
+  assert.equal(poolOf(state, 30000).status, "EMPTY");
+  assert.equal(poolOf(state, 2500).status, "UNKNOWN");
+  assert.match(poolOf(state, 2500).healthError, /slot0 read failed.*timeout/);
+  assert.notEqual(poolOf(state, 2500).displayPrice, null); // still displayed
+  assert.equal(poolOf(state, 3000).status, "OK");
+  assert.equal(state.spreads.length, 0);
+  assert.equal(state.lastError, null);
+  assert.equal(errors.length, 0);
+  assert.deepEqual(timers.map((t) => t.ms), [E.POLL_INTERVAL_MS]); // no 60 s back-off
+
+  // Recovery on the next poll, and a malformed reply counts as a failed read.
+  provider.slot0Fail.clear();
+  provider.setSlot0(idOf(30000, 600), "0x");
+  await fire();
+  state = monitor.getState();
+  assert.equal(poolOf(state, 2500).status, "OK");
+  assert.equal(poolOf(state, 30000).status, "UNKNOWN");
+  assert.match(poolOf(state, 30000).healthError, /32-byte word/);
+  assert.equal(state.spreads.length, 1);
+  monitor.stop();
+});
+
+test("the swap block's read failing or returning null marks that pool UNKNOWN; the latest block failing is the 60 s retry", async () => {
+  const provider = new MockWallet();
+  provider.addSwap(3000, 60, -292916, provider.block - 10);
+  provider.addSwap(2500, 25, -292902, provider.block - 20);
+  provider.blockFail.add(provider.block - 10);
+  const { monitor, timers, fire } = monitorWithFakeTimers(provider);
+  await monitor.start(E.PONS, E.USDG);
+  let state = monitor.getState();
+  assert.equal(poolOf(state, 3000).status, "UNKNOWN");
+  assert.match(poolOf(state, 3000).healthError, /swap block read failed/);
+  assert.equal(poolOf(state, 3000).elapsedSeconds, null);
+  assert.equal(poolOf(state, 2500).status, "OK");
+  assert.equal(state.lastError, null);
+  provider.blockFail.clear();
+
+  const realHandle = provider.handle.bind(provider);
+  provider.handle = (method, params) => (method === "eth_getBlockByNumber" && params[0] !== "latest" ? null : realHandle(method, params));
+  await fire();
+  state = monitor.getState();
+  assert.equal(poolOf(state, 2500).status, "UNKNOWN");
+  assert.match(poolOf(state, 2500).healthError, /no block/);
+  assert.equal(state.lastError, null);
+
+  provider.handle = (method, params) => (method === "eth_getBlockByNumber" ? null : realHandle(method, params));
+  await fire();
+  assert.match(monitor.getState().lastError, /no block for latest/);
+  assert.deepEqual(timers.map((t) => t.ms), [E.RPC_RETRY_MS]);
+  provider.handle = realHandle;
+  await fire();
+  assert.equal(monitor.getState().lastError, null);
+  assert.equal(poolOf(monitor.getState(), 3000).status, "OK");
+  monitor.stop();
+});
+
+test("a clock mismatch between RPC nodes never gives a negative elapsed time", async () => {
+  const provider = new MockWallet();
+  provider.addSwap(3000, 60, -292916, provider.block, { ageSeconds: -5 });
+  const { monitor } = monitorWithFakeTimers(provider);
+  await monitor.start(E.PONS, E.USDG);
+  assert.equal(poolOf(monitor.getState(), 3000).elapsedSeconds, 0);
+  monitor.stop();
+});
+
+test("a poll still in flight when the pair changes never writes the old pair's pools into the new state", async () => {
+  const provider = new MockWallet();
+  const third = "0x1111111111111111111111111111111111111111";
+  provider.tokens.set(third, ["FOO", 8]);
+  provider.addSwap(3000, 60, -292916);
+  const { monitor } = monitorWithFakeTimers(provider);
+  await monitor.start(E.PONS, E.USDG);
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  provider.beforeRpc = async (body) => { if (body.method === "eth_getLogs") { provider.beforeRpc = null; await gate; } };
+  const old = monitor.pollOnce();
+  await new Promise((resolve) => setImmediate(resolve));
+  await monitor.start(E.PONS, third);
+  assert.equal(monitor.getState().pair.symbolB, "FOO");
+  const polls = monitor.getState().polls;
+  release();
+  await old;
+  assert.equal(monitor.getState().pair.symbolB, "FOO");
+  assert.equal(monitor.getState().polls, polls);
+  assert.equal(monitor.getState().pools.filter((p) => p.active).length, 0);
+  monitor.stop();
 });
 
 // ------------------------------------------------------------------ wallet client: pairs, balances, transfers
