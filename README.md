@@ -7,6 +7,111 @@ on chain 4663, with the evidence for the fix.
 The deliverables are [`index.html`](index.html) and [`js/v4-arb-encoder.js`](js/v4-arb-encoder.js):
 plain JavaScript and the existing vendored ethers v5, with no install or CDN required.
 
+## Follow-up 6: All-pairs scanner, Manual mode (one-shot), hardening, Worker fallback
+
+**Mode** now offers **Auto-scan** (unchanged), **All pairs** (new) and **Manual** (re-added as a
+one-shot read). All V3 and V4 execution code, the monitor architecture of Auto-scan, the page layout,
+the wallet transfer and the activity log are unchanged; the 184 Node tests and 91 Foundry tests of
+the earlier follow-ups still pass alongside the new ones.
+
+### All pairs
+
+Token A (one field) against a **Token B list** (textarea, one address per line; default WETH
+`0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73` and USDG `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`),
+plus Window, Protocol and a **WATCH** button (`createAllPairsMonitor`, `parseTokenList`).
+
+- **Discovery, once per list change, one JSON-RPC batch:** for every Token B the pair is sorted by
+  BigInt; V3 `factory.getPool(token0, token1, fee)` for fees 100, 500, 3000, 10000; V4 `poolId` for the
+  seven tiers and `getLiquidity(poolId)` read through `PoolManager.extsload` at the liquidity slot
+  (`keccak256(abi.encode(poolId, 6)) + 3`, Uniswap's `StateLibrary.LIQUIDITY_OFFSET`; the deployed
+  PoolManager exposes no `getLiquidity(bytes32)` just as it exposes no `getSlot0`). Non-zero results
+  are kept (`liquidityStorageSlot`, `encodeLiquidityCall`, `decodeLiquidityWord`).
+- **Per poll (30 s), one batch:** latest block + **ONE** `eth_getLogs` with `address = [all V3
+  pools]`, `topics = [0xc42079f9…]` + **ONE** `eth_getLogs` with `address = PoolManager`, `topics =
+  [0x40e9cecb…]`, both over the window; V4 logs are filtered to our pool ids client-side. Then the
+  existing phase-2 health batch: swap-block timestamps (staleness as before), `liquidity()` of active
+  V3 pools, slot0 of active V4 pools. Price = 1.0001^tick of the latest swap, shown as currency1 per
+  currency0 after decimals, with the pair's symbols.
+- **Pool table:** Token B | Fee | Price | Swaps | Active? | Last Swap | Protocol.
+- **Spread table:** every pairwise combination of tradeable pools (`allPairsSpreads`). **Path** reads
+  e.g. `V3 0.05% (WETH) → V3 0.30% (USDG)`. Same-pair rows are the existing executable spreads
+  (click → quote → dry run → send, unchanged code path). Rows across different Token Bs are tagged
+  **3-LEG**, watch-only, no click: they compare Token A's price in two different quote tokens, which
+  a two-pool route cannot capture. Auto mode uses `allPairsAutoDecision`: same pair, same protocol only.
+
+### Manual mode (one-shot)
+
+Pool A + Pool B addresses and **READ PRICES**: one read, no polling (`manualMonitor.readOnce`).
+Each pool answers `token0()`, `token1()`, `fee()`, `slot0()` and now `liquidity()` (10 `eth_call`s,
+one at a time), symbols and decimals once. One spread row: GREEN rows execute through the existing
+V3 path; a pool with `liquidity() == 0` is shown **EMPTY** and the row cannot be selected or
+auto-executed. The follow-up 5 polling API (`start`) still exists for callers that want it.
+
+### Hardening
+
+- **30000/600 filter:** a V4 pool whose latest tick is ≤ -887000 is **EMPTY** (`DRAINED_TICK`,
+  `isDrained`) and excluded from spreads and auto mode; the live 30000/600 PONS/USDG pool sits at
+  -887272. V3 pools are not filtered.
+- **Gas estimate:** after a quote, `Gas: ~$X (250K gas V3 / 400K gas V4 × eth_gasPrice)` (a mixed
+  route is two transactions: 650K) and `Net after gas: $Y` (`estimateGasCost`, `netAfterGas`,
+  `fetchEthUsd`). Dollars assume **USDG = $1**; ETH is priced from the first V3 WETH/USDG pool with
+  liquidity (tiers 500, 3000, 100, 10000). When currency1 is neither USDG nor WETH, or no such pool
+  exists, the line says the USD figure is unavailable instead of guessing. For V4/V4 routes the
+  return leg is quoted for display only; the minimum return the transaction enforces is unchanged.
+- **Multi-tab lock:** `localStorage["ponsarb_lock"] = Date.now()` on send; on load a value younger
+  than 5 minutes written by another tab shows the banner **Another tab active** and disables dry run,
+  send and auto mode; `beforeunload` clears the tab's own lock (`createTabLock`). A tab never clears
+  another tab's lock.
+- **REVOKE ALL** (Section 2, shown when connected): `approve(SwapRouter02, 0)` then
+  `approve(Permit2, 0)` for the input token (currency1), each simulated, sent and confirmed before the
+  next; allowances already at 0 are skipped (`wallet.revokeAll`). Permit2's own allowance table is not
+  touched: with the ERC20 allowance at 0 the router cannot pull anyway; re-approve to trade again.
+
+### RPC and Worker fallback
+
+`RPC_URL` is now the brief's primary, `https://rpc-robinhood.blockmachine.io`; `RPC_FALLBACK_URL` is
+`https://robinhood.drpc.org`; the earlier `https://rpc.mainnet.chain.robinhood.com` stays as
+`RPC_LEGACY_URL`. The page's RPC client (`createRpcClient(..., { fallbackUrl })`) retries the same
+payload once against the fallback on HTTP 429 or 5xx and returns whichever succeeds; when both fail
+the primary's error is reported with the fallback's. `worker/rpc-proxy.js` is the same rule as a
+Cloudflare Worker (service-worker syntax, `worker/wrangler.toml`): POST JSON-RPC only, bodies
+forwarded unchanged (batches included), CORS headers, `x-rpc-upstream` / `x-rpc-fallback` headers.
+It is **not deployed** by this job; to use it, deploy it from the operator's own Cloudflare account
+and point `RPC_URL` at the Worker.
+
+### Follow-up 6 verification
+
+- `node --test js/test/*.test.js`: 202 cases. New: `allpairs.test.js` (list parsing, liquidity slot,
+  All pairs discovery and single-filter polling with pools from two Token Bs, V3/V4-only, back-off,
+  the drained-tick filter at -887272, gas estimate, multi-tab lock, client fallback, REVOKE ALL),
+  `worker.test.js` (healthy primary, 429/5xx/network fallback, relayed errors, input validation), and
+  UI tests for All pairs, the lock banner, REVOKE ALL and the manual EMPTY row. Two follow-up 5 UI
+  assertions changed with the brief: Manual mode no longer schedules a poll and reads 10 calls.
+- `forge build`, `forge test` (107 tests, 5 suites) with the fuzz seed given for this job and
+  `forge fmt --check` pass with the unchanged pinned solc 0.8.26. `src/AllPairsScanner.sol` and
+  `test/AllPairsScanner.t.sol` cover the liquidity slot, the drained-tick rule, pairwise counts and
+  3-LEG tagging, executable-route checks, gas units/cost/net and the lock freshness rule, success and
+  failure paths, 4 fuzz tests.
+- Live: the three RPC endpoints answered `eth_chainId = 0x1237` on 2026-11-08. No transaction was
+  sent and no live poll was recorded for this follow-up.
+
+### Follow-up 6 assumptions and deployment
+
+| Item | Value |
+| --- | --- |
+| Primary / fallback RPC | `https://rpc-robinhood.blockmachine.io` / `https://robinhood.drpc.org`, embedded; no key |
+| Worker | `worker/rpc-proxy.js`, optional, deployed by the operator (`npx wrangler deploy` in `worker/`); not deployed here |
+| V4 liquidity read | `extsload(slot0Slot + 3)`; relies on the deployed PoolManager's standard `pools` layout at slot 6 |
+| Drained tick | -887000 inclusive, V4 only |
+| Gas budget | 250K V3, 400K V4, 650K mixed, times `eth_gasPrice`; a display estimate, not a limit set on the transaction |
+| Dollar prices | USDG = $1; ETH from the V3 WETH/USDG pool's tick; others unavailable |
+| Lock | `localStorage` key `ponsarb_lock`, 5 minutes; same browser profile only, not across devices |
+| Default Token B list | WETH, USDG (user-editable) |
+
+Operators remain responsible for the Worker's deployment and its Cloudflare account, for watching
+both RPC providers' rate limits, for the fact that cross-pair 3-LEG rows are hints and not routes,
+for re-approving after REVOKE ALL, and for everything listed under "Operational responsibilities".
+
 ## Follow-up 5: Manual pool mode (eth_call only)
 
 A **Mode** field at the top of the page selects **Auto-scan** (everything the page did before,
@@ -863,7 +968,10 @@ These were visible on chain while testing. None of them is fixed by an encoder.
 | Path | What it is |
 |---|---|
 | `index.html` | live pool monitor, Manual pool mode, spread table, quote → Permit2 → dry run → send, auto mode, wallet transfer |
-| `js/v4-arb-encoder.js` | corrected encoder, Permit2 wallet client, pool monitor, manual pool reader, quote, transfers |
+| `js/v4-arb-encoder.js` | corrected encoder, Permit2 wallet client, pool monitor, all-pairs monitor, manual pool reader, quote, gas estimate, tab lock, revoke, transfers |
+| `worker/rpc-proxy.js`, `worker/wrangler.toml` | JSON-RPC proxy Worker: Blockmachine primary, one retry against dRPC on 429/5xx |
+| `js/test/allpairs.test.js`, `js/test/allpairs-mock.js`, `js/test/worker.test.js` | follow-up 6 tests and the multi-pair mock |
+| `src/AllPairsScanner.sol`, `test/AllPairsScanner.t.sol` | follow-up 6 reference arithmetic and its Foundry tests |
 | `js/test/manual.test.js` | Manual mode: address rule, the four reads, slot0 layouts, validation messages, monitor schedule, 10 cases |
 | `js/test/manual-mock.js` | pool-shaped eth_call double (token0 / token1 / fee / slot0), including the brief's two pools' live replies |
 | `scripts/verify-manual-live.js` | optional read-only live check of Manual mode; `docs/manual-live.json` is its output of 2026-11-07 |

@@ -1,0 +1,6 @@
+# Cloudflare Worker configuration for the JSON-RPC proxy (follow-up 6).
+# Deploy with `npx wrangler deploy` from this folder after logging in to the operator's own
+# Cloudflare account. No secrets, bindings or storage are needed: the Worker only relays requests.
+name = "ponsarb-rpc-proxy"
+main = "rpc-proxy.js"
+compatibility_date = "2025-01-01"

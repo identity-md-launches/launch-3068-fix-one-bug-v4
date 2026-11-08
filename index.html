@@ -41,6 +41,10 @@
     .bar { display: flex; flex-wrap: wrap; gap: 18px 32px; padding: 12px 16px; background: #182331; border: 1px solid #344356;
       border-radius: 12px; margin-top: 20px; }
     .bar div { min-width: 180px; }
+    textarea { box-sizing: border-box; width: 100%; margin-top: 6px; padding: 10px; background: #101721; color: inherit;
+      border: 1px solid #687e98; border-radius: 6px; font: inherit; min-height: 72px; }
+    .banner { border: 2px solid #ff8a7a; background: #3a1f1c; border-radius: 12px; padding: 14px 18px; margin-top: 20px; font-weight: 700; }
+    .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; background: #344356; font-size: .8rem; font-weight: 700; }
   </style>
 </head>
 <body>
@@ -52,6 +56,8 @@
   <p class="notice"><strong>Small-amount test.</strong> V4-only routes retain the default minimum return of 0.
     Routes involving V3 enforce the quoted return minus 0.5%. A GREEN verdict compares the last swap prices of two pools; it is not a guarantee of profit, and
     prices can move between the poll and your transaction.</p>
+  <p id="lock-banner" class="banner" role="alert" hidden>Another tab active: a transaction was sent from another tab of this page less than
+    5 minutes ago. Execution is disabled here until that lock expires or the other tab closes. Reload to check again.</p>
 
   <div class="bar" role="region" aria-label="Balances and polling status">
     <div><small>Token A balance</small><br><span id="bal-a">—</span></div>
@@ -64,10 +70,12 @@
   <section aria-labelledby="pair-heading">
     <h2 id="pair-heading">1. Token pair</h2>
     <div class="fields">
-      <label>Mode<select id="mode"><option value="Auto-scan" selected>Auto-scan</option><option value="Manual">Manual</option></select></label>
+      <label>Mode<select id="mode"><option value="Auto-scan" selected>Auto-scan</option><option value="All pairs">All pairs</option><option value="Manual">Manual</option></select></label>
       <label id="field-protocol">Protocol<select id="protocol"><option value="V4">V4</option><option value="V3">V3</option><option value="Both" selected>Both</option></select></label>
       <label id="field-token-a">Token A<input id="token-a" type="text" value="0x39dbed3a2bd333467115de45665cc57f813c4571" autocomplete="off" spellcheck="false"></label>
       <label id="field-token-b">Token B<input id="token-b" type="text" value="0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" autocomplete="off" spellcheck="false"></label>
+      <label id="field-token-b-list" hidden>Token B list (one address per line)<textarea id="token-b-list" autocomplete="off" spellcheck="false">0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73
+0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168</textarea></label>
       <div id="field-window"><label>Window (blocks)<input id="window-blocks" type="number" value="3000" min="50" max="50000" step="1" inputmode="numeric" autocomplete="off"></label></div>
       <label id="field-pool-a" hidden>Pool A (V3 pool address)<input id="pool-a" type="text" value="0x10cc6bd38112cac182db90b6a71d8bb5939526ba" autocomplete="off" spellcheck="false"></label>
       <label id="field-pool-b" hidden>Pool B (V3 pool address)<input id="pool-b" type="text" value="0xed50bdeea8adc232f159486192a4157281d722ff" autocomplete="off" spellcheck="false"></label>
@@ -83,10 +91,15 @@
     <p class="muted">V3 discovers fee tiers 0.01%, 0.05%, 0.30% and 1.00% once per pair change, scans their
       Swap logs together, and checks active liquidity. Both uses the same block window for both protocols.</p>
     </div>
-    <p id="manual-notes" class="muted" hidden>Manual mode reads each pool's token0(), token1(), fee() and slot0() with
-      plain eth_call every 30 s (8 calls, one at a time, never a batch, never eth_getLogs), plus symbol() and decimals()
-      of the two tokens once. Price = 1.0001^tick of slot0, shown as token1 per token0 after decimals. Both pools
-      must share token0 and token1 and have sqrtPriceX96 above 0. On an RPC error the page waits 60 s and reads again.</p>
+    <p id="manual-notes" class="muted" hidden>Manual mode reads each pool's token0(), token1(), fee(), slot0() and liquidity() with
+      plain eth_call once per click of READ PRICES (10 calls, one at a time, never a batch, never eth_getLogs, no polling), plus
+      symbol() and decimals() of the two tokens once. Price = 1.0001^tick of slot0, shown as token1 per token0 after decimals. Both pools
+      must share token0 and token1 and have sqrtPriceX96 above 0. A pool with liquidity() = 0 is shown EMPTY and cannot be executed.</p>
+    <p id="allpairs-notes" class="muted" hidden>All pairs watches Token A against every Token B in the list. Once per list change the
+      page discovers the V3 pools (factory.getPool for 0.01%, 0.05%, 0.30%, 1.00%) and the V4 pools with liquidity (getLiquidity through
+      extsload for the seven fee tiers) of every pair. Every 30 s it sends ONE eth_getLogs over all V3 pools and ONE over the PoolManager,
+      filtered to our pool ids, in a single batch, then the usual health batch. Spreads between pools of different Token Bs are tagged
+      3-LEG and are watch-only; same-pair spreads execute exactly as in Auto-scan.</p>
   </section>
 
   <section aria-labelledby="wallet-heading">
@@ -95,6 +108,12 @@
     <p id="account">Not connected. Select Robinhood Chain in your wallet.</p>
     <small>The connected account pays, receives both swaps, and owns the allowances. Polling and quoting use the
       public RPC and need no wallet.</small>
+    <div id="revoke-controls" hidden>
+      <button id="revoke-all" class="warn" type="button" disabled>REVOKE ALL</button>
+      <small>Sets the input token's (currency1, sold in swap 1) ERC20 allowance to SwapRouter02 and to Permit2 to 0, one
+        transaction after the other, each confirmed before the next. Allowances already at 0 are skipped.</small>
+      <p id="revoke-status" class="muted" role="status" aria-live="polite"></p>
+    </div>
   </section>
 
   <section aria-labelledby="pools-heading">
@@ -122,6 +141,18 @@
     <p id="manual-pools" class="muted">Pool A is the lower-priced pool (buy token0 there) and Pool B the higher-priced
       (sell there); the labels swap automatically when the pasted order is the other way round.</p>
     </div>
+    <div id="allpairs-view" hidden>
+    <table aria-describedby="pools-heading">
+      <thead><tr><th>Token B</th><th>Fee</th><th>Price</th><th id="allpairs-swaps-heading">Swaps (3000 blocks)</th><th>Active?</th><th>Last Swap</th><th>Protocol</th></tr></thead>
+      <tbody id="allpairs-pools-body"></tbody>
+    </table>
+    <h3>All pairwise spreads across active pools (click a same-pair row to select it)</h3>
+    <table aria-describedby="pools-heading">
+      <thead><tr><th>Path</th><th>Spread%</th><th>Fee Cost%</th><th>Net%</th><th>Verdict</th><th>Legs</th></tr></thead>
+      <tbody id="allpairs-spreads-body"></tbody>
+    </table>
+    <p id="allpairs-note" class="muted">No pools discovered yet.</p>
+    </div>
     <div class="fields">
       <label><input id="auto-mode" type="checkbox"> Auto mode: execute when Net% is above the threshold</label>
       <label>Net% threshold<input id="threshold" type="text" value="0.5" inputmode="decimal" autocomplete="off"></label>
@@ -138,6 +169,7 @@
     <h2 id="swap-heading">4. Quote, approve, simulate and send</h2>
     <details open><summary>Selected pools</summary><pre id="selected-pools">No spread selected.</pre></details>
     <p id="quote-info" class="muted">Select a spread row to quote swap 1.</p>
+    <p id="gas-info" class="muted"></p>
     <p id="route-warning" class="notice" hidden></p>
     <div class="fields">
       <label>Input, currency1 (sold in swap 1)<input id="amount-in" type="text" value="0.01" inputmode="decimal" autocomplete="off"></label>
@@ -170,6 +202,7 @@
         <dt>V3 Router</dt><dd><code id="v3-router-address"></code></dd>
         <dt>PoolManager</dt><dd><code id="pool-manager-address"></code></dd>
         <dt>RPC</dt><dd><code id="rpc-url"></code></dd>
+        <dt>RPC fallback</dt><dd><code id="rpc-fallback-url"></code></dd>
       </dl>
     </details>
     <h3>Activity</h3>
@@ -209,8 +242,11 @@
     let windowBlocks = E.LOG_WINDOW_BLOCKS;      // last valid field value; the next poll reads it
     let maxStaleness = E.MAX_STALENESS_SECONDS;  // last valid field value; a typo never loosens the guard
     let autoSkipsLogged = new Map();             // poolId → status already in the activity log
+    let tabLocked = false;                       // another tab sent a transaction less than 5 min ago
     const activity = [];
-    const rpc = E.createRpcClient(E.RPC_URL, typeof fetch === "function" ? fetch.bind(window) : undefined);
+    // Primary RPC first; an HTTP 429 / 5xx retries the same payload once against the fallback (follow-up 6).
+    const rpc = E.createRpcClient(E.RPC_URL, typeof fetch === "function" ? fetch.bind(window) : undefined, { fallbackUrl: E.RPC_FALLBACK_URL });
+    const tabLock = E.createTabLock(typeof window !== "undefined" && window.localStorage ? window.localStorage : null);
 
     function log(message) {
       activity.push(message);
@@ -223,16 +259,27 @@
     }
 
     function isManual() { return element("mode").value === "Manual"; }
+    function isAllPairs() { return element("mode").value === "All pairs"; }
 
-    /** The monitor of the current mode: the manual pool reader or the auto-scan log monitor. */
-    function activeState() { return isManual() ? manualMonitor.getState() : monitor.getState(); }
+    /** The monitor of the current mode: the manual pool reader, the all-pairs scanner or the auto-scan log monitor. */
+    function activeState() { return isManual() ? manualMonitor.getState() : isAllPairs() ? allPairsMonitor.getState() : monitor.getState(); }
 
-    function pair() { return activeState().pair; }
+    /** The pair a quote settles in. In All pairs it is the selected spread's pair, else the first pair of the list. */
+    function pair() {
+      if (!isAllPairs()) return activeState().pair;
+      if (selected && selected.buy.pair) return selected.buy.pair;
+      const state = allPairsMonitor.getState();
+      return state.pairs && state.pairs.length ? state.pairs[0].pair : null;
+    }
 
     /** The two tokens the balances and transfer buttons refer to: the fields, or the manual pools' pair. */
     function walletTokens() {
       const meta = isManual() ? manualMonitor.getState().pair : null;
       if (meta) return [meta.currency0, meta.currency1];
+      if (isAllPairs()) {
+        const current = pair();
+        return [element("token-a").value.trim(), current ? current.tokenB : (allPairsMonitor.getState().tokenBs[0] || element("token-b").value.trim())];
+      }
       return [element("token-a").value.trim(), element("token-b").value.trim()];
     }
 
@@ -256,17 +303,25 @@
       element("pool-b").disabled = busy;
       element("protocol").disabled = busy;
       element("mode").disabled = busy;
+      element("token-b-list").disabled = busy;
       const manual = isManual();
-      ["field-protocol", "field-token-a", "field-token-b", "field-window", "apply-pair", "auto-scan-notes", "auto-scan-view"]
-        .forEach((id) => { element(id).hidden = manual; });
+      const allPairs = isAllPairs();
+      ["field-protocol", "field-token-a", "field-window", "apply-pair"].forEach((id) => { element(id).hidden = manual; });
+      ["field-token-b", "auto-scan-notes", "auto-scan-view"].forEach((id) => { element(id).hidden = manual || allPairs; });
+      ["field-token-b-list", "allpairs-notes", "allpairs-view"].forEach((id) => { element(id).hidden = !allPairs; });
       ["field-pool-a", "field-pool-b", "read-prices", "manual-notes", "manual-view"].forEach((id) => { element(id).hidden = !manual; });
+      element("apply-pair").textContent = allPairs ? "WATCH" : "WATCH PAIR";
       const protocol = manual ? "V3" : element("protocol").value;
       element("permit2-controls").hidden = protocol === "V3";
       element("v3-controls").hidden = protocol === "V4";
+      element("lock-banner").hidden = !tabLocked;
       element("approve-permit2").disabled = !ready || !quoted || (E.protocolOf(selected.buy) === "V3" && E.protocolOf(selected.sell) === "V3");
       element("approve-v3-router").disabled = !ready || !quoted || (E.protocolOf(selected.buy) === "V4" && E.protocolOf(selected.sell) === "V4");
-      element("dry-run").disabled = !ready || !quoted;
-      element("send").disabled = !ready || !prepared;
+      element("dry-run").disabled = !ready || !quoted || tabLocked;
+      element("send").disabled = !ready || !prepared || tabLocked;
+      element("auto-mode").disabled = tabLocked;
+      element("revoke-controls").hidden = !account;
+      element("revoke-all").disabled = !ready || !pair();
       element("amount-in").disabled = busy;
       element("min-out").disabled = busy;
       element("threshold").disabled = busy;
@@ -289,6 +344,7 @@
       element("bridge-amount").value = "";
       element("quote-info").textContent = "Select a spread row to quote swap 1.";
       element("quote-info").className = "muted";
+      element("gas-info").textContent = "";
       element("approval-limits").textContent = "";
       element("route-warning").hidden = true;
       clearPrepared();
@@ -422,13 +478,116 @@
 
     function poolLabel(pool) {
       if (pool.manual) return "V3 " + E.formatManualFee(pool.fee) + " " + E.truncateAddress(pool.address);
+      if (pool.pair) return E.describeLeg(pool);
       return E.protocolOf(pool) === "V3" ? "V3 " + E.formatV3Fee(pool.fee) : pool.fee + " / " + pool.tickSpacing;
     }
 
     /** Re-render the spread rows of the current mode (selection highlight follows the quote). */
     function refreshSpreads() {
       if (isManual()) renderManual(manualMonitor.getState());
+      else if (isAllPairs()) renderAllPairsSpreads(allPairsMonitor.getState());
       else renderSpreads(monitor.getState());
+    }
+
+    // ------------------------------------------------------------------ all pairs (follow-up 6)
+
+    function renderAllPairsPools(state) {
+      const body = element("allpairs-pools-body");
+      body.replaceChildren();
+      state.pools.forEach((pool) => {
+        const row = document.createElement("tr");
+        cell(row, pool.pair.symbolB + " " + E.truncateAddress(pool.tokenB));
+        cell(row, E.protocolOf(pool) === "V3" ? E.formatV3Fee(pool.fee) : pool.fee + " / " + pool.tickSpacing);
+        cell(row, pool.displayPrice === null ? "—" : pool.displayPrice.toPrecision(6) + " " + pool.pair.symbol1 + "/" + pool.pair.symbol0 + " (tick " + pool.tick + ")");
+        cell(row, String(pool.swaps));
+        const marked = pool.status && pool.status !== "OK" && pool.status !== "INACTIVE";
+        cell(row, !pool.active ? "no (inactive)" : marked ? "yes · " + pool.status : "yes", !pool.active ? "muted" : marked ? "red" : "green");
+        if (pool.elapsedSeconds === null || pool.elapsedSeconds === undefined) cell(row, "—", "muted");
+        else cell(row, E.formatElapsed(pool.elapsedSeconds), E.stalenessColor(pool.elapsedSeconds));
+        cell(row, E.protocolOf(pool));
+        body.appendChild(row);
+      });
+    }
+
+    function renderAllPairsSpreads(state) {
+      const body = element("allpairs-spreads-body");
+      body.replaceChildren();
+      const spreads = state.pools.length ? E.allPairsSpreads(state.pools, thresholdOrDefault()) : [];
+      spreads.forEach((spread) => {
+        const row = document.createElement("tr");
+        const isSelected = selected && selected.buy.poolId === spread.buy.poolId && selected.sell.poolId === spread.sell.poolId;
+        row.className = (spread.crossPair ? "" : "selectable") + (isSelected ? " selected" : "");
+        cell(row, spread.path);
+        cell(row, spread.spreadPercent.toFixed(3));
+        cell(row, spread.feeCostPercent.toFixed(3));
+        cell(row, spread.netPercent.toFixed(3));
+        cell(row, spread.verdict, spread.verdict === "GREEN" ? "green" : "red");
+        if (spread.crossPair) {
+          cell(row, "3-LEG · watch-only", "tag");
+        } else {
+          cell(row, "2-LEG · " + E.protocolOf(spread.buy) + " → " + E.protocolOf(spread.sell) + " · click to quote");
+          row.tabIndex = 0;
+          row.addEventListener("click", () => selectSpread(spread));
+          row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") selectSpread(spread); });
+        }
+        body.appendChild(row);
+      });
+      const active = state.pools.filter((pool) => pool.active).length;
+      const tradeable = state.pools.filter((pool) => pool.status === "OK").length;
+      const cross = spreads.filter((spread) => spread.crossPair).length;
+      element("allpairs-note").textContent = spreads.length
+        ? spreads.length + " spread(s) from " + tradeable + " tradeable pool(s) across " + (state.pairs ? state.pairs.length : 0) + " pair(s): " +
+          (spreads.length - cross) + " executable same-pair, " + cross + " cross-pair 3-LEG (watch-only). Same-pair rows buy currency0 where it is cheaper and sell where it is dearer."
+        : "No tradeable spreads. Pools discovered: " + (state.discovered ? state.discovered.v3 + " V3, " + state.discovered.v4 + " V4 (with liquidity)" : "none yet") +
+          " · active: " + active + ", tradeable: " + tradeable + ".";
+      return spreads;
+    }
+
+    function renderAllPairs(state) {
+      const when = (ms) => new Date(ms).toISOString().replace("T", " ").slice(0, 19) + " UTC";
+      if (state.pairs) {
+        element("pair-info").textContent = "Token A " + state.tokenA + " against " + state.pairs.map((entry) => entry.pair.symbolB).join(", ") +
+          " · " + state.discovered.v3 + " V3 pool(s) and " + state.discovered.v4 + " V4 pool(s) with liquidity discovered.";
+      }
+      if (state.lastError) {
+        element("poll-status").textContent = "All pairs · RPC error, retrying in " + Math.round(E.RPC_RETRY_MS / 1000) + "s — " + state.lastError +
+          (state.lastPoll ? " · last successful poll " + when(state.lastPoll) : " · no successful poll yet") + " · errors: " + state.errors;
+        element("poll-status").className = "error";
+      } else if (state.lastPoll) {
+        element("poll-status").textContent = "All pairs · last poll " + when(state.lastPoll) + " · block " + state.blockNumber + " · window " + state.windowBlocks +
+          " blocks (" + state.fromBlock + "–" + state.blockNumber + ") · " + state.pools.filter((pool) => pool.active).length + " active pool(s) · 1 eth_getLogs per protocol · next poll in " +
+          Math.round(E.POLL_INTERVAL_MS / 1000) + "s";
+        element("poll-status").className = "success";
+      }
+      if (state.windowBlocks) element("allpairs-swaps-heading").textContent = "Swaps (" + state.windowBlocks + " blocks)";
+      renderAllPairsPools(state);
+      renderAllPairsSpreads(state);
+      if (!state.lastError) maybeAutoExecute(state);
+    }
+
+    const allPairsMonitor = E.createAllPairsMonitor({ request: rpc.request, batchRequest: rpc.batchRequest,
+      thresholdPercent: thresholdOrDefault, windowBlocks: () => windowBlocks,
+      maxStalenessSeconds: () => maxStaleness, onUpdate: renderAllPairs });
+
+    function startAllPairs() {
+      monitor.stop();
+      manualMonitor.stop();
+      clearSelection();
+      renderAllPairsPools({ pools: [] });
+      renderAllPairsSpreads({ pools: [], pairs: null, discovered: null });
+      try {
+        element("poll-status").textContent = "All pairs · discovering pools and polling…";
+        element("poll-status").className = "muted";
+        allPairsMonitor.start(element("token-a").value.trim(), element("token-b-list").value, element("protocol").value).then(() => refreshBalances()).catch((error) => {
+          element("poll-status").textContent = error.message;
+          element("poll-status").className = "error";
+        });
+      } catch (error) {
+        allPairsMonitor.stop();
+        element("poll-status").textContent = error.message;
+        element("poll-status").className = "error";
+        element("pair-info").textContent = "Not watching. Fix Token A or the Token B list and click WATCH.";
+      }
     }
 
     function renderPools(state) {
@@ -519,43 +678,51 @@
       }
       if (state.spread && state.pools.length === 2 && !state.lastError) {
         const spread = E.manualSpread(state.pools[0], state.pools[1], thresholdOrDefault());
+        // Follow-up 6: a pool whose liquidity() is 0 is EMPTY; the row is shown but cannot be selected.
+        const empty = state.pools.some((pool) => pool.status === "EMPTY");
         const row = document.createElement("tr");
-        row.className = "selectable" + (selected && selected.buy.poolId === spread.buy.poolId && selected.sell.poolId === spread.sell.poolId ? " selected" : "");
-        row.tabIndex = 0;
-        const describe = (pool) => E.formatManualFee(pool.fee) + " · " + pool.displayPrice.toPrecision(6) + " (tick " + pool.tick + ") · " + E.truncateAddress(pool.address);
+        row.className = (empty ? "" : "selectable") + (selected && selected.buy.poolId === spread.buy.poolId && selected.sell.poolId === spread.sell.poolId ? " selected" : "");
+        const describe = (pool) => E.formatManualFee(pool.fee) + " · " + pool.displayPrice.toPrecision(6) + " (tick " + pool.tick + ") · " + E.truncateAddress(pool.address) +
+          (pool.status === "EMPTY" ? " · EMPTY (liquidity 0)" : "");
         cell(row, describe(spread.buy));
         cell(row, describe(spread.sell));
         cell(row, spread.spreadPercent.toFixed(3));
         cell(row, spread.feeCostPercent.toFixed(3));
         cell(row, spread.netPercent.toFixed(3));
-        cell(row, spread.verdict, spread.verdict === "GREEN" ? "green" : "red");
-        row.addEventListener("click", () => selectSpread(spread));
-        row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") selectSpread(spread); });
+        cell(row, empty ? "EMPTY" : spread.verdict, !empty && spread.verdict === "GREEN" ? "green" : "red");
+        if (!empty) {
+          row.tabIndex = 0;
+          row.addEventListener("click", () => selectSpread(spread));
+          row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") selectSpread(spread); });
+        }
         body.appendChild(row);
         element("manual-pools").textContent = "Pool A (buy) " + spread.buy.address + " · Pool B (sell) " + spread.sell.address +
           (spread.buy.address !== state.addresses[0] ? " · labels swapped: the pasted Pool B has the lower price." : "") +
           " Pool A is the lower-priced pool (buy " + state.pair.symbol0 + " there) and Pool B the higher-priced (sell there).";
       }
       if (state.lastError) {
-        element("manual-status").textContent = state.lastError + (state.errorCode === "RPC" ? " · RPC error, retrying in " + Math.round(E.RPC_RETRY_MS / 1000) + "s" :
-          " · next read in " + Math.round(E.POLL_INTERVAL_MS / 1000) + "s") + " · errors: " + state.errors;
+        element("manual-status").textContent = state.lastError + " · click READ PRICES to read again · errors: " + state.errors;
         element("manual-status").className = "error";
         element("poll-status").textContent = "Manual mode · " + state.lastError;
         element("poll-status").className = "error";
       } else if (state.lastRead) {
-        element("manual-status").textContent = "Read " + state.pools.length + " pools with eth_call only · next read in " + Math.round(E.POLL_INTERVAL_MS / 1000) + "s";
-        element("manual-status").className = "success";
-        element("poll-status").textContent = "Manual mode · " + E.formatLastRead(0) + " · 8 eth_calls per read, no eth_getLogs";
+        const empty = state.pools.filter((pool) => pool.status === "EMPTY").length;
+        element("manual-status").textContent = "Read " + state.pools.length + " pools with eth_call only (one-shot, no polling)" +
+          (empty ? " · " + empty + " pool(s) EMPTY: liquidity() = 0, execution disabled" : "") + " · click READ PRICES to read again";
+        element("manual-status").className = empty ? "error" : "success";
+        element("poll-status").textContent = "Manual mode · " + E.formatLastRead(0) + " · 10 eth_calls per read, no eth_getLogs, no polling";
         element("poll-status").className = "success";
       }
       renderLastRead(state);
-      if (!state.lastError) maybeAutoExecute(state);
+      if (!state.lastError && !state.pools.some((pool) => pool.status === "EMPTY")) maybeAutoExecute(state);
     }
 
-    const manualMonitor = E.createManualMonitor({ request: rpc.request, thresholdPercent: thresholdOrDefault, onUpdate: renderManual });
+    // Follow-up 6: READ PRICES is one shot (readOnce) and also reads liquidity() of both pools.
+    const manualMonitor = E.createManualMonitor({ request: rpc.request, thresholdPercent: thresholdOrDefault, onUpdate: renderManual, liquidity: true });
 
     function startManual() {
       monitor.stop();
+      allPairsMonitor.stop();
       clearSelection();
       element("manual-body").replaceChildren();
       element("manual-last-read").textContent = "";
@@ -564,7 +731,9 @@
         element("manual-status").className = "muted";
         element("poll-status").textContent = "Manual mode · reading pools with eth_call…";
         element("poll-status").className = "muted";
-        manualMonitor.start(element("pool-a").value, element("pool-b").value).then(() => refreshBalances()).catch((error) => {
+        E.parseManualPoolAddress(element("pool-a").value, "Pool A"); // synchronous 42-char check: a bad field requests nothing
+        E.parseManualPoolAddress(element("pool-b").value, "Pool B");
+        manualMonitor.readOnce(element("pool-a").value, element("pool-b").value).then(() => refreshBalances()).catch((error) => {
           element("manual-status").textContent = error.message;
           element("manual-status").className = "error";
         });
@@ -580,6 +749,7 @@
 
     function startMonitor() {
       manualMonitor.stop();
+      allPairsMonitor.stop();
       clearSelection();
       // Remove selectable rows from the previous pair/protocol while discovery is in flight.
       renderPools({ pools: [] });
@@ -603,10 +773,47 @@
 
     // ------------------------------------------------------------------ spreads → execution
 
+    /**
+     * Follow-up 6: after a quote, "Gas: ~$X (gas units × eth_gasPrice)" and "Net after gas: $Y". The
+     * return of the sell leg is quoted for display when the route did not quote it already (V4/V4).
+     * Display only: it never changes the amounts or minimums the transaction is built with.
+     */
+    async function showGasEstimate(spread, meta) {
+      element("gas-info").textContent = "Estimating gas…";
+      element("gas-info").className = "muted";
+      try {
+        const gasPrice = await rpc.request("eth_gasPrice", []);
+        const ethUsd = await E.fetchEthUsd(rpc.request);
+        const estimate = E.estimateGasCost(spread.buy, spread.sell, gasPrice, ethUsd);
+        const units = E.protocolOf(spread.buy) === E.protocolOf(spread.sell) ? (E.gasUnitsFor(spread.buy, spread.sell) / 1000) + "K gas " + E.protocolOf(spread.buy)
+          : "250K gas V3 + 400K gas V4";
+        let text = "Gas: " + (estimate.costUsd === null ? estimate.costEth.toPrecision(4) + " ETH (USD unavailable: no WETH/USDG V3 pool price)" : "~" + E.formatUsd(estimate.costUsd)) +
+          " (" + units + " × eth_gasPrice " + ethers.utils.formatUnits(estimate.gasPrice, "gwei") + " gwei).";
+        let expectedReturn = selected.finalQuote || null;
+        if (!expectedReturn && selected.bridgeAmount) {
+          try { expectedReturn = await E.quotePool(rpc.request, spread.sell, true, selected.bridgeAmount, account || undefined); } catch (error) { expectedReturn = null; }
+        }
+        if (expectedReturn) {
+          const net = E.netAfterGas(selected.amountIn, expectedReturn, meta.decimals1, meta.currency1, estimate, ethUsd);
+          text += " Expected return " + format(expectedReturn, meta.decimals1) + " " + meta.symbol1 + " for " + format(selected.amountIn, meta.decimals1) + " " + meta.symbol1 +
+            " (" + (net.profitToken >= 0 ? "+" : "") + net.profitToken.toPrecision(4) + " " + meta.symbol1 + ").";
+          text += net.netUsd === null ? " Net after gas: USD unavailable for " + meta.symbol1 + "."
+            : " Net after gas: " + E.formatUsd(net.netUsd) + (net.netUsd < 0 ? " (gas exceeds the expected gain)." : ".");
+          selected.netAfterGasUsd = net.netUsd;
+        } else text += " Net after gas: no return quote available.";
+        element("gas-info").textContent = text;
+        element("gas-info").className = selected.netAfterGasUsd !== undefined && selected.netAfterGasUsd !== null && selected.netAfterGasUsd < 0 ? "error" : "muted";
+      } catch (error) {
+        element("gas-info").textContent = "Gas estimate unavailable: " + error.message;
+        element("gas-info").className = "error";
+      }
+    }
+
     async function quoteSpread(spread) {
       clearSelection();
-      const meta = pair();
+      const meta = spread.buy.pair || pair();
       if (!meta) throw new Error("Wait for the pair's symbols and decimals to load.");
+      if (spread.crossPair) throw new Error("Cross-pair (3-LEG) spreads are watch-only and cannot be executed.");
       const inText = element("amount-in").value.trim();
       const inPattern = new RegExp("^\\d+(\\.\\d{1," + Math.max(meta.decimals1, 1) + "})?$");
       if (!inPattern.test(inText)) throw new Error("Enter an input amount with up to " + meta.decimals1 + " decimals.");
@@ -646,6 +853,7 @@
         (!mixed ? " The atomic V3 path sells the entire first-hop output." : "");
       element("quote-info").className = "success";
       updateLimits();
+      await showGasEstimate(spread, meta);
       showStatus("Spread selected and quoted. Approve the required router if needed, then dry run.");
       return selected;
     }
@@ -667,6 +875,13 @@
     async function send() {
       const candidate = prepared;
       prepared = null;
+      // Follow-up 6 multi-tab lock: refuse when another tab sent less than 5 minutes ago; else mark this tab as the sender.
+      if (tabLock.heldElsewhere()) {
+        tabLocked = true;
+        render();
+        throw new Error("Another tab active: a transaction was sent from another tab less than 5 minutes ago. Nothing sent.");
+      }
+      tabLock.acquire();
       showStatus("Rechecking allowances and eth_call, then waiting for your wallet and receipt…");
       try {
         const receipt = await wallet.sendRoute(candidate);
@@ -687,8 +902,9 @@
     }
 
     function maybeAutoExecute(state) {
-      if (!auto || busy) return;
-      const decision = E.protocolAutoDecision(state.pools, thresholdOrDefault());
+      if (!auto || busy || tabLocked) return;
+      // All pairs: only same-pair, same-protocol spreads; cross-pair 3-LEG rows are never executed.
+      const decision = isAllPairs() ? E.allPairsAutoDecision(state.pools, thresholdOrDefault()) : E.protocolAutoDecision(state.pools, thresholdOrDefault());
       logAutoSkips(decision.skips);
       const best = decision.spread;
       if (!best || !account || !wallet || pendingHash) return;
@@ -720,16 +936,36 @@
       showStatus("Connected on Robinhood Chain. Select a spread, approve Permit2 if needed, then dry run.");
     }));
 
-    element("apply-pair").addEventListener("click", () => { if (!busy && !isManual()) startMonitor(); });
-    element("protocol").addEventListener("change", () => { if (!busy && !isManual()) startMonitor(); });
+    function startCurrentMode() {
+      if (isManual()) startManual();
+      else if (isAllPairs()) startAllPairs();
+      else startMonitor();
+    }
+
+    element("apply-pair").addEventListener("click", () => { if (!busy && !isManual()) startCurrentMode(); });
+    element("protocol").addEventListener("change", () => { if (!busy && !isManual()) startCurrentMode(); });
     element("read-prices").addEventListener("click", () => { if (!busy && isManual()) startManual(); });
     element("mode").addEventListener("change", () => {
       if (busy) return;
       render();
       log("Mode: " + element("mode").value + ".");
-      if (isManual()) startManual();
-      else startMonitor();
+      startCurrentMode();
     });
+
+    // Follow-up 6 REVOKE ALL: approve(SwapRouter02, 0) then approve(Permit2, 0) for the input token (currency1).
+    element("revoke-all").addEventListener("click", () => runAction(async () => {
+      clearPrepared();
+      const meta = pair();
+      if (!meta) throw new Error("Wait for the pair's symbols and decimals to load.");
+      element("revoke-status").textContent = "Revoking " + meta.symbol1 + " allowances: V3 Router first, then Permit2. Confirm each in your wallet…";
+      element("revoke-status").className = "muted";
+      const done = await wallet.revokeAll(meta.currency1, meta.symbol1);
+      element("revoke-status").textContent = done.length ? meta.symbol1 + " allowances revoked: " + done.map((entry) => (entry.spender === E.V3_ROUTER ? "V3 Router " : "Permit2 ") + entry.hash).join(" · ")
+        : meta.symbol1 + " allowances to V3 Router and Permit2 were already 0; nothing sent.";
+      element("revoke-status").className = "success";
+      showStatus("REVOKE ALL finished for " + meta.symbol1 + ". Approvals are needed again before the next swap.");
+      clearSelection();
+    }).then((ok) => { if (!ok) { element("revoke-status").textContent = "Revoke failed: " + element("status").textContent; element("revoke-status").className = "error"; } }));
     // The "Last read: Xs ago" line ticks every second in a browser; nothing is requested by the tick.
     if (typeof setInterval === "function") {
       setInterval(() => { if (isManual()) renderLastRead(manualMonitor.getState()); }, 1000);
@@ -802,6 +1038,10 @@
       E.annotatePools(state.pools, maxStaleness);
       renderPools(state);
       renderSpreads(state);
+      const all = allPairsMonitor.getState();
+      E.annotatePools(all.pools, maxStaleness);
+      renderAllPairsPools(all);
+      renderAllPairsSpreads(all);
     });
 
     element("auto-mode").addEventListener("change", () => {
@@ -846,8 +1086,14 @@
     element("transfer-eth").addEventListener("click", () => transfer("ETH transfer", (to) => wallet.transferAllEth(to)));
 
     [["permit2-address", E.PERMIT2], ["router-address", E.ROUTER], ["pool-manager-address", E.POOL_MANAGER], ["rpc-url", E.RPC_URL],
-      ["v3-factory-address", E.V3_FACTORY], ["v3-router-address", E.V3_ROUTER]]
+      ["rpc-fallback-url", E.RPC_FALLBACK_URL], ["v3-factory-address", E.V3_FACTORY], ["v3-router-address", E.V3_ROUTER]]
       .forEach(([id, value]) => { element(id).textContent = value; });
+    // Follow-up 6 multi-tab lock: a send from another tab less than 5 minutes ago disables execution here.
+    tabLocked = tabLock.heldElsewhere();
+    if (tabLocked) log("Another tab active: execution disabled in this tab (lock " + E.LOCK_KEY + " younger than 5 minutes).");
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      window.addEventListener("beforeunload", () => { tabLock.release(); });
+    }
     element("protocol").value = "Both";
     element("mode").value = "Auto-scan";
     render();

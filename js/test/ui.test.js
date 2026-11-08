@@ -21,6 +21,7 @@ function node(tag, attributes = {}) {
     value: attributes.value || "",
     disabled: attributes.disabled || false,
     checked: attributes.checked || false,
+    hidden: attributes.hidden || false,
     className: "",
     children: [],
     listeners: {},
@@ -34,7 +35,7 @@ function node(tag, attributes = {}) {
   };
 }
 
-function loadPage(provider = new MockWallet(), { noWallet = false } = {}) {
+function loadPage(provider = new MockWallet(), { noWallet = false, storage = undefined } = {}) {
   const root = path.resolve(__dirname, "../..");
   const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
   const elements = new Map();
@@ -44,10 +45,13 @@ function loadPage(provider = new MockWallet(), { noWallet = false } = {}) {
       value: /\bvalue="([^"]*)"/.exec(tag)?.[1] || "",
       disabled: /\bdisabled\b/.test(tag),
       checked: /\bchecked\b/.test(tag),
+      hidden: /\bhidden\b/.test(tag),
     });
     created.textContent = (/^([^<]*)</.exec(html.slice(match.index + tag.length))?.[1] || "").trim();
+    if (created.tagName === "textarea") created.value = created.textContent; // a textarea's default value is its content
     elements.set(match[1], created);
   }
+  const windowListeners = {};
   const document = {
     getElementById: (id) => { assert.ok(elements.has(id), "Missing DOM element " + id); return elements.get(id); },
     createElement: (tag) => node(tag),
@@ -59,7 +63,8 @@ function loadPage(provider = new MockWallet(), { noWallet = false } = {}) {
   class FakeDate extends Date { static now() { clock += 10000; return clock; } }
   const context = vm.createContext({
     document,
-    window: { ethereum: noWallet ? undefined : provider, crypto: globalThis.crypto, fetch: provider.fetch },
+    window: { ethereum: noWallet ? undefined : provider, crypto: globalThis.crypto, fetch: provider.fetch, localStorage: storage,
+      addEventListener: (event, listener) => { windowListeners[event] = listener; } },
     fetch: provider.fetch,
     // Short delays run now (receipt polling); long ones (poll / retry) are fired by the test.
     setTimeout: (fn, ms) => { if (ms >= 5000) { const id = nextId++; timers.push({ id, fn, ms }); return id; } return setImmediate(fn); },
@@ -88,7 +93,7 @@ function loadPage(provider = new MockWallet(), { noWallet = false } = {}) {
     await until(() => timers.length > 0, "the next poll to be scheduled");
     await flush(5);
   };
-  return { provider, element: document.getElementById, context, html, timers, flush, until, poll };
+  return { provider, element: document.getElementById, context, html, timers, flush, until, poll, windowListeners, storage };
 }
 
 /** A page whose first poll has finished. */
@@ -918,17 +923,20 @@ test("V3 auto mode executes only one atomic route while the receipt is pending, 
 const { ManualMock, liveManualMock, pool: manualPool, LIVE_POOL_A, LIVE_POOL_B, WETH: MANUAL_WETH, PONS: MANUAL_PONS } = require("./manual-mock.js");
 const { poolA: MANUAL_POOL_A, poolB: MANUAL_POOL_B } = require("./v3-mock.js");
 
+// Follow-up 6: Manual mode is one-shot (no poll timer), so a manual read is "done" when its status settles.
+const manualSettled = (page) => !/Reading both pools…/.test(page.element("manual-status").textContent);
+
 async function chooseMode(page, mode) {
   page.element("mode").value = mode;
   page.element("mode").change(false);
-  await page.until(() => page.timers.length > 0, "mode restart");
+  await page.until(() => mode === "Manual" ? manualSettled(page) : page.timers.length > 0, "mode restart");
   await page.flush();
 }
 
 async function readPrices(page) {
   const before = page.provider.rpcCalls.length;
   await page.element("read-prices").click();
-  await page.until(() => page.timers.length > 0 || /Enter a 42-char/.test(page.element("manual-status").textContent), "manual read");
+  await page.until(() => manualSettled(page) || /Enter a 42-char/.test(page.element("manual-status").textContent), "manual read");
   await page.flush();
   return page.provider.rpcCalls.slice(before);
 }
@@ -957,9 +965,9 @@ test("Manual mode hides the pair fields, stops the log scan, reads both pools wi
   assert.ok(since.length >= 12, "calls since switching: " + JSON.stringify(since.map((c) => c.method + " " + (c.params[0] && c.params[0].to) + " " + (c.params[0] && c.params[0].data && c.params[0].data.slice(0, 10)))));
   assert.ok(since.every((c) => c.method === "eth_call"), "only eth_call in manual mode");
   assert.ok(provider.httpCalls.slice(httpBefore).every((c) => !Array.isArray(c.body)), "no JSON-RPC batch in manual mode");
-  assert.equal(provider.manualCalls.length, 8);
+  assert.equal(provider.manualCalls.length, 10, "token0, token1, fee, slot0 and liquidity() of both pools (follow-up 6)");
   assert.equal(provider.calls.length, 0, "no wallet call");
-  assert.deepEqual(timers.map((t) => t.ms), [E.POLL_INTERVAL_MS], "the log monitor's timer is gone; one manual poll is scheduled");
+  assert.deepEqual(timers.map((t) => t.ms), [], "the log monitor's timer is gone and READ PRICES is one-shot: no manual poll is scheduled (follow-up 6)");
   const rows = element("manual-body").children;
   assert.equal(rows.length, 1);
   assert.match(rows[0].children[0].textContent, /^0\.30% · 0\.19030\d* \(tick -292916\) · 0x0652…BAF3$/);
@@ -969,12 +977,13 @@ test("Manual mode hides the pair fields, stops the log scan, reads both pools wi
   assert.match(element("pair-info").textContent, /^Pair PONS\/USDG · token0 = PONS \(0x39dBED3a2bd333467115dE45665cC57F813C4571, 18 decimals\) · token1 = USDG/);
   assert.match(element("manual-last-read").textContent, /^Last read: \d+s ago$/);
   assert.match(element("manual-status").textContent, /Read 2 pools with eth_call only/);
-  assert.match(element("poll-status").textContent, /^Manual mode · Last read: 0s ago · 8 eth_calls per read, no eth_getLogs$/);
+  assert.match(element("poll-status").textContent, /^Manual mode · Last read: 0s ago · 10 eth_calls per read, no eth_getLogs, no polling$/);
   assert.match(element("manual-pools").textContent, /Pool A \(buy\) 0x0652d61511f3A96B8721bE6825680F5954D9BAF3 · Pool B \(sell\) 0x7A192E71564ec66eE0763e328a3Ac274942dE4e1/);
-  // The next poll re-reads the eight pool values and nothing else: symbols and decimals are cached.
+  // Another click of READ PRICES re-reads the ten pool values and nothing else: symbols and decimals are cached.
   const beforePoll = provider.rpcCalls.length;
-  await poll();
-  assert.equal(provider.rpcCalls.length - beforePoll, 8);
+  await readPrices(page);
+  assert.equal(provider.rpcCalls.length - beforePoll, 10);
+  assert.equal(timers.length, 0, "still no timer after a second one-shot read");
   assert.equal(provider.symbolCalls - symbolsBefore, 2, "symbol() read once per token in manual mode");
   assert.ok(provider.rpcCalls.slice(before).every((c) => c.method === "eth_call"));
   // Back to Auto-scan: the manual view goes, the log scan resumes.
@@ -1053,7 +1062,7 @@ test("Manual mode shows the brief's errors: different pairs, invalid address, 42
 
   element("pool-b").value = MANUAL_POOL_A; // PONS/USDG
   await readPrices(page);
-  assert.match(element("manual-status").textContent, /^Pools are different pairs · next read in 30s/);
+  assert.match(element("manual-status").textContent, /^Pools are different pairs · click READ PRICES to read again/);
   assert.equal(element("manual-status").className, "error");
   assert.equal(element("manual-body").children.length, 0, "no row for an invalid pair");
   assert.match(element("poll-status").textContent, /Manual mode · Pools are different pairs/);
@@ -1090,4 +1099,153 @@ test("Manual mode shows the brief's errors: different pairs, invalid address, 42
   await element("connect").click();
   assert.equal(element("mode").disabled, false);
   assert.equal(element("pool-a").disabled, false);
+});
+
+// ------------------------------------------------------------------ Follow-up 6: All pairs, hardening
+
+const { AllPairsMock, WETH: AP_WETH, PONS: AP_PONS, USDG: AP_USDG } = require("./allpairs-mock.js");
+
+/** An All-pairs fixture: PONS against WETH and USDG with active pools in both pairs. */
+function allPairsProvider() {
+  const p = new AllPairsMock();
+  const pu = E.sortPair(AP_PONS, AP_USDG), wp = E.sortPair(AP_WETH, AP_PONS);
+  p.setV4Liquidity({ currency0: pu.currency0, currency1: pu.currency1, fee: 3000, tickSpacing: 60, hooks: E.NO_HOOKS }, 1000);
+  p.setV4Liquidity({ currency0: pu.currency0, currency1: pu.currency1, fee: 30000, tickSpacing: 600, hooks: E.NO_HOOKS }, 7);
+  p.addSwap(3000, 60, -292916);
+  p.addSwap(30000, 600, -887272);
+  p.addV3Swap(3000, -292916);
+  p.addV3Swap(10000, -292000);
+  p.v3Logs.push({ address: "0x1111111111111111111111111111111111111111", topics: [E.V3_SWAP_TOPIC, ethers.utils.hexZeroPad(CALLER, 32), ethers.utils.hexZeroPad(CALLER, 32)],
+    data: ethers.utils.defaultAbiCoder.encode(["int256", "int256", "uint160", "uint128", "int24"], [1, -1, ethers.BigNumber.from(2).pow(96), 1, 93992]),
+    blockNumber: ethers.utils.hexValue(p.block), logIndex: "0x9" });
+  return p;
+}
+
+test("All pairs mode shows pools from several Token Bs, tags cross-pair spreads 3-LEG without execution, and quotes a same-pair row with a gas line", async () => {
+  const provider = allPairsProvider();
+  const page = await readyPage(provider), { element, timers, flush } = page;
+  assert.equal(element("token-b-list").value, "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73\n0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", "the brief's default list");
+  await chooseMode(page, "All pairs");
+  for (const id of ["field-token-a", "field-token-b-list", "field-protocol", "field-window", "apply-pair", "allpairs-view", "allpairs-notes"]) {
+    assert.equal(element(id).hidden, false, id + " shown in All pairs");
+  }
+  for (const id of ["field-token-b", "auto-scan-view", "manual-view", "field-pool-a"]) assert.equal(element(id).hidden, true, id + " hidden in All pairs");
+  assert.equal(element("apply-pair").textContent, "WATCH");
+  assert.deepEqual(timers.map((t) => t.ms), [E.POLL_INTERVAL_MS]);
+  const rows = element("allpairs-pools-body").children;
+  const tokenBs = new Set(rows.map((row) => row.children[0].textContent.split(" ")[0]));
+  assert.deepEqual([...tokenBs].sort(), ["USDG", "WETH"], "pools of both Token Bs in one table");
+  assert.equal(rows.length, 6, "2 V4 + 2 V3 PONS/USDG, 2 V3 WETH/PONS");
+  const drained = rows.find((row) => row.children[1].textContent === "30000 / 600");
+  assert.equal(drained.children[4].textContent, "yes · EMPTY", "tick -887272 is EMPTY");
+  assert.match(drained.children[2].textContent, /tick -887272/);
+  assert.match(element("pair-info").textContent, /Token A .* against WETH, USDG · 4 V3 pool\(s\) and 2 V4 pool\(s\) with liquidity discovered/);
+  assert.match(element("poll-status").textContent, /^All pairs · last poll .* 1 eth_getLogs per protocol/);
+  // ONE V3 filter over all pools and ONE V4 filter on the PoolManager per poll.
+  const filters = provider.getLogsFilters.slice(-2);
+  assert.ok(filters.some((f) => Array.isArray(f.address) && f.address.length === 4));
+  assert.ok(filters.some((f) => !Array.isArray(f.address) && f.topics.length === 1));
+  const spreads = element("allpairs-spreads-body").children;
+  const cross = spreads.filter((row) => row.children[5].textContent.startsWith("3-LEG"));
+  const same = spreads.filter((row) => row.children[5].textContent.startsWith("2-LEG"));
+  assert.equal(cross.length, 3, "3 OK pools in PONS/USDG × 1 OK pool in WETH/PONS");
+  assert.equal(same.length, 3, "3 pairwise combos of the PONS/USDG OK pools");
+  assert.ok(cross.every((row) => !row.listeners.click && row.className === ""), "3-LEG rows cannot be clicked");
+  assert.ok(cross.every((row) => /\(WETH\)/.test(row.children[0].textContent) && /\(USDG\)/.test(row.children[0].textContent)), "Path names both Token Bs");
+  assert.ok(same.every((row) => row.listeners.click), "same-pair rows are selectable");
+  assert.match(element("allpairs-note").textContent, /6 spread\(s\) from 4 tradeable pool\(s\) across 2 pair\(s\): 3 executable same-pair, 3 cross-pair 3-LEG/);
+  // Click a same-pair row: quote, then the gas estimate line.
+  const v4v4 = same.find((row) => /^V4 3000\/60 \(USDG\) → V3 1\.00% \(USDG\)$|^V3 0\.30% \(USDG\) → V3 1\.00% \(USDG\)$/.test(row.children[0].textContent)) || same[0];
+  await v4v4.click(); await flush();
+  await page.until(() => element("status").className === "error" || (!/^Quoting/.test(element("quote-info").textContent) && !/Estimating gas/.test(element("gas-info").textContent)), "quote and gas line");
+  assert.notEqual(element("status").className, "error", element("status").textContent);
+  await flush();
+  assert.match(element("quote-info").textContent, /^Swap 1 quote: 0\.01 USDG → /, element("status").textContent);
+  assert.match(element("gas-info").textContent, /^Gas: ~\$[\d.]+ \((250K gas V3|400K gas V4|250K gas V3 \+ 400K gas V4) × eth_gasPrice 0\.020102 gwei\)\./);
+  assert.match(element("gas-info").textContent, /Net after gas: -?\$[\d.]+/);
+  assert.equal(provider.calls.length, 0, "quotes and gas use the public RPC");
+  const label = v4v4.children[0].textContent;
+  assert.equal(element("allpairs-spreads-body").children.find((row) => row.children[0].textContent === label).className, "selectable selected", "the re-rendered row keeps the selection");
+  await element("connect").click();
+  assert.equal(element("dry-run").disabled, false);
+  assert.match(element("bal-a").textContent, /PONS$/);
+  assert.match(element("bal-b").textContent, /USDG$/, "Token B balance follows the selected pair");
+  assert.equal(element("revoke-controls").hidden, false, "REVOKE ALL appears once connected");
+  assert.equal(element("revoke-all").disabled, false);
+});
+
+test("the multi-tab lock disables execution when another tab sent less than 5 minutes ago, is written on send and cleared on unload", async () => {
+  const store = new Map();
+  const storage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) };
+  // Another tab wrote the lock "just now" (the fake clock starts at 1762500000000 and advances 10 s per read).
+  store.set("ponsarb_lock", "1762500000000");
+  let page = loadPage(withActivePools(), { storage });
+  await page.until(() => page.timers.length > 0, "first poll");
+  await page.poll();
+  assert.equal(page.element("lock-banner").hidden, false, "banner shown");
+  assert.match(page.element("activity").textContent, /Another tab active/);
+  await page.element("spreads-body").children[0].click(); await page.flush();
+  await page.element("connect").click();
+  assert.equal(page.element("dry-run").disabled, true, "execute disabled while locked");
+  assert.equal(page.element("send").disabled, true);
+  assert.equal(page.element("auto-mode").disabled, true);
+  assert.equal(page.element("approve-permit2").disabled, false, "approvals are not execution");
+  // A lock older than 5 minutes does not block; a send writes a fresh one; beforeunload clears it.
+  store.set("ponsarb_lock", String(1762500000000 - 6 * 60 * 1000));
+  page = loadPage(withActivePools(), { storage });
+  await page.until(() => page.timers.length > 0, "first poll");
+  await page.poll();
+  assert.equal(page.element("lock-banner").hidden, true);
+  await page.element("spreads-body").children[0].click(); await page.flush();
+  await page.element("connect").click();
+  await page.element("approve-permit2").click();
+  await page.element("dry-run").click();
+  assert.equal(page.element("send").disabled, false);
+  await page.element("send").click();
+  assert.match(page.element("status").textContent, /Swap confirmed/);
+  const written = Number(store.get("ponsarb_lock"));
+  assert.ok(written > 1762500000000, "the lock is this tab's send timestamp");
+  assert.ok(typeof page.windowListeners.beforeunload === "function");
+  page.windowListeners.beforeunload();
+  assert.equal(store.has("ponsarb_lock"), false, "cleared on unload");
+});
+
+test("REVOKE ALL zeroes the input token's allowances to the V3 Router and Permit2 in two confirmed transactions", async () => {
+  const provider = new V3Mock();
+  provider.setAllowance(E.USDG, 12345);
+  const page = await readyPage(provider), { element } = page;
+  assert.equal(element("revoke-controls").hidden, true, "hidden until connected");
+  await element("connect").click();
+  assert.equal(element("revoke-controls").hidden, false);
+  await element("revoke-all").click();
+  await page.flush();
+  assert.equal(provider.sent.length, 2, element("revoke-status").textContent + " | " + element("status").textContent);
+  assert.ok(provider.sent.every((tx) => tx.to.toLowerCase() === E.USDG.toLowerCase()), "the input token, currency1");
+  assert.equal(provider.allowance(E.USDG).toString(), "0");
+  assert.equal(provider.tokenAllowances.get(E.USDG.toLowerCase()).toString(), "0");
+  assert.match(element("revoke-status").textContent, /^USDG allowances revoked: V3 Router 0x.* · Permit2 0x/);
+  assert.match(element("activity").textContent, /USDG revoke V3 Router allowance confirmed:/);
+  assert.match(element("activity").textContent, /USDG revoke Permit2 allowance confirmed:/);
+  await element("revoke-all").click();
+  assert.equal(provider.sent.length, 2, "already zero: nothing sent");
+  assert.match(element("revoke-status").textContent, /already 0; nothing sent/);
+});
+
+test("Manual mode marks a pool with liquidity() = 0 EMPTY and refuses to select it", async () => {
+  const provider = new ManualMock();
+  provider.setPool(MANUAL_POOL_B, manualPool(MANUAL_PONS, ethers.utils.getAddress(E.USDG), 10000, -292000, { liquidity: 0 }));
+  const page = await readyPage(provider), { element } = page;
+  element("pool-a").value = MANUAL_POOL_A;
+  element("pool-b").value = MANUAL_POOL_B;
+  await chooseMode(page, "Manual");
+  assert.equal(provider.manualCalls.filter((c) => c.name === "liquidity").length, 2, "liquidity() read on both pools");
+  const row = element("manual-body").children[0];
+  assert.equal(row.children[5].textContent, "EMPTY");
+  assert.match(row.children[1].textContent, /EMPTY \(liquidity 0\)$/);
+  assert.equal(row.listeners.click, undefined, "not selectable");
+  assert.equal(row.className, "");
+  assert.match(element("manual-status").textContent, /1 pool\(s\) EMPTY: liquidity\(\) = 0, execution disabled/);
+  assert.equal(page.timers.length, 0, "one-shot: no poll scheduled");
+  element("auto-mode").change(true);
+  assert.equal(provider.calls.length, 0, "auto mode never executes an EMPTY manual row");
 });

@@ -54,7 +54,11 @@
   var ROUTER = "0x8876789976dEcBfCbBbe364623C63652db8C0904";
   var PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
   var POOL_MANAGER = "0x8366a39CC670B4001A1121B8F6A443A643e40951";
-  var RPC_URL = "https://rpc.mainnet.chain.robinhood.com";
+  // Follow-up 6: the brief's primary RPC (Blockmachine) and the fallback the Worker and the page
+  // retry once against on an HTTP 429 or 5xx. The earlier public RPC still answers and stays documented.
+  var RPC_URL = "https://rpc-robinhood.blockmachine.io";
+  var RPC_FALLBACK_URL = "https://robinhood.drpc.org";
+  var RPC_LEGACY_URL = "https://rpc.mainnet.chain.robinhood.com";
   var CHAIN_ID = 4663;
   var PONS = "0x39dbed3a2bd333467115de45665cc57f813c4571"; // 18 decimals
   var USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"; // 6 decimals
@@ -81,6 +85,19 @@
   var SLIPPAGE_BPS = 50; // 0.5%
   var MIN_TICK = -887272;
   var MAX_TICK = 887272;
+  // Follow-up 6 hardening: a V4 pool whose last swap left the tick at or below this floor has been
+  // drained to its price limit (the PONS/USDG 30000/600 pool sits at -887272). It is EMPTY.
+  var DRAINED_TICK = -887000;
+  // Gas estimate shown after a quote: a flat budget per protocol times eth_gasPrice. A mixed route
+  // is two transactions and adds both.
+  var GAS_UNITS = { V3: 250000, V4: 400000 };
+  // Multi-tab lock: a timestamp in localStorage written on send; younger than this it means another
+  // tab is executing and this tab must not.
+  var LOCK_KEY = "ponsarb_lock";
+  var LOCK_TTL_MS = 5 * 60 * 1000;
+  // PoolManager Pool.State: slot0 at offset 0, feeGrowthGlobal0/1 at 1 and 2, liquidity at 3
+  // (Uniswap's StateLibrary.LIQUIDITY_OFFSET). getLiquidity(poolId) is read through extsload.
+  var LIQUIDITY_OFFSET = 3;
   // V4TooLittleReceivedPerHopSingle(uint256 minHopPriceX36, uint256 actualPriceX36): the router's
   // price check, which fires after the PoolManager has executed the swap and before settlement.
   var QUOTE_REVERT_SELECTOR = "0x4713c18b";
@@ -154,6 +171,8 @@
   var MANUAL_LIQUIDITY_ERROR = "Pool has no liquidity";
   var MANUAL_SAME_POOL_ERROR = "Pool A and Pool B are the same pool";
   var MANUAL_READS = ["token0", "token1", "fee", "slot0"];
+  // Follow-up 6: READ PRICES also reads liquidity(); a pool with liquidity 0 is shown EMPTY and disabled.
+  var MANUAL_READS_WITH_LIQUIDITY = MANUAL_READS.concat(["liquidity"]);
   // slot0 is declared as the brief gives it (six outputs). The deployed pools answer with the
   // canonical V3 seven-word layout; both start with sqrtPriceX96 then tick, which is all the
   // page uses, so decodeManualSlot0 reads those two words and accepts either length.
@@ -162,6 +181,7 @@
     "function token1() view returns (address)",
     "function fee() view returns (uint24)",
     "function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee, uint8 tickSpacing, bool unlocked)",
+    "function liquidity() view returns (uint128)",
   ]);
 
   /** A pasted pool address: exactly 0x + 40 hex digits. Throws the brief's message otherwise. */
@@ -173,10 +193,13 @@
     return address;
   }
 
-  /** The four eth_call params of one pool, in MANUAL_READS order: token0, token1, fee, slot0. */
-  function manualPoolCalls(address) {
+  /**
+   * The four eth_call params of one pool, in MANUAL_READS order: token0, token1, fee, slot0.
+   * With `withLiquidity` a fifth call, liquidity(), follows (follow-up 6 READ PRICES).
+   */
+  function manualPoolCalls(address, withLiquidity) {
     var pool = parseManualPoolAddress(address);
-    return MANUAL_READS.map(function (name) {
+    return (withLiquidity ? MANUAL_READS_WITH_LIQUIDITY : MANUAL_READS).map(function (name) {
       return { method: "eth_call", params: [{ to: pool, data: v3ManualPoolInterface.encodeFunctionData(name, []) }, "latest"] };
     });
   }
@@ -227,9 +250,15 @@
     if (token0 === ethers.constants.AddressZero || token1 === ethers.constants.AddressZero || token0 === token1 ||
       !BigNumber.from(token0).lt(BigNumber.from(token1))) throw manualInvalid(pool, "token0/token1 are not a sorted pair");
     if (fee > 1000000) throw manualInvalid(pool, "fee() is not a V3 fee");
-    return { protocol: "V3", manual: true, address: pool, poolId: pool.toLowerCase(), fee: fee,
+    var row = { protocol: "V3", manual: true, address: pool, poolId: pool.toLowerCase(), fee: fee,
       currency0: token0, currency1: token1, tickSpacing: null, tick: slot0.tick, sqrtPriceX96: slot0.sqrtPriceX96,
-      price: tickToPrice(slot0.tick), active: true, swaps: null, lastBlock: null, lastIndex: null };
+      price: tickToPrice(slot0.tick), active: true, swaps: null, lastBlock: null, lastIndex: null, liquidity: null };
+    if (results.length > MANUAL_READS.length) {
+      var liquidity = read(MANUAL_READS.length, "liquidity");
+      row.liquidity = BigNumber.from(liquidity);
+      if (row.liquidity.gt(MAX_UINT128)) throw manualInvalid(pool, "liquidity() does not fit uint128");
+    }
+    return row;
   }
 
   /** "0.01%", "1.00%", for any fee in hundredths of a basis point (no fee-tier whitelist). */
@@ -253,14 +282,16 @@
    * reply that does not decode is "Invalid pool address"; a transport failure is rethrown as is
    * so the monitor can back off instead of blaming the address.
    */
-  async function readManualPool(request, address) {
+  async function readManualPool(request, address, options) {
     if (typeof request !== "function") fail("request function is required");
+    var withLiquidity = !!(options && options.liquidity);
     var pool = parseManualPoolAddress(address);
-    var calls = manualPoolCalls(pool);
+    var calls = manualPoolCalls(pool, withLiquidity);
+    var names = withLiquidity ? MANUAL_READS_WITH_LIQUIDITY : MANUAL_READS;
     var results = [];
     for (var i = 0; i < calls.length; i++) {
       try { results.push(await request(calls[i].method, calls[i].params)); } catch (error) {
-        if (isRevertError(error)) throw manualInvalid(pool, MANUAL_READS[i] + "() reverted");
+        if (isRevertError(error)) throw manualInvalid(pool, names[i] + "() reverted");
         throw error;
       }
     }
@@ -325,12 +356,14 @@
     var running = false;
     var generation = 0;
     var timer = null;
+    var withLiquidity = !!options.liquidity; // follow-up 6: READ PRICES also reads liquidity()
     var symbolCache = {}; // token address → { symbol, decimals }, read once
     var state = freshState();
 
     function freshState() {
       return { mode: "Manual", addresses: null, pair: null, pools: [], spreads: [], spread: null, lastRead: null,
-        lastError: null, errorCode: null, retryAt: null, nextPollMs: null, polls: 0, errors: 0, protocol: "V3" };
+        lastError: null, errorCode: null, retryAt: null, nextPollMs: null, polls: 0, errors: 0, protocol: "V3",
+        oneShot: false };
     }
 
     async function tokenMeta(token) {
@@ -350,7 +383,7 @@
       var current = state;
       var rows = [];
       for (var i = 0; i < 2; i++) {
-        try { rows.push(await readManualPool(request, addresses[i])); } catch (error) {
+        try { rows.push(await readManualPool(request, addresses[i], { liquidity: withLiquidity })); } catch (error) {
           if (error.manualCode) error.message = (i === 0 ? "Pool A" : "Pool B") + ": " + error.message;
           throw error;
         }
@@ -368,10 +401,11 @@
       rows.forEach(function (row, index) {
         row.label = index === 0 ? "Pool A" : "Pool B";
         row.displayPrice = row.price * scale;
-        row.empty = false;
+        // liquidity() == 0 (follow-up 6) is EMPTY: shown, never executable. Without the read, OK as before.
+        row.empty = row.liquidity ? row.liquidity.isZero() : false;
         row.elapsedSeconds = 0;
         row.healthError = null;
-        row.status = STATUS_OK;
+        row.status = row.empty ? STATUS_EMPTY : STATUS_OK;
       });
       var spread = manualSpread(rows[0], rows[1], threshold());
       current.addresses = addresses.slice();
@@ -430,7 +464,33 @@
       return cycle();
     }
 
-    return { start: start, stop: stop, pollOnce: pollOnce, getState: function () { return state; },
+    /**
+     * Follow-up 6 READ PRICES: one read of both pools, no timer afterwards. Errors are reported in
+     * state.lastError / errorCode exactly as a polled read would, and nothing is retried.
+     */
+    async function readOnce(poolA, poolB) {
+      stop();
+      var a = parseManualPoolAddress(poolA, "Pool A");
+      var b = parseManualPoolAddress(poolB, "Pool B");
+      addresses = [a, b];
+      state = freshState();
+      state.addresses = [a, b];
+      state.oneShot = true;
+      var mine = generation;
+      try {
+        await pollOnce();
+      } catch (error) {
+        if (mine !== generation) return state;
+        state.errors += 1;
+        state.lastError = error && error.message ? error.message : String(error);
+        state.errorCode = error.manualCode || "RPC";
+        onError(error, state);
+      }
+      if (mine === generation) onUpdate(state);
+      return state;
+    }
+
+    return { start: start, stop: stop, readOnce: readOnce, pollOnce: pollOnce, getState: function () { return state; },
       isRunning: function () { return running; } };
   }
 
@@ -997,9 +1057,14 @@
    * UNKNOWN the slot0 read or the swap block's timestamp failed; OK otherwise. A definite fact is
    * reported ahead of a failed read. Only OK pools reach the spreads and auto mode.
    */
+  /** Follow-up 6: a V4 pool whose latest tick is at or below -887000 was drained to its price floor. */
+  function isDrained(pool) {
+    return protocolOf(pool) === "V4" && pool.tick !== null && pool.tick !== undefined && Number(pool.tick) <= DRAINED_TICK;
+  }
+
   function poolStatus(pool, maxStalenessSeconds) {
     if (!pool.active) return STATUS_INACTIVE;
-    if (pool.empty === true) return STATUS_EMPTY;
+    if (pool.empty === true || isDrained(pool)) return STATUS_EMPTY;
     if (pool.elapsedSeconds !== null && pool.elapsedSeconds !== undefined && pool.elapsedSeconds > maxStalenessSeconds) {
       return STATUS_STALE;
     }
@@ -1019,8 +1084,132 @@
   function autoSkipReason(pool) {
     var label = "auto skipped: pool " + pool.fee + "/" + pool.tickSpacing + " ";
     if (pool.status === STATUS_STALE) return label + "stale (" + formatDuration(pool.elapsedSeconds) + ")";
-    if (pool.status === STATUS_EMPTY) return label + "empty (sqrtPriceX96 = 0)";
+    if (pool.status === STATUS_EMPTY) {
+      return label + (pool.empty === true ? "empty (sqrtPriceX96 = 0)" : "empty (tick " + pool.tick + " is at the price floor)");
+    }
     return label + "unknown (" + (pool.healthError || "health read failed") + ")";
+  }
+
+  // ------------------------------------------------------------------ follow-up 6 hardening helpers
+
+  /** Gas units of a route: 250K for V3, 400K for V4; a mixed route is two transactions and adds both. */
+  function gasUnitsFor(buy, sell) {
+    var a = protocolOf(buy);
+    var b = protocolOf(sell);
+    if (!GAS_UNITS[a] || !GAS_UNITS[b]) fail("unknown pool protocol");
+    return a === b ? GAS_UNITS[a] : GAS_UNITS[a] + GAS_UNITS[b];
+  }
+
+  /**
+   * Gas cost of a route at `gasPriceWei` (eth_gasPrice): { gas, gasPrice, costWei, costEth, costUsd }.
+   * costUsd is null unless `ethUsd` (dollars per ETH) is a positive number.
+   */
+  function estimateGasCost(buy, sell, gasPriceWei, ethUsd) {
+    var gas = gasUnitsFor(buy, sell);
+    var gasPrice = BigNumber.from(gasPriceWei);
+    if (gasPrice.lt(0)) fail("gas price must not be negative");
+    var costWei = gasPrice.mul(gas);
+    var costEth = Number(utils.formatEther(costWei));
+    var usd = Number(ethUsd);
+    return { gas: gas, gasPrice: gasPrice, costWei: costWei, costEth: costEth,
+      costUsd: Number.isFinite(usd) && usd > 0 ? costEth * usd : null };
+  }
+
+  /** "$0.0123"; small numbers keep enough digits to be legible. */
+  function formatUsd(value) {
+    var n = Number(value);
+    if (!Number.isFinite(n)) fail("USD amount must be a finite number");
+    var abs = Math.abs(n);
+    var digits = abs >= 100 ? 2 : abs >= 1 ? 3 : 4;
+    return (n < 0 ? "-$" : "$") + abs.toFixed(digits);
+  }
+
+  /** Dollars of one token unit: USDG is the dollar, WETH is `ethUsd`, anything else is unknown (null). */
+  function usdPerToken(token, ethUsd) {
+    var address = utils.getAddress(token);
+    if (address === utils.getAddress(USDG)) return 1;
+    if (address === utils.getAddress(WETH)) return Number.isFinite(Number(ethUsd)) && Number(ethUsd) > 0 ? Number(ethUsd) : null;
+    return null;
+  }
+
+  /**
+   * Expected profit of a quoted route in dollars: (return − input) of currency1, converted with
+   * usdPerToken, minus the gas estimate. Returns { profitToken, profitUsd, netUsd } where the USD
+   * fields are null when currency1 has no dollar price.
+   */
+  function netAfterGas(amountIn, expectedReturn, decimals1, currency1, gasEstimate, ethUsd) {
+    var input = BigNumber.from(amountIn);
+    var out = BigNumber.from(expectedReturn);
+    var profitToken = Number(utils.formatUnits(out.sub(input), decimals1));
+    var rate = usdPerToken(currency1, ethUsd);
+    var profitUsd = rate === null ? null : profitToken * rate;
+    var gasUsd = gasEstimate && gasEstimate.costUsd !== null && gasEstimate.costUsd !== undefined ? gasEstimate.costUsd : null;
+    return { profitToken: profitToken, profitUsd: profitUsd,
+      netUsd: profitUsd === null || gasUsd === null ? null : profitUsd - gasUsd };
+  }
+
+  /**
+   * ETH price in dollars from the V3 WETH/USDG pool with liquidity (fee tiers tried in order):
+   * 1.0001^tick scaled by 10^(18-6). Resolves null when no such pool is found or a read fails.
+   */
+  async function fetchEthUsd(request) {
+    if (typeof request !== "function") fail("request function is required");
+    var pair = sortPair(WETH, USDG);
+    var wethIs0 = pair.currency0 === utils.getAddress(WETH);
+    var tiers = [500, 3000, 100, 10000];
+    for (var i = 0; i < tiers.length; i++) {
+      try {
+        var reply = await request("eth_call", [{ to: V3_FACTORY,
+          data: v3FactoryInterface.encodeFunctionData("getPool", [pair.currency0, pair.currency1, tiers[i]]) }, "latest"]);
+        var address = v3FactoryInterface.decodeFunctionResult("getPool", reply)[0];
+        if (address === ethers.constants.AddressZero) continue;
+        var liquidity = v3PoolInterface.decodeFunctionResult("liquidity",
+          await request("eth_call", [{ to: address, data: v3PoolInterface.encodeFunctionData("liquidity") }, "latest"]))[0];
+        if (liquidity.isZero()) continue;
+        var slot0 = decodeManualSlot0(await request("eth_call", [{ to: address,
+          data: v3ManualPoolInterface.encodeFunctionData("slot0", []) }, "latest"]));
+        var price = tickToPrice(slot0.tick) * Math.pow(10, 18 - 6); // USDG per WETH when WETH is currency0
+        return wethIs0 ? price : 1 / price;
+      } catch (error) { return null; }
+    }
+    return null;
+  }
+
+  /**
+   * Multi-tab lock over a Storage-like object (localStorage): `acquire()` writes now() under
+   * LOCK_KEY on send, `release()` clears it (beforeunload), `heldElsewhere()` is true while a
+   * timestamp younger than LOCK_TTL_MS that this instance did not write is present.
+   */
+  function createTabLock(storage, now) {
+    var clock = now || function () { return Date.now(); };
+    var mine = null;
+    function read() {
+      if (!storage || typeof storage.getItem !== "function") return null;
+      var raw;
+      try { raw = storage.getItem(LOCK_KEY); } catch (error) { return null; }
+      var value = Number(raw);
+      return raw === null || raw === undefined || raw === "" || !Number.isFinite(value) ? null : value;
+    }
+    function heldElsewhere() {
+      var value = read();
+      if (value === null) return false;
+      if (mine !== null && value === mine) return false;
+      return clock() - value < LOCK_TTL_MS;
+    }
+    function acquire() {
+      if (heldElsewhere()) fail("Another tab active: it sent a transaction less than 5 minutes ago");
+      mine = clock();
+      if (storage && typeof storage.setItem === "function") storage.setItem(LOCK_KEY, String(mine));
+      return mine;
+    }
+    function release() {
+      var value = read();
+      if (value !== null && (mine === null || value !== mine)) return false; // never clear another tab's lock
+      if (storage && typeof storage.removeItem === "function") storage.removeItem(LOCK_KEY);
+      mine = null;
+      return true;
+    }
+    return { heldElsewhere: heldElsewhere, acquire: acquire, release: release, read: read };
   }
 
   /**
@@ -1075,6 +1264,9 @@
     if (typeof url !== "string" || !/^https?:\/\//.test(url)) fail("RPC url must be an http(s) URL");
     var timeoutMs = options.timeoutMs === undefined ? 20000 : options.timeoutMs;
     var batchTimeoutMs = options.batchTimeoutMs === undefined ? 30000 : options.batchTimeoutMs;
+    // Follow-up 6: an optional fallback endpoint, tried once when the primary answers HTTP 429 or 5xx.
+    var fallbackUrl = options.fallbackUrl || null;
+    if (fallbackUrl !== null && (typeof fallbackUrl !== "string" || !/^https?:\/\//.test(fallbackUrl))) fail("fallback RPC url must be an http(s) URL");
     var nextId = 0;
     var batchSupported = true;
     var sequentialTail = Promise.resolve();
@@ -1083,11 +1275,13 @@
       return { jsonrpc: "2.0", id: ++nextId, method: method, params: params || [] };
     }
 
-    async function post(payload, timeout) {
+    function shouldFallBack(status) { return status === 429 || (status >= 500 && status <= 599); }
+
+    async function postTo(target, payload, timeout) {
       var controller = typeof AbortController === "function" ? new AbortController() : null;
       var timer = controller ? setTimeout(function () { controller.abort(); }, timeout) : null;
       try {
-        var response = await doFetch(url, {
+        var response = await doFetch(target, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(payload),
@@ -1095,16 +1289,44 @@
         });
         // A 429/outage must back off, not fan out into individual HTTP requests.
         if (!response || response.status === 429 || response.status === 503) {
-          fail("RPC HTTP error " + (response ? response.status : "no response"));
+          var outage = new Error("V4ArbEncoder: RPC HTTP error " + (response ? response.status : "no response"));
+          outage.httpStatus = response ? response.status : 0;
+          throw outage;
         }
         var body;
         try { body = await response.json(); } catch (error) {
-          if (!response.ok) fail("RPC HTTP error " + response.status);
+          if (!response.ok) {
+            var bad = new Error("V4ArbEncoder: RPC HTTP error " + response.status);
+            bad.httpStatus = response.status;
+            throw bad;
+          }
           throw error;
         }
         return { ok: response.ok, status: response.status, body: body };
       } finally {
         if (timer !== null) clearTimeout(timer);
+      }
+    }
+
+    /** Primary first; on HTTP 429 / 5xx retry the same payload once against the fallback. */
+    async function post(payload, timeout) {
+      try {
+        var reply = await postTo(url, payload, timeout);
+        if (fallbackUrl && shouldFallBack(reply.status)) throw Object.assign(new Error("V4ArbEncoder: RPC HTTP error " + reply.status), { httpStatus: reply.status });
+        return reply;
+      } catch (error) {
+        if (!fallbackUrl || !error || !shouldFallBack(error.httpStatus)) throw error;
+        // Return whichever succeeds; when the fallback fails too, report the primary's error with the fallback's.
+        try {
+          var second = await postTo(fallbackUrl, payload, timeout);
+          if (second.ok) return second;
+          error.message += " (fallback " + fallbackUrl + ": HTTP error " + second.status + ")";
+          throw error;
+        } catch (fallbackError) {
+          if (fallbackError === error) throw error;
+          error.message += " (fallback " + fallbackUrl + ": " + (fallbackError && fallbackError.message ? fallbackError.message.replace("V4ArbEncoder: ", "") : String(fallbackError)) + ")";
+          throw error;
+        }
       }
     }
 
@@ -1252,6 +1474,79 @@
 
   // ------------------------------------------------------------------ live pool monitor
 
+  // Shared by the pair monitor (follow-up 3) and the all-pairs monitor (follow-up 6).
+
+  function metadataCalls(pair) {
+    return [pair.currency0, pair.currency1].reduce(function (calls, token) {
+      return calls.concat(["symbol", "decimals"].map(function (name) {
+        return { method: "eth_call", params: [{ to: token, data: tokenInterface.encodeFunctionData(name, []) }, "latest"] };
+      }));
+    }, []);
+  }
+
+  function decodePair(tokenA, tokenB, results) {
+    var sorted = sortPair(tokenA, tokenB);
+    var pair = { tokenA: utils.getAddress(tokenA), tokenB: utils.getAddress(tokenB),
+      currency0: sorted.currency0, currency1: sorted.currency1, keys: poolKeysFor(sorted.currency0, sorted.currency1) };
+    function read(i, name, token) {
+      var result = rpcResult(results[i]);
+      if (!result || result === "0x") fail("no " + name + "() at " + token);
+      return tokenInterface.decodeFunctionResult(name, result)[0];
+    }
+    pair.symbol0 = String(read(0, "symbol", pair.currency0));
+    pair.decimals0 = BigNumber.from(read(1, "decimals", pair.currency0)).toNumber();
+    pair.symbol1 = String(read(2, "symbol", pair.currency1));
+    pair.decimals1 = BigNumber.from(read(3, "decimals", pair.currency1)).toNumber();
+    pair.symbolA = pair.tokenA === pair.currency0 ? pair.symbol0 : pair.symbol1;
+    pair.symbolB = pair.tokenB === pair.currency0 ? pair.symbol0 : pair.symbol1;
+    pair.decimalsA = pair.tokenA === pair.currency0 ? pair.decimals0 : pair.decimals1;
+    pair.decimalsB = pair.tokenB === pair.currency0 ? pair.decimals0 : pair.decimals1;
+    return pair;
+  }
+
+  /** A block's number and timestamp from eth_getBlockByNumber. Throws on a missing or partial block. */
+  function decodeBlock(result, tag) {
+    var block = rpcResult(result);
+    if (!block || !block.number || !block.timestamp) fail("eth_getBlockByNumber returned no block for " + tag);
+    return { number: BigNumber.from(block.number).toNumber(), timestamp: BigNumber.from(block.timestamp).toNumber() };
+  }
+
+  function messageOf(error) { return error && error.message ? error.message : String(error); }
+
+  /** Phase 2 of a poll: every active pool's swap-block timestamp and health read, failures per call. */
+  async function readPoolHealthBatch(batchRequest, pools, latest) {
+    var active = pools.filter(function (pool) { return pool.active; });
+    if (!active.length) return; // JSON-RPC forbids an empty batch.
+    var calls = [];
+    active.forEach(function (pool) {
+      calls.push({ method: "eth_getBlockByNumber", params: [utils.hexValue(pool.lastBlock), false] });
+      calls.push(protocolOf(pool) === "V3" ?
+        { method: "eth_call", params: [{ to: pool.address, data: v3PoolInterface.encodeFunctionData("liquidity") },
+          utils.hexValue(latest.number)] } :
+        { method: "eth_call", params: [encodeSlot0Call(pool.poolId), "latest"] });
+    });
+    var results;
+    try { results = await batchRequest(calls); }
+    catch (error) { results = calls.map(function () { return { error: error }; }); }
+    active.forEach(function (pool, i) {
+      try {
+        var block = decodeBlock(results[i * 2], utils.hexValue(pool.lastBlock));
+        pool.swapTimestamp = block.timestamp;
+        pool.elapsedSeconds = Math.max(0, latest.timestamp - block.timestamp);
+      } catch (error) { pool.healthError = "swap block read failed: " + messageOf(error); }
+      try {
+        var result = rpcResult(results[i * 2 + 1]);
+        if (protocolOf(pool) === "V3") {
+          pool.liquidity = v3PoolInterface.decodeFunctionResult("liquidity", result)[0];
+          pool.empty = pool.liquidity.isZero();
+        } else pool.empty = decodeSlot0(result).sqrtPriceX96.isZero();
+      } catch (error) {
+        pool.healthError = (pool.healthError ? pool.healthError + "; " : "") +
+          (protocolOf(pool) === "V3" ? "liquidity" : "slot0") + " read failed: " + messageOf(error);
+      }
+    });
+  }
+
   /**
    * Polls the PoolManager's Swap logs for the seven fee tiers of one pair.
    *
@@ -1306,47 +1601,10 @@
         lastError: null, retryAt: null, nextPollMs: null, polls: 0, errors: 0 };
     }
 
-    function metadataCalls(pair) {
-      return [pair.currency0, pair.currency1].reduce(function (calls, token) {
-        return calls.concat(["symbol", "decimals"].map(function (name) {
-          return { method: "eth_call", params: [{ to: token, data: tokenInterface.encodeFunctionData(name, []) }, "latest"] };
-        }));
-      }, []);
-    }
-
-    function decodePair(tokenA, tokenB, results) {
-      var sorted = sortPair(tokenA, tokenB);
-      var pair = { tokenA: utils.getAddress(tokenA), tokenB: utils.getAddress(tokenB),
-        currency0: sorted.currency0, currency1: sorted.currency1, keys: poolKeysFor(sorted.currency0, sorted.currency1) };
-      function read(i, name, token) {
-        var result = rpcResult(results[i]);
-        if (!result || result === "0x") fail("no " + name + "() at " + token);
-        return tokenInterface.decodeFunctionResult(name, result)[0];
-      }
-      pair.symbol0 = String(read(0, "symbol", pair.currency0));
-      pair.decimals0 = BigNumber.from(read(1, "decimals", pair.currency0)).toNumber();
-      pair.symbol1 = String(read(2, "symbol", pair.currency1));
-      pair.decimals1 = BigNumber.from(read(3, "decimals", pair.currency1)).toNumber();
-      pair.symbolA = pair.tokenA === pair.currency0 ? pair.symbol0 : pair.symbol1;
-      pair.symbolB = pair.tokenB === pair.currency0 ? pair.symbol0 : pair.symbol1;
-      pair.decimalsA = pair.tokenA === pair.currency0 ? pair.decimals0 : pair.decimals1;
-      pair.decimalsB = pair.tokenB === pair.currency0 ? pair.decimals0 : pair.decimals1;
-      return pair;
-    }
-
     /** Sort the pair and read symbol() and decimals() of both tokens in one batch. */
     async function loadPair(tokenA, tokenB) {
       return decodePair(tokenA, tokenB, await batchRequest(metadataCalls(sortPair(tokenA, tokenB))));
     }
-
-    /** A block's number and timestamp from eth_getBlockByNumber. Throws on a missing or partial block. */
-    function decodeBlock(result, tag) {
-      var block = rpcResult(result);
-      if (!block || !block.number || !block.timestamp) fail("eth_getBlockByNumber returned no block for " + tag);
-      return { number: BigNumber.from(block.number).toNumber(), timestamp: BigNumber.from(block.timestamp).toNumber() };
-    }
-
-    function messageOf(error) { return error && error.message ? error.message : String(error); }
 
     // A numeric lower bound cannot refer to another call's result inside a JSON-RPC batch.
     // Seed it once alongside cached pair metadata and discovery, then refresh it in phase 1.
@@ -1364,38 +1622,7 @@
     }
 
     /** Phase 2: all active pools' timestamp and health reads, with per-call failures. */
-    async function readPoolHealth(pools, latest) {
-      var active = pools.filter(function (pool) { return pool.active; });
-      if (!active.length) return; // JSON-RPC forbids an empty batch.
-      var calls = [];
-      active.forEach(function (pool) {
-        calls.push({ method: "eth_getBlockByNumber", params: [utils.hexValue(pool.lastBlock), false] });
-        calls.push(protocolOf(pool) === "V3" ?
-          { method: "eth_call", params: [{ to: pool.address, data: v3PoolInterface.encodeFunctionData("liquidity") },
-            utils.hexValue(latest.number)] } :
-          { method: "eth_call", params: [encodeSlot0Call(pool.poolId), "latest"] });
-      });
-      var results;
-      try { results = await batchRequest(calls); }
-      catch (error) { results = calls.map(function () { return { error: error }; }); }
-      active.forEach(function (pool, i) {
-        try {
-          var block = decodeBlock(results[i * 2], utils.hexValue(pool.lastBlock));
-          pool.swapTimestamp = block.timestamp;
-          pool.elapsedSeconds = Math.max(0, latest.timestamp - block.timestamp);
-        } catch (error) { pool.healthError = "swap block read failed: " + messageOf(error); }
-        try {
-          var result = rpcResult(results[i * 2 + 1]);
-          if (protocolOf(pool) === "V3") {
-            pool.liquidity = v3PoolInterface.decodeFunctionResult("liquidity", result)[0];
-            pool.empty = pool.liquidity.isZero();
-          } else pool.empty = decodeSlot0(result).sqrtPriceX96.isZero();
-        } catch (error) {
-          pool.healthError = (pool.healthError ? pool.healthError + "; " : "") +
-            (protocolOf(pool) === "V3" ? "liquidity" : "slot0") + " read failed: " + messageOf(error);
-        }
-      });
-    }
+    function readPoolHealth(pools, latest) { return readPoolHealthBatch(batchRequest, pools, latest); }
 
     /** One scan: latest block, Swap logs of the seven pools over the window, pool health, table and spreads. */
     async function pollOnce() {
@@ -1516,6 +1743,327 @@
 
     return { start: start, stop: stop, pollOnce: pollOnce, loadPair: loadPair,
       getState: function () { return state; }, isRunning: function () { return running; } };
+  }
+
+  // ------------------------------------------------------------------ follow-up 6: all-pairs monitor
+
+  /** The Token B textarea: one address per line (commas and blanks tolerated), unique, Token A excluded. */
+  function parseTokenList(text, tokenA) {
+    var a = tokenA ? utils.getAddress(tokenA) : null;
+    var seen = {};
+    var list = [];
+    String(text === undefined || text === null ? "" : text).split(/[\s,;]+/).forEach(function (entry) {
+      if (!entry) return;
+      if (!/^0x[0-9a-fA-F]{40}$/.test(entry)) fail("Token B list: '" + entry + "' is not a 42-character address");
+      var address = utils.getAddress(entry.toLowerCase());
+      if (address === ethers.constants.AddressZero) fail("Token B list: the zero address is not a token");
+      if (address === a) return;
+      if (seen[address]) return;
+      seen[address] = true;
+      list.push(address);
+    });
+    if (!list.length) fail("Token B list: enter at least one token address other than Token A");
+    return list;
+  }
+
+  /** The PoolManager storage slot of a pool's liquidity: slot0 slot + 3. */
+  function liquidityStorageSlot(id) {
+    return utils.hexZeroPad(BigNumber.from(slot0StorageSlot(id)).add(LIQUIDITY_OFFSET).toHexString(), 32);
+  }
+
+  /** eth_call reading getLiquidity(poolId) through extsload. */
+  function encodeLiquidityCall(id) {
+    return { to: POOL_MANAGER, data: poolManagerInterface.encodeFunctionData("extsload", [liquidityStorageSlot(id)]) };
+  }
+
+  function decodeLiquidityWord(word) {
+    if (typeof word !== "string" || !utils.isHexString(word, 32)) fail("liquidity reply is not a 32-byte word");
+    return BigNumber.from(word).and(MAX_UINT128);
+  }
+
+  /** "V3 0.05% (WETH)" or "V4 3000/60 (USDG)": a pool's leg in the Path column. */
+  function describeLeg(pool) {
+    var symbol = pool.pair ? pool.pair.symbolB : "";
+    var fee = protocolOf(pool) === "V3" ? formatV3Fee(pool.fee) : pool.fee + "/" + pool.tickSpacing;
+    return protocolOf(pool) + " " + fee + (symbol ? " (" + symbol + ")" : "");
+  }
+
+  /** Token A priced in Token B units: the pair's display price, inverted when Token A is currency1. */
+  function tokenAPrice(pool) {
+    if (!pool.pair || pool.displayPrice === null || pool.displayPrice === undefined) return null;
+    return pool.pair.tokenA === pool.pair.currency0 ? pool.displayPrice : 1 / pool.displayPrice;
+  }
+
+  /**
+   * Every pairwise combination of tradeable pools across all pairs, best net first. Same-pair rows
+   * are the executable spreads of rankSpreads (buy = lower currency1-per-currency0 price). Rows
+   * whose two pools quote different Token Bs are tagged `crossPair` ("3-LEG"): the gap between
+   * Token A's price in two different quote tokens, watch-only, never executed.
+   */
+  function allPairsSpreads(pools, thresholdPercent) {
+    var threshold = readThreshold(thresholdPercent);
+    var tradeable = pools.filter(isTradeable);
+    var groups = {};
+    tradeable.forEach(function (pool) { (groups[pool.pairKey] = groups[pool.pairKey] || []).push(pool); });
+    var spreads = [];
+    Object.keys(groups).forEach(function (key) {
+      pairSpreads(groups[key], threshold).forEach(function (spread) {
+        spread.crossPair = false;
+        spread.path = describeLeg(spread.buy) + " → " + describeLeg(spread.sell);
+        spreads.push(spread);
+      });
+    });
+    for (var i = 0; i < tradeable.length; i++) {
+      for (var j = i + 1; j < tradeable.length; j++) {
+        if (tradeable[i].pairKey === tradeable[j].pairKey) continue;
+        var pa = tokenAPrice(tradeable[i]);
+        var pb = tokenAPrice(tradeable[j]);
+        if (!(pa > 0) || !(pb > 0)) continue;
+        var buy = pa <= pb ? tradeable[i] : tradeable[j];
+        var sell = buy === tradeable[i] ? tradeable[j] : tradeable[i];
+        var spread = spreadPercent(pa, pb);
+        var feeCost = feeCostPercent(buy.fee, sell.fee);
+        var net = spread - feeCost;
+        spreads.push({ buy: buy, sell: sell, spreadPercent: spread, feeCostPercent: feeCost, netPercent: net,
+          verdict: net > threshold ? "GREEN" : "RED", crossPair: true,
+          path: describeLeg(buy) + " → " + describeLeg(sell) });
+      }
+    }
+    spreads.sort(function (x, y) { return y.netPercent - x.netPercent; });
+    return spreads;
+  }
+
+  /** Auto mode across pairs: the best same-pair, same-protocol decision; cross-pair rows never execute. */
+  function allPairsAutoDecision(pools, thresholdPercent) {
+    var groups = {};
+    pools.forEach(function (pool) { (groups[pool.pairKey] = groups[pool.pairKey] || []).push(pool); });
+    var best = null;
+    var skips = [];
+    Object.keys(groups).forEach(function (key) {
+      var decision = protocolAutoDecision(groups[key], thresholdPercent);
+      skips = skips.concat(decision.skips);
+      if (decision.spread && (!best || decision.spread.netPercent > best.netPercent)) best = decision.spread;
+    });
+    return { spread: best, skips: skips };
+  }
+
+  /**
+   * All-pairs monitor: one Token A against a list of Token Bs. Discovery once per list change
+   * (V3 factory.getPool for the four tiers and V4 getLiquidity through extsload for the seven
+   * tiers of every pair, non-zero results kept). Each poll is ONE eth_getLogs over all V3 pools
+   * and ONE over the PoolManager, in a single JSON-RPC batch with the latest block, then the
+   * existing phase-2 health batch (swap-block timestamps, V3 liquidity(), V4 slot0).
+   *
+   * options as createPoolMonitor; start(tokenA, tokenBList, protocol).
+   */
+  function createAllPairsMonitor(options) {
+    options = options || {};
+    var request = options.request;
+    var batchRequest = options.batchRequest;
+    if (typeof request !== "function") fail("request function is required");
+    if (typeof batchRequest !== "function") fail("batchRequest function is required");
+    var pollMs = options.pollIntervalMs === undefined ? POLL_INTERVAL_MS : options.pollIntervalMs;
+    var retryMs = options.retryIntervalMs === undefined ? RPC_RETRY_MS : options.retryIntervalMs;
+    if (!Number.isFinite(pollMs) || pollMs < 0 || !Number.isFinite(retryMs) || retryMs < 0) fail("invalid intervals");
+    var windowOption = options.windowBlocks === undefined ? LOG_WINDOW_BLOCKS : options.windowBlocks;
+    var windowBlocks = typeof windowOption === "function" ? windowOption : function () { return windowOption; };
+    var stalenessOption = options.maxStalenessSeconds === undefined ? MAX_STALENESS_SECONDS : options.maxStalenessSeconds;
+    var maxStaleness = typeof stalenessOption === "function" ? stalenessOption : function () { return stalenessOption; };
+    var thresholdOption = options.thresholdPercent === undefined ? 0.5 : options.thresholdPercent;
+    var threshold = typeof thresholdOption === "function" ? thresholdOption : function () { return thresholdOption; };
+    var onUpdate = options.onUpdate || function () {};
+    var onError = options.onError || function () {};
+    var now = options.now || function () { return Date.now(); };
+    var tokens = null;
+    var running = false;
+    var generation = 0;
+    var timer = null;
+    var state = freshState();
+
+    function readWindow() {
+      var blocks = windowBlocks();
+      if (!Number.isInteger(blocks) || blocks < MIN_WINDOW_BLOCKS || blocks > MAX_WINDOW_BLOCKS) {
+        fail("windowBlocks must be a whole number from " + MIN_WINDOW_BLOCKS + " to " + MAX_WINDOW_BLOCKS);
+      }
+      return blocks;
+    }
+
+    function freshState() {
+      return { mode: "All pairs", tokenA: null, tokenBs: [], pairs: null, pools: [], spreads: [], blockNumber: null,
+        blockTimestamp: null, fromBlock: null, protocol: normaliseProtocol(options.protocol || "Both"), scanHead: null,
+        windowBlocks: null, lastPoll: null, lastError: null, retryAt: null, nextPollMs: null, polls: 0, errors: 0,
+        discovered: null };
+    }
+
+    /** Discovery: ONE batch with the latest block, every pair's metadata, V3 getPool x4 and V4 liquidity x7. */
+    async function discover(current) {
+      var calls = [{ method: "eth_getBlockByNumber", params: ["latest", false] }];
+      var layout = [];
+      var protocol = current.protocol;
+      current.tokenBs.forEach(function (tokenB) {
+        var sorted = sortPair(current.tokenA, tokenB);
+        var entry = { tokenB: tokenB, sorted: sorted, meta: calls.length };
+        calls = calls.concat(metadataCalls(sorted));
+        if (protocol !== "V4") { entry.v3 = calls.length; calls = calls.concat(v3DiscoveryCalls(sorted)); }
+        if (protocol !== "V3") {
+          entry.v4 = calls.length;
+          poolKeysFor(sorted.currency0, sorted.currency1).forEach(function (key) {
+            calls.push({ method: "eth_call", params: [encodeLiquidityCall(poolId(key)), "latest"] });
+          });
+        }
+        layout.push(entry);
+      });
+      var results = await batchRequest(calls);
+      current.scanHead = decodeBlock(results[0], "latest").number;
+      var pairs = layout.map(function (entry) {
+        var pair = decodePair(current.tokenA, entry.tokenB, results.slice(entry.meta, entry.meta + 4));
+        pair.pairKey = pair.currency0.toLowerCase() + ":" + pair.currency1.toLowerCase();
+        var v3Pools = entry.v3 === undefined ? [] : decodeV3Pools(pair, results.slice(entry.v3, entry.v3 + V3_FEE_TIERS.length));
+        var v4Keys = [];
+        if (entry.v4 !== undefined) {
+          pair.keys.forEach(function (key, i) {
+            var liquidity = decodeLiquidityWord(rpcResult(results[entry.v4 + i]));
+            if (!liquidity.isZero()) v4Keys.push({ key: key, liquidity: liquidity });
+          });
+        }
+        return { pair: pair, v3Pools: v3Pools, v4Keys: v4Keys };
+      });
+      current.pairs = pairs;
+      current.discovered = { v3: pairs.reduce(function (n, p) { return n + p.v3Pools.length; }, 0),
+        v4: pairs.reduce(function (n, p) { return n + p.v4Keys.length; }, 0) };
+    }
+
+    async function pollOnce() {
+      if (!tokens) fail("start(tokenA, tokenBList) first");
+      var current = state;
+      var blocks = readWindow();
+      if (!current.pairs || current.scanHead === null) await discover(current);
+      var previousHead = current.scanHead;
+      var scanFrom = Math.max(0, previousHead - (blocks - 1));
+      var phase1 = [{ method: "eth_getBlockByNumber", params: ["latest", false] }];
+      var v4Indexes = [], v3Indexes = [];
+      function addLogs(address, topics, indexes) {
+        var tailFrom = Math.max(scanFrom, previousHead - 24999);
+        if (tailFrom > scanFrom) {
+          indexes.push(phase1.length);
+          phase1.push({ method: "eth_getLogs", params: [{ address: address, topics: topics,
+            fromBlock: utils.hexValue(scanFrom), toBlock: utils.hexValue(tailFrom - 1) }] });
+        }
+        indexes.push(phase1.length);
+        phase1.push({ method: "eth_getLogs", params: [{ address: address, topics: topics,
+          fromBlock: utils.hexValue(tailFrom), toBlock: "latest" }] });
+      }
+      var v3Addresses = [];
+      var v4Keys = [];
+      current.pairs.forEach(function (entry) {
+        entry.v3Pools.forEach(function (pool) { v3Addresses.push(pool.address); });
+        entry.v4Keys.forEach(function (k) { v4Keys.push(k.key); });
+      });
+      // V4: ONE eth_getLogs on the PoolManager with the Swap topic only; our pool ids are filtered client-side.
+      if (current.protocol !== "V3" && v4Keys.length) addLogs(POOL_MANAGER, [SWAP_TOPIC], v4Indexes);
+      // V3: ONE eth_getLogs over every discovered pool address. Never an empty address list.
+      if (current.protocol !== "V4" && v3Addresses.length) addLogs(v3Addresses, [V3_SWAP_TOPIC], v3Indexes);
+      var results = await batchRequest(phase1);
+      var latest = decodeBlock(results[0], "latest");
+      current.scanHead = latest.number;
+      if (latest.number < previousHead) fail("latest block moved backwards; retrying with refreshed log window");
+      var fromBlock = Math.max(0, latest.number - (blocks - 1));
+      function logsInWindow(indexes) {
+        return indexes.reduce(function (logs, i) {
+          var entries = rpcResult(results[i]);
+          if (!Array.isArray(entries)) fail("eth_getLogs did not return a list");
+          return logs.concat(entries.filter(function (log) {
+            if (!log || log.removed) return false;
+            var number = BigNumber.from(log.blockNumber).toNumber();
+            return number >= fromBlock && number <= latest.number;
+          }));
+        }, []);
+      }
+      var v4Logs = logsInWindow(v4Indexes);
+      var v3Logs = logsInWindow(v3Indexes);
+      var pools = [];
+      current.pairs.forEach(function (entry) {
+        var pair = entry.pair;
+        var scale = Math.pow(10, pair.decimals0 - pair.decimals1);
+        var rows = [];
+        if (entry.v4Keys.length) {
+          rows = summarisePools(entry.v4Keys.map(function (k) { return k.key; }), v4Logs);
+          rows.forEach(function (row, i) { row.protocol = "V4"; row.discoveredLiquidity = entry.v4Keys[i].liquidity; });
+        }
+        rows = rows.concat(summariseV3Pools(entry.v3Pools, v3Logs));
+        rows.forEach(function (row) {
+          row.pair = pair;
+          row.pairKey = pair.pairKey;
+          row.tokenB = pair.tokenB;
+          row.displayPrice = row.price === null ? null : row.price * scale;
+          row.swapTimestamp = null;
+          row.elapsedSeconds = null;
+          row.empty = null;
+          row.healthError = null;
+        });
+        pools = pools.concat(rows);
+      });
+      await readPoolHealthBatch(batchRequest, pools, latest);
+      annotatePools(pools, maxStaleness());
+      current.pools = pools;
+      current.spreads = allPairsSpreads(pools, threshold());
+      current.blockNumber = latest.number;
+      current.blockTimestamp = latest.timestamp;
+      current.fromBlock = fromBlock;
+      current.windowBlocks = blocks;
+      current.lastPoll = now();
+      current.lastError = null;
+      current.retryAt = null;
+      current.polls += 1;
+      return current;
+    }
+
+    async function cycle() {
+      if (!running) return;
+      var mine = generation;
+      var delay = pollMs;
+      try {
+        await pollOnce();
+        if (mine !== generation) return;
+        onUpdate(state);
+      } catch (error) {
+        if (mine !== generation) return;
+        delay = retryMs;
+        state.errors += 1;
+        state.lastError = messageOf(error);
+        state.retryAt = now() + retryMs;
+        onError(error, state);
+        onUpdate(state);
+      }
+      if (mine !== generation || !running) return;
+      state.nextPollMs = delay;
+      timer = setTimeout(cycle, delay);
+    }
+
+    function stop() {
+      running = false;
+      generation += 1;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    }
+
+    /** Validates Token A and the list synchronously so a bad field never starts a loop. */
+    function start(tokenA, tokenBList, protocol) {
+      stop();
+      if (protocol !== undefined) normaliseProtocol(protocol);
+      var list = Array.isArray(tokenBList) ? parseTokenList(tokenBList.join("\n"), tokenA) : parseTokenList(tokenBList, tokenA);
+      list.forEach(function (tokenB) { sortPair(tokenA, tokenB); });
+      tokens = [utils.getAddress(tokenA), list];
+      state = freshState();
+      state.tokenA = tokens[0];
+      state.tokenBs = list;
+      if (protocol !== undefined) state.protocol = normaliseProtocol(protocol);
+      running = true;
+      return cycle();
+    }
+
+    return { start: start, stop: stop, pollOnce: pollOnce, getState: function () { return state; },
+      isRunning: function () { return running; } };
   }
 
   /** Permit2 uses uint160/uint48, NOT ERC20's approve(address,uint256). Zero amount revokes. */
@@ -2062,6 +2610,39 @@
       return { hash: receipt.transactionHash, amount: value, reserve: reserve, receipt: receipt };
     }
 
+    /**
+     * Follow-up 6 REVOKE ALL: token.approve(SwapRouter02, 0) then token.approve(Permit2, 0) for the
+     * input token, sequentially, each simulated and confirmed before the next. Allowances already
+     * at zero are skipped. Resolves with the list of { spender, hash } confirmed.
+     */
+    async function revokeAll(token, label) {
+      var expected = session;
+      prepared = null;
+      await assertSession(expected);
+      var asset = utils.getAddress(token);
+      var name = label || labelFor(asset);
+      await requireCode(asset);
+      var done = [];
+      var spenders = [[V3_ROUTER, "V3 Router"], [PERMIT2, "Permit2"]];
+      for (var i = 0; i < spenders.length; i++) {
+        var spender = spenders[i][0];
+        await assertSession(expected);
+        if ((await tokenAllowance(expected, asset, spender)).isZero()) {
+          status(name + " allowance to " + spenders[i][1] + " is already 0; skipped");
+          continue;
+        }
+        var transaction = { from: expected.account, to: asset, value: "0x0", chainId: utils.hexValue(CHAIN_ID),
+          data: v3TokenInterface.encodeFunctionData("approve", [spender, 0]) };
+        var result = await request("eth_call", [transaction, "latest"]);
+        if (result !== "0x" && !abi.decode(["bool"], result)[0]) fail("Token refused the " + spenders[i][1] + " revocation");
+        var receipt = await submit(transaction, expected, name + " revoke " + spenders[i][1] + " allowance");
+        if (!(await tokenAllowance(expected, asset, spender)).isZero()) fail(name + " allowance to " + spenders[i][1] + " is still above 0 after confirmation");
+        done.push({ spender: spender, hash: receipt.transactionHash });
+      }
+      await assertSession(expected);
+      return done;
+    }
+
     function destroy() {
       invalidate();
       if (typeof provider.removeListener === "function") {
@@ -2073,7 +2654,7 @@
       prepareRoute: prepareRoute, sendRoute: sendRoute, approveRouteV3: approveRouteV3, approveRoutePermit2: approveRoutePermit2,
       approveBothPermit2: approveBothPermit2, checkTokenAllowances: checkTokenAllowances,
       checkAllowances: checkAllowances, prepareSwap: prepareSwap, sendSwap: sendSwap,
-      readBalances: readBalances, transferAllToken: transferAllToken, transferAllEth: transferAllEth,
+      readBalances: readBalances, transferAllToken: transferAllToken, transferAllEth: transferAllEth, revokeAll: revokeAll,
       request: request, account: function () { return session ? session.account : null; },
       invalidate: invalidate, destroy: destroy };
   }
@@ -2088,6 +2669,32 @@
   }
 
   return {
+    // Follow-up 6
+    RPC_FALLBACK_URL: RPC_FALLBACK_URL,
+    RPC_LEGACY_URL: RPC_LEGACY_URL,
+    DRAINED_TICK: DRAINED_TICK,
+    GAS_UNITS: GAS_UNITS,
+    LOCK_KEY: LOCK_KEY,
+    LOCK_TTL_MS: LOCK_TTL_MS,
+    LIQUIDITY_OFFSET: LIQUIDITY_OFFSET,
+    MANUAL_READS_WITH_LIQUIDITY: MANUAL_READS_WITH_LIQUIDITY,
+    isDrained: isDrained,
+    gasUnitsFor: gasUnitsFor,
+    estimateGasCost: estimateGasCost,
+    formatUsd: formatUsd,
+    usdPerToken: usdPerToken,
+    netAfterGas: netAfterGas,
+    fetchEthUsd: fetchEthUsd,
+    createTabLock: createTabLock,
+    parseTokenList: parseTokenList,
+    liquidityStorageSlot: liquidityStorageSlot,
+    encodeLiquidityCall: encodeLiquidityCall,
+    decodeLiquidityWord: decodeLiquidityWord,
+    describeLeg: describeLeg,
+    tokenAPrice: tokenAPrice,
+    allPairsSpreads: allPairsSpreads,
+    allPairsAutoDecision: allPairsAutoDecision,
+    createAllPairsMonitor: createAllPairsMonitor,
     V3_FACTORY: V3_FACTORY,
     V3_ROUTER: V3_ROUTER,
     WETH: WETH,

@@ -11,7 +11,7 @@ const { V3Mock, poolA, poolB } = require("./v3-mock.js");
 const abi = ethers.utils.defaultAbiCoder;
 const bn = ethers.BigNumber.from;
 const lower = (a) => a.toLowerCase();
-const SELECTORS = { "0x0dfe1681": "token0", "0xd21220a7": "token1", "0xddca3f43": "fee", "0x3850c7bd": "slot0" };
+const SELECTORS = { "0x0dfe1681": "token0", "0xd21220a7": "token1", "0xddca3f43": "fee", "0x3850c7bd": "slot0", "0x1a686502": "liquidity" };
 const WETH = ethers.utils.getAddress(E.WETH);
 const PONS = ethers.utils.getAddress(E.PONS);
 const USDG = ethers.utils.getAddress(E.USDG);
@@ -24,7 +24,8 @@ const LIVE_SLOT0_B = "0x000000000000000000000000000000000000006e482fb88f9dc537e6
 /** A pool fixture. `layout` 7 is canonical V3 slot0, 6 is the brief's declared ABI. */
 function pool(token0, token1, fee, tick, extra = {}) {
   return { token0, token1, fee, tick, sqrtPriceX96: extra.sqrtPriceX96 === undefined ? bn(2).pow(96) : bn(extra.sqrtPriceX96),
-    layout: extra.layout || 7, revert: extra.revert || null, raw: extra.raw || null };
+    layout: extra.layout || 7, revert: extra.revert || null, raw: extra.raw || null,
+    liquidity: extra.liquidity === undefined ? bn("1000000000000000000") : bn(extra.liquidity) }; // follow-up 6: liquidity()
 }
 
 class ManualMock extends V3Mock {
@@ -63,6 +64,7 @@ class ManualMock extends V3Mock {
         if (name === "token0") return abi.encode(["address"], [fixture.token0]);
         if (name === "token1") return abi.encode(["address"], [fixture.token1]);
         if (name === "fee") return abi.encode(["uint24"], [fixture.fee]);
+        if (name === "liquidity") return abi.encode(["uint128"], [fixture.liquidity]);
         return this.slot0Reply(fixture);
       }
     }
