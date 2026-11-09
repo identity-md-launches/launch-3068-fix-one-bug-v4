@@ -192,7 +192,8 @@ for (const token of [E.USDG, E.PONS]) {
       if (kind === "ERC20") provider.tokenAllowances.set(token.toLowerCase(), ethers.BigNumber.from(0));
       else provider.setPermit(token, kind === "insufficient" ? 0 : E.MAX_UINT160,
         kind === "expired" ? provider.now - 1 : kind === "expires before deadline" ? provider.now + 100 : provider.now + 3600);
-      await assert.rejects(client.prepareSwap(args), /allowance/);
+      // Job 8 fix 8: a layer-1 allowance of exactly 0 gets the clear Permit2 instruction; Permit2-table problems keep theirs.
+      await assert.rejects(client.prepareSwap(args), kind === "ERC20" ? /⚠️ Approve (USDG|PONS) for Permit2 in MetaMask \(Contract tab → Permit2 → increaseAllowance\) before this route will work\./ : /allowance/);
       assert.equal(provider.sent.length, 0);
       assert.equal(provider.routerCalls, 0);
     });

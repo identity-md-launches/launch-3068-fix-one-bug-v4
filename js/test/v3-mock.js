@@ -151,8 +151,9 @@ class V3Mock extends MockWallet {
       if (this.tokens.has(lower(tx.to))) {
         if (tx.data.slice(0, 10) === token.getSighash("approve")) {
           const [spender] = token.decodeFunctionData("approve", tx.data);
-          // V3 Router approvals (follow-up 4) and the Permit2 revocation of REVOKE ALL (follow-up 6).
-          assert.ok([lower(E.V3_ROUTER), lower(E.PERMIT2)].includes(lower(spender)), "approve spender " + spender);
+          // V3 Router approvals (follow-up 4), the Permit2 revocation of REVOKE ALL (follow-up 6) and the
+          // PoolManager revocation (job 8 fix 3).
+          assert.ok([lower(E.V3_ROUTER), lower(E.PERMIT2), lower(E.POOL_MANAGER)].includes(lower(spender)), "approve spender " + spender);
           return token.encodeFunctionResult("approve", [!this.approveFalse]);
         }
         if (tx.data.slice(0, 10) === erc20.getSighash("allowance")) {
@@ -172,7 +173,8 @@ class V3Mock extends MockWallet {
     if (this.tokens.has(lower(tx.to)) && tx.data.slice(0, 10) === token.getSighash("approve")) {
       const [spender, amount] = token.decodeFunctionData("approve", tx.data);
       if (lower(spender) === lower(E.PERMIT2)) this.tokenAllowances.set(lower(tx.to), bn(amount)); // ERC20 → Permit2 layer
-      else this.setAllowance(tx.to, amount, tx.from);
+      else if (lower(spender) === lower(E.V3_ROUTER)) this.setAllowance(tx.to, amount, tx.from);
+      else this.spenderAllowances.set(this.key(tx.from, tx.to, spender), bn(amount)); // e.g. the PoolManager
       return;
     }
     const v3Swap = lower(tx.to) === lower(E.V3_ROUTER);

@@ -1794,6 +1794,70 @@
     return pool.pair.tokenA === pool.pair.currency0 ? pool.displayPrice : 1 / pool.displayPrice;
   }
 
+  // ------------------------------------------------------------------ job 8: audit fixes
+
+  /**
+   * Fix 5: a cross-pair ("3-LEG") row is a binary indicator, never a percentage. It is live (green
+   * dot) when both pools exist and are tradeable; its price ratio means nothing and is not shown.
+   */
+  function threeLegLive(buy, sell) {
+    return !!buy && !!sell && isTradeable(buy) && isTradeable(sell);
+  }
+
+  /**
+   * Fix 1: auto mode may send only when the quoted return is STRICTLY greater than the input.
+   * Both amounts are in currency1 base units; a missing or zero return never qualifies.
+   */
+  function autoSendAllowed(amountIn, expectedReturn) {
+    if (amountIn === null || amountIn === undefined || expectedReturn === null || expectedReturn === undefined) return false;
+    var input = BigNumber.from(amountIn);
+    var out = BigNumber.from(expectedReturn);
+    return !input.isZero() && out.gt(input);
+  }
+
+  /** Fix 1 message, shown in red instead of sending. */
+  var AUTO_ABORT_MESSAGE = "ABORTED: return ≤ input";
+
+  /** Fix 7: the colour class of the return value: green when return > input, red otherwise. */
+  function returnColor(amountIn, expectedReturn) {
+    return autoSendAllowed(amountIn, expectedReturn) ? "green" : "red";
+  }
+
+  /** Fix 2: a sell leg that quotes 0 (no liquidity in the tick range) makes the route invalid. */
+  function sellQuoteValid(sellQuote) {
+    return sellQuote !== null && sellQuote !== undefined && !BigNumber.from(sellQuote).isZero();
+  }
+
+  /** Fix 2 message. */
+  var SELL_QUOTE_ZERO_MESSAGE = "Sell leg quotes 0: no liquidity in the tick range. Route invalid (RED); nothing will be sent.";
+
+  /**
+   * Fix 3: every spender REVOKE ALL zeroes, for each of Token A and Token B: the V3 SwapRouter02,
+   * the V4 PoolManager and Permit2. Allowances already at 0 are skipped.
+   */
+  var REVOKE_SPENDERS = [[V3_ROUTER, "V3 Router"], [POOL_MANAGER, "PoolManager"], [PERMIT2, "Permit2"]];
+
+  /** Fix 8: the exact inline message for a missing layer-1 (token → Permit2) ERC20 allowance. */
+  function permit2LayerOneMessage(symbol) {
+    return "⚠️ Approve " + symbol + " for Permit2 in MetaMask (Contract tab → Permit2 → increaseAllowance) before this route will work.";
+  }
+
+  /** ERC20 allowance(owner, spender) of `token` through any JSON-RPC request function. Read-only. */
+  async function readErc20Allowance(request, token, owner, spender) {
+    var result = await request("eth_call", [{ to: utils.getAddress(token),
+      data: tokenInterface.encodeFunctionData("allowance", [utils.getAddress(owner), utils.getAddress(spender)]) }, "latest"]);
+    if (!result || result === "0x") fail("no allowance() at " + token);
+    return tokenInterface.decodeFunctionResult("allowance", result)[0];
+  }
+
+  /** The V4 legs' input tokens of a route (currency1 for a V4 buy, currency0 for a V4 sell). */
+  function permit2LayerOneTokens(buy, sell, pair) {
+    var tokens = [];
+    if (protocolOf(buy) === "V4") tokens.push({ token: pair.currency1, symbol: pair.symbol1 });
+    if (protocolOf(sell) === "V4") tokens.push({ token: pair.currency0, symbol: pair.symbol0 });
+    return tokens;
+  }
+
   /**
    * Every pairwise combination of tradeable pools across all pairs, best net first. Same-pair rows
    * are the executable spreads of rankSpreads (buy = lower currency1-per-currency0 price). Rows
@@ -1824,12 +1888,18 @@
         var spread = spreadPercent(pa, pb);
         var feeCost = feeCostPercent(buy.fee, sell.fee);
         var net = spread - feeCost;
+        // Job 8 fix 5: the ratio is kept for callers that want it but is NOT a verdict; the row is a
+        // binary indicator (live = both pools exist and are tradeable) and is never GREEN or RED.
         spreads.push({ buy: buy, sell: sell, spreadPercent: spread, feeCostPercent: feeCost, netPercent: net,
-          verdict: net > threshold ? "GREEN" : "RED", crossPair: true,
+          verdict: "3-LEG", crossPair: true, live: threeLegLive(buy, sell),
           path: describeLeg(buy) + " → " + describeLeg(sell) });
       }
     }
-    spreads.sort(function (x, y) { return y.netPercent - x.netPercent; });
+    // Executable same-pair rows first, best net first; 3-LEG indicators after them, in pool order.
+    spreads.sort(function (x, y) {
+      if (x.crossPair !== y.crossPair) return x.crossPair ? 1 : -1;
+      return x.crossPair ? 0 : y.netPercent - x.netPercent;
+    });
     return spreads;
   }
 
@@ -2177,12 +2247,36 @@
         var result = await request("eth_call", [{
           to: entry[0], data: tokenInterface.encodeFunctionData("allowance", [expected.account, PERMIT2]),
         }, "latest"]);
-        if (tokenInterface.decodeFunctionResult("allowance", result)[0].lt(entry[1])) {
+        var allowed = tokenInterface.decodeFunctionResult("allowance", result)[0];
+        // Job 8 fix 8: a missing layer-1 allowance gets the exact inline instruction, never an opaque revert.
+        if (allowed.isZero()) fail(permit2LayerOneMessage(entry[2]));
+        if (allowed.lt(entry[1])) {
           fail(entry[2] + " ERC20 allowance to Permit2 is too low. Approve the token to " + PERMIT2 +
             " first; an ERC20 approval to the router is not used");
         }
       }
       await assertSession(expected);
+    }
+
+    /**
+     * Job 8 fix 8 fallback: when a V4 leg's eth_call or send fails, re-read the layer-1 allowance of
+     * its input token; if it is 0 the clear message replaces the opaque revert. Other errors pass.
+     */
+    async function explainV4Failure(error, token, symbol, expected) {
+      var allowed = null;
+      try { allowed = await tokenAllowance(expected, token, PERMIT2); } catch (ignored) { allowed = null; }
+      if (allowed !== null && allowed.isZero()) {
+        var clear = new Error("V4ArbEncoder: " + permit2LayerOneMessage(symbol));
+        clear.cause = error;
+        if (error && error.pendingHash) clear.pendingHash = error.pendingHash;
+        throw clear;
+      }
+      throw error;
+    }
+
+    /** Runs a V4 leg step; on failure applies explainV4Failure for the leg's input token. */
+    async function v4Step(action, token, symbol, expected) {
+      try { return await action(); } catch (error) { return explainV4Failure(error, token, symbol, expected); }
     }
 
     async function checkAllowances(usdgAmount, ponsAmount, validUntil, pair) {
@@ -2318,7 +2412,7 @@
       await checkAllowances(args.usdgIn, args.ponsAmount, deadline, pair);
       var transaction = Object.freeze({ from: expected.account, to: ROUTER, data: data, value: "0x0",
         chainId: utils.hexValue(CHAIN_ID) });
-      await request("eth_call", [transaction, "latest"]);
+      await v4Step(function () { return request("eth_call", [transaction, "latest"]); }, pair.currency1, pair.symbol1, expected);
       await assertSession(expected);
       prepared = Object.freeze({ transaction: transaction, deadline: deadline,
         usdgIn: BigNumber.from(args.usdgIn), ponsAmount: BigNumber.from(args.ponsAmount),
@@ -2335,8 +2429,10 @@
       await assertSession(expected);
       if ((await timestamp()) >= candidate.deadline) fail("Swap deadline has expired; build and dry run again");
       await checkAllowances(candidate.usdgIn, candidate.ponsAmount, candidate.deadline, candidate.pair);
-      await request("eth_call", [candidate.transaction, "latest"]);
-      return submit(candidate.transaction, expected, "Swap");
+      return v4Step(async function () {
+        await request("eth_call", [candidate.transaction, "latest"]);
+        return submit(candidate.transaction, expected, "Swap");
+      }, candidate.pair.currency1, candidate.pair.symbol1, expected);
     }
 
     // -------------------------------------------------------------- V3 and mixed execution
@@ -2390,7 +2486,10 @@
       await assertSession(expected);
       for (var entry of routeApprovals(route)) {
         var spender = entry.protocol === "V3" ? V3_ROUTER : PERMIT2;
-        if ((await tokenAllowance(expected, entry.token, spender)).lt(entry.amount)) {
+        var allowed = await tokenAllowance(expected, entry.token, spender);
+        // Job 8 fix 8: layer 1 (token → Permit2) at 0 gets the exact inline instruction before anything is sent.
+        if (entry.protocol === "V4" && allowed.isZero()) fail(permit2LayerOneMessage(labelFor(entry.token, route.pair)));
+        if (allowed.lt(entry.amount)) {
           fail(labelFor(entry.token, route.pair) + " ERC20 allowance to " + (entry.protocol === "V3" ? "V3 Router is too low; click APPROVE V3 ROUTER" : "Permit2 is too low"));
         }
         if (entry.protocol === "V4") {
@@ -2437,7 +2536,9 @@
       for (var entry of routeApprovals(route).filter(function (entry) { return entry.protocol === "V4"; })) {
         var limit = entry.amount.mul(100);
         encodePermit2Approve(entry.token, ROUTER, limit, expiration);
-        if ((await tokenAllowance(expected, entry.token, PERMIT2)).lt(entry.amount)) fail("ERC20 allowance to Permit2 is too low; approve the token to Permit2 first");
+        var layerOne = await tokenAllowance(expected, entry.token, PERMIT2);
+        if (layerOne.isZero()) fail(permit2LayerOneMessage(labelFor(entry.token, route.pair)));
+        if (layerOne.lt(entry.amount)) fail("ERC20 allowance to Permit2 is too low; approve the token to Permit2 first");
         var allowed = await readPermit2(expected.account, entry.token);
         if (allowed.amount.gte(limit) && BigNumber.from(allowed.expiration).gte(until)) {
           status("Permit2 allowance already sufficient; skipped"); continue;
@@ -2492,7 +2593,9 @@
       await checkRouteAllowances(route, deadline, expected);
       var transactions = Object.freeze(routeTransactions(route, expected.account, deadline));
       // Mixed leg 2 is simulated only AFTER leg 1 confirms: its funds do not exist yet.
-      await request("eth_call", [transactions[0], "latest"]);
+      if (route.buy.protocol === "V4") {
+        await v4Step(function () { return request("eth_call", [transactions[0], "latest"]); }, route.pair.currency1, route.pair.symbol1, expected);
+      } else await request("eth_call", [transactions[0], "latest"]);
       await assertSession(expected);
       prepared = Object.freeze({ route: route, transactions: transactions, transaction: transactions[0], deadline: deadline });
       status(route.mixed ? "First leg dry run succeeded; second leg will be simulated after its funds arrive" : "V3 atomic dry run succeeded");
@@ -2527,8 +2630,12 @@
         if ((await timestamp()) >= candidate.deadline) fail("Swap deadline has expired; build and dry run again");
         await checkRouteAllowances(candidate.route, candidate.deadline, expected);
         var before = candidate.route.mixed ? (await readBalances([candidate.route.pair.currency0], expected.account)).tokens[0] : null;
-        await request("eth_call", [candidate.transactions[0], "latest"]);
-        firstReceipt = await submitLeg(candidate.transactions[0], candidate.route.mixed ? "Mixed leg 1" : "V3 atomic swap");
+        var legOne = async function () {
+          await request("eth_call", [candidate.transactions[0], "latest"]);
+          return submitLeg(candidate.transactions[0], candidate.route.mixed ? "Mixed leg 1" : "V3 atomic swap");
+        };
+        firstReceipt = candidate.route.buy.protocol === "V4"
+          ? await v4Step(legOne, candidate.route.pair.currency1, candidate.route.pair.symbol1, expected) : await legOne();
         if (!candidate.route.mixed) return firstReceipt;
         await assertSession(expected);
         var after = (await readBalances([candidate.route.pair.currency0], expected.account)).tokens[0];
@@ -2543,8 +2650,11 @@
           var permit = await readPermit2(expected.account, token);
           if (permit.amount.lt(candidate.route.ponsAmount) || BigNumber.from(permit.expiration).lt(candidate.deadline)) fail("Second leg Permit2 allowance expired or is insufficient");
         }
-        await request("eth_call", [candidate.transactions[1], "latest"]);
-        var receipt = await submitLeg(candidate.transactions[1], "Mixed leg 2");
+        var legTwo = async function () {
+          await request("eth_call", [candidate.transactions[1], "latest"]);
+          return submitLeg(candidate.transactions[1], "Mixed leg 2");
+        };
+        var receipt = sell.protocol === "V4" ? await v4Step(legTwo, token, candidate.route.pair.symbol0, expected) : await legTwo();
         return Object.assign({}, receipt, { firstLegHash: firstReceipt.transactionHash });
       } catch (error) {
         if (candidate.route.mixed && firstReceipt) {
@@ -2611,9 +2721,10 @@
     }
 
     /**
-     * Follow-up 6 REVOKE ALL: token.approve(SwapRouter02, 0) then token.approve(Permit2, 0) for the
-     * input token, sequentially, each simulated and confirmed before the next. Allowances already
-     * at zero are skipped. Resolves with the list of { spender, hash } confirmed.
+     * Follow-up 6 REVOKE ALL, widened by job 8 fix 3: token.approve(spender, 0) for every known
+     * spender (SwapRouter02, the V4 PoolManager, Permit2) of ONE token, sequentially, each simulated
+     * and confirmed before the next. Allowances already at zero are skipped. Resolves with the list
+     * of { spender, hash } confirmed. The page calls it once per token (Token A, then Token B).
      */
     async function revokeAll(token, label) {
       var expected = session;
@@ -2623,7 +2734,7 @@
       var name = label || labelFor(asset);
       await requireCode(asset);
       var done = [];
-      var spenders = [[V3_ROUTER, "V3 Router"], [PERMIT2, "Permit2"]];
+      var spenders = REVOKE_SPENDERS;
       for (var i = 0; i < spenders.length; i++) {
         var spender = spenders[i][0];
         await assertSession(expected);
@@ -2669,6 +2780,17 @@
   }
 
   return {
+    // Job 8: audit fixes
+    AUTO_ABORT_MESSAGE: AUTO_ABORT_MESSAGE,
+    SELL_QUOTE_ZERO_MESSAGE: SELL_QUOTE_ZERO_MESSAGE,
+    REVOKE_SPENDERS: REVOKE_SPENDERS,
+    threeLegLive: threeLegLive,
+    autoSendAllowed: autoSendAllowed,
+    returnColor: returnColor,
+    sellQuoteValid: sellQuoteValid,
+    permit2LayerOneMessage: permit2LayerOneMessage,
+    permit2LayerOneTokens: permit2LayerOneTokens,
+    readErc20Allowance: readErc20Allowance,
     // Follow-up 6
     RPC_FALLBACK_URL: RPC_FALLBACK_URL,
     RPC_LEGACY_URL: RPC_LEGACY_URL,

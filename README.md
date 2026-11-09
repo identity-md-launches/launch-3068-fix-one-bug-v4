@@ -7,6 +7,118 @@ on chain 4663, with the evidence for the fix.
 The deliverables are [`index.html`](index.html) and [`js/v4-arb-encoder.js`](js/v4-arb-encoder.js):
 plain JavaScript and the existing vendored ethers v5, with no install or CDN required.
 
+## Job 8: Audit fixes, display, Permit2, UX
+
+Nine fixes to the existing page, Worker and encoder. No new dependency, no build step, no change to
+the watch/scan logic, pool detection or RPC fallback; the layout is unchanged apart from the items
+below. Everything earlier still passes (225 Node tests, 139 Foundry tests, see verification).
+
+### What changed, item by item
+
+1. **Auto mode guard (HIGH).** Every route is now quoted on both legs (see 2). Before an automatic
+   send the page checks `autoSendAllowed(input, return)`: the quoted return must be **strictly
+   greater** than the input. Otherwise nothing is built or sent and the status line shows, in red,
+   `ABORTED: return ≤ input (0.005209 ≤ 0.01 USDG). Nothing sent.`; the abort is logged once per
+   route. Auto mode stays ON (an abort is a guard, not a failure) and re-checks on the next poll, so it
+   resumes by itself when the return beats the input again. A manual SEND is still the user's call: the
+   quote line is red (7) and the status warns, but the button works.
+2. **V4/V4 sell quote floor (MED).** `quoteSpread` quotes the sell leg for V4/V4 routes as well (input
+   = the bridge amount, exactly what swap 2 sells). A quote of 0 means no liquidity in the tick range:
+   the route is invalid, the quote line says so in red, the bridge amount is cleared (dry run, approve
+   and send disabled), the sell pool is remembered and its rows show **`RED · sell quote 0`** in the
+   spread tables. Auto mode never sends it: if it finds the zero itself it aborts (red line, stays ON);
+   afterwards it skips the marked route without quoting again. The mark clears when the row is clicked
+   and quotes above 0, or when the pair, protocol or mode restarts. The "Minimum currency1 return" field
+   keeps its default **0**; for V4/V4 the return quote is the guard, the minimum is not raised.
+3. **REVOKE ALL: both tokens (MED).** The button now loops **Token A, then Token B**, and for each token
+   zeroes the ERC20 allowance to the **V3 SwapRouter02, the V4 PoolManager and Permit2**
+   (`REVOKE_SPENDERS`), one confirmed transaction after another; allowances already at 0 are skipped.
+   The status line reports per token: `PONS: nothing to revoke · USDG: ✓ revoked (V3 Router 0x…,
+   PoolManager 0x…, Permit2 0x…)`; a refused or failed revocation marks that token `✗ not revoked (…)`
+   and stops. The Universal Router is not in the list: the page never asks for an ERC20 approval to it
+   (it pulls through Permit2), and Permit2's own allowance table is untouched as before.
+4. **Worker: origin + method allow-list (LOW).** `worker/rpc-proxy.js` refuses, with 403 and before
+   contacting any upstream: a request whose `Origin` is not loopback (`http(s)://localhost`,
+   `127.0.0.1` or `[::1]`, optional port 1–65535, nothing else; a missing or `null` origin is refused
+   too), and any request, or any entry of a batch, whose `method` is not one of
+   `eth_call, eth_blockNumber, eth_getBalance, eth_estimateGas, eth_getTransactionReceipt,
+   eth_getTransactionByHash, eth_chainId, net_version` (`ALLOWED_METHODS`). CORS now echoes the
+   loopback origin instead of `*`. **Consequence stated plainly:** the brief's list does not include
+   `eth_getLogs`, `eth_getBlockByNumber`, `eth_gasPrice` or `eth_getCode`, which the pool scan and the
+   gas line use. The page's default `RPC_URL` is still Blockmachine directly, so nothing breaks; an
+   operator who points `RPC_URL` at the Worker gets quotes, balances and receipts but no scan unless
+   they widen `ALLOWED_METHODS` in their own deployment. The page must be served from a local web
+   server (not opened as a file) for its origin to pass.
+5. **3-LEG display.** Cross-pair rows in All pairs show no Spread%, Fee Cost% or Net% at all. The
+   Verdict cell shows `● 3-LEG` in green when both pools exist and are tradeable (`threeLegLive`), and
+   the Legs cell `3-LEG · watch-only`. `allPairsSpreads` tags these rows `verdict: "3-LEG"`,
+   `live: true/false`, and lists them after every executable row; they still cannot be clicked.
+6. **Token B list never wraps.** `#token-b-list { white-space: pre; overflow-x: auto; }`. `pre` rather
+   than `nowrap`: the field holds one address per line and `nowrap` would collapse the line breaks; `pre`
+   keeps them and refuses to wrap a long address, which scrolls horizontally instead.
+7. **Quote line colour.** The quote line is rendered as spans; the **return value itself** is green
+   when return > input and red when return ≤ input (`returnColor`), followed by `(return > input)` or
+   `(return ≤ input: a loss before gas)`. The line's own class carries no colour any more; the status
+   line turns red for a losing quote.
+8. **Permit2 layer 1 (token → Permit2).** Preferred path: after a quote, with a wallet connected, the
+   page reads `allowance(account, Permit2)` of every V4 leg's input token through the public RPC and,
+   at 0, shows inline (route notice, status and activity log) exactly:
+   `⚠️ Approve [TOKEN] for Permit2 in MetaMask (Contract tab → Permit2 → increaseAllowance) before
+   this route will work.` The same message is thrown by the dry run, the send and APPROVE PERMIT2
+   (`checkTokenAllowances`, `checkRouteAllowances`, `approveRoutePermit2`) when the allowance is 0,
+   so no transaction is sent; a non-zero but insufficient allowance keeps the earlier "too low" text.
+   Fallback: if a V4 leg's `eth_call` or submission still fails, the allowance is re-read and, at 0,
+   the opaque revert is replaced by the same message (`explainV4Failure`); other reverts pass through
+   unchanged.
+9. **Auto checkbox click area.** The `<label>` wrapper is gone: `<input id="auto-mode" type="checkbox"
+   aria-labelledby="auto-mode-text">` followed by `<span id="auto-mode-text">`. Only the 14×14 square
+   toggles auto mode; the text is inert (the `aria-labelledby` keeps the accessible name).
+
+### Job 8 verification
+
+- `node --test js/test/*.test.js`: **225 cases**. New `audit-fixes.test.js` (the pure rules, REVOKE ALL
+  per token against the mock, the Permit2 message and token selection, the preferred and fallback
+  Permit2 paths through `prepareRoute`, `prepareSwap`, `sendRoute` and `approveRoutePermit2`), new
+  Worker tests (loopback and refused origins, missing origin, preflight, all eight methods, refused
+  methods, a poisoned batch), and page tests for every item: the red ABORTED line with nothing sent and
+  auto mode resuming, the zero sell quote (row RED, execution disabled, auto skip/abort, mark cleared on
+  restart), 3-LEG rows with empty percentages and a green dot, the textarea CSS, the coloured value
+  span (green on the V3 route, red on a losing V4/V4 route), the inline Permit2 message with the
+  approval and dry run stopped and the same clicks succeeding once approved, the check on connect, no
+  warning for V3/V3, and the checkbox markup. Mocks: the ERC20 `allowance()` of spenders other than
+  Permit2 is answered (0 unless set) instead of throwing, `approve(PoolManager, 0)` is accepted, and
+  the fake DOM's `textContent` concatenates child spans as a browser does. Three earlier assertions
+  changed with the brief: REVOKE ALL covers both tokens and three spenders, a zero layer-1 allowance
+  gets the new message, and 3-LEG rows are no longer ranked by net.
+- `forge build`, `forge test` (**139 tests, 6 suites**) with the verifier's fuzz seed and
+  `forge fmt --check` pass on the unchanged pinned solc 0.8.26. `src/AuditFixes.sol` +
+  `test/AuditFixes.t.sol` (32 tests, 7 fuzz) pin the rules: strict return > input with reverts at
+  equal, below and zero; the zero sell-quote floor; the 2 × 3 REVOKE ALL matrix and its skip rule; the
+  Permit2 layer-1 readiness; the exact method allow-list; the loopback-origin grammar including ports,
+  look-alike hosts and case; the 3-LEG indicator and the return colour.
+- Not done live: no transaction was sent and no live read was recorded for this job. The brief's
+  "$0.001 USDG" size is exercised in the Solidity tests (`TINY = 1_000` base units) and the page's
+  default input remains 0.01; set the Input field to `0.001` for a live test.
+
+### Job 8 assumptions and deployment
+
+| Item | Value |
+| --- | --- |
+| Auto-mode guard | return > input, both in currency1 base units, before dry run; abort keeps auto ON |
+| Sell quote input | V3 atomic: whole swap-1 output; every other route (V4/V4, mixed): bridge amount = quote − 0.5% |
+| Zero-sell mark | per sell pool id, in page memory; cleared by a non-zero re-quote or a restart of pair/protocol/mode |
+| REVOKE ALL spenders | `0xCaf681a66D020601342297493863E78C959E5cb2` (SwapRouter02), `0x8366a39CC670B4001A1121B8F6A443A643e40951` (PoolManager), `0x000000000022D473030F116dDEE9F6B43aC78BA3` (Permit2) |
+| Worker origins | `http`/`https` + `localhost`, `127.0.0.1`, `[::1]`, optional `:1`–`:65535`; CORS echoes the origin |
+| Worker methods | the brief's eight; no `eth_getLogs`/`eth_getBlockByNumber`/`eth_gasPrice`/`eth_getCode` |
+| Permit2 message | the brief's text verbatim, `[TOKEN]` = the pair's symbol; shown when the layer-1 allowance is exactly 0 |
+| Textarea | `white-space: pre` (not `nowrap`, which would collapse the lines) + horizontal scroll |
+| Test size | Foundry tests use 1 000 base units ($0.001 USDG); the page default stays 0.01 |
+
+Operators remain responsible for serving the page from a loopback origin when using the Worker, for
+widening `ALLOWED_METHODS` if the Worker is to carry the scan, for re-approving both tokens to every
+spender after REVOKE ALL, for watching the red ABORTED line (auto mode keeps polling and will send
+as soon as a quote beats the input), and for everything listed under "Operational responsibilities".
+
 ## Follow-up 6: All-pairs scanner, Manual mode (one-shot), hardening, Worker fallback
 
 **Mode** now offers **Auto-scan** (unchanged), **All pairs** (new) and **Manual** (re-added as a

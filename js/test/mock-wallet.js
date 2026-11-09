@@ -44,6 +44,7 @@ class MockWallet extends EventEmitter {
     this.pending = new Map();
     this.permits = new Map();
     this.tokenAllowances = new Map([[lower(E.USDG), E.MAX_UINT256], [lower(E.PONS), E.MAX_UINT256]]);
+    this.spenderAllowances = new Map(); // owner:token:spender → ERC20 allowance to spenders other than Permit2
     this.tokens = new Map([[lower(E.PONS), ["PONS", 18]], [lower(E.USDG), ["USDG", 6]]]);
     this.balances = new Map([
       [this.key(CALLER, E.PONS, "bal"), ethers.utils.parseUnits("1.5", 18)],
@@ -209,8 +210,12 @@ class MockWallet extends EventEmitter {
           if (this.balance(tx.from, tx.to).lt(amount)) throw new Error("execution reverted: ERC20: transfer amount exceeds balance");
           return erc20.encodeFunctionResult("transfer", [true]);
         }
-        const [, spender] = erc20.decodeFunctionData("allowance", tx.data);
-        if (lower(spender) !== lower(E.PERMIT2)) throw new Error("ERC20 allowance must target Permit2");
+        const [owner, spender] = erc20.decodeFunctionData("allowance", tx.data);
+        // Layer 1 (token → Permit2) is `tokenAllowances`; any other spender (job 8 REVOKE ALL reads the V4
+        // PoolManager too) answers from `spenderAllowances`, 0 unless a test sets it.
+        if (lower(spender) !== lower(E.PERMIT2)) {
+          return erc20.encodeFunctionResult("allowance", [this.spenderAllowances.get(this.key(owner, tx.to, spender)) || ethers.BigNumber.from(0)]);
+        }
         return erc20.encodeFunctionResult("allowance", [this.tokenAllowances.get(lower(tx.to)) || ethers.BigNumber.from(0)]);
       }
       if (lower(tx.to) === lower(E.ROUTER)) {

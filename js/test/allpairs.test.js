@@ -105,7 +105,10 @@ test("All pairs discovers V3 and V4 pools of several Token Bs in one batch, poll
   assert.ok(same.every((s) => s.buy.pairKey === s.sell.pairKey));
   assert.match(same.find((s) => s.buy.pair.symbolB === "WETH").path, /^V(3|4) .* \(WETH\) → V(3|4) .* \(WETH\)$/);
   assert.ok(cross[0].path.includes("(WETH)") && cross[0].path.includes("(USDG)"), cross[0].path);
-  assert.equal(spreads.map((s) => s.netPercent).join(), spreads.map((s) => s.netPercent).sort((a, b) => b - a).join(), "best net first");
+  // Job 8 fix 5: executable rows first, best net first; 3-LEG rows after them as binary indicators without a verdict.
+  assert.equal(same.map((s) => s.netPercent).join(), same.map((s) => s.netPercent).sort((a, b) => b - a).join(), "best net first");
+  assert.equal(spreads.findIndex((s) => s.crossPair), same.length, "3-LEG rows follow every executable row");
+  assert.ok(cross.every((s) => s.verdict === "3-LEG" && s.live === true), "3-LEG rows are live indicators, never GREEN/RED");
   // Same-pair rows carry what the existing execution path needs; cross-pair rows never reach auto mode.
   const usdgSpread = same.find((s) => s.buy.pair.symbolB === "USDG");
   assert.equal(usdgSpread.buy.pair.currency1, USDG);

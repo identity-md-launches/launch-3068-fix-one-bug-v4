@@ -12,12 +12,16 @@ const vm = require("node:vm");
 const { MockWallet, CALLER, OTHER, erc20 } = require("./mock-wallet.js");
 const { ethers } = require("../vendor/ethers-5.7.2.umd.min.js");
 const E = require("../v4-arb-encoder.js");
-const { V3Mock, v3, decodePath } = require("./v3-mock.js");
+const { V3Mock, v3, token, decodePath } = require("./v3-mock.js");
 
 function node(tag, attributes = {}) {
+  // textContent behaves as in the DOM: setting it replaces the children with one text run; reading it
+  // concatenates that run with the children's text (job 8 fix 7 renders the quote line as coloured spans).
+  let ownText = "";
   return {
     tagName: tag,
-    textContent: "",
+    get textContent() { return ownText + this.children.map((child) => child.textContent).join(""); },
+    set textContent(value) { ownText = String(value); this.children = []; },
     value: attributes.value || "",
     disabled: attributes.disabled || false,
     checked: attributes.checked || false,
@@ -1210,25 +1214,45 @@ test("the multi-tab lock disables execution when another tab sent less than 5 mi
   assert.equal(store.has("ponsarb_lock"), false, "cleared on unload");
 });
 
-test("REVOKE ALL zeroes the input token's allowances to the V3 Router and Permit2 in two confirmed transactions", async () => {
+test("REVOKE ALL (job 8 fix 3) loops Token A then Token B over the V3 Router, the PoolManager and Permit2, with a status per token", async () => {
   const provider = new V3Mock();
-  provider.setAllowance(E.USDG, 12345);
+  provider.setAllowance(E.USDG, 12345); // USDG → V3 Router
+  provider.spenderAllowances.set(provider.key(CALLER, E.USDG, E.POOL_MANAGER), ethers.BigNumber.from(77)); // USDG → PoolManager
+  provider.tokenAllowances.set(E.PONS.toLowerCase(), ethers.BigNumber.from(0)); // PONS has nothing to revoke
   const page = await readyPage(provider), { element } = page;
   assert.equal(element("revoke-controls").hidden, true, "hidden until connected");
   await element("connect").click();
   assert.equal(element("revoke-controls").hidden, false);
   await element("revoke-all").click();
   await page.flush();
-  assert.equal(provider.sent.length, 2, element("revoke-status").textContent + " | " + element("status").textContent);
-  assert.ok(provider.sent.every((tx) => tx.to.toLowerCase() === E.USDG.toLowerCase()), "the input token, currency1");
+  assert.equal(provider.sent.length, 3, element("revoke-status").textContent + " | " + element("status").textContent);
+  assert.ok(provider.sent.every((tx) => tx.to.toLowerCase() === E.USDG.toLowerCase()), "only USDG had allowances");
+  const spenders = provider.sent.map((tx) => token.decodeFunctionData("approve", tx.data)[0].toLowerCase());
+  assert.deepEqual(spenders, [E.V3_ROUTER, E.POOL_MANAGER, E.PERMIT2].map((a) => a.toLowerCase()), "V3 Router, PoolManager, Permit2 in order");
   assert.equal(provider.allowance(E.USDG).toString(), "0");
+  assert.equal(provider.spenderAllowances.get(provider.key(CALLER, E.USDG, E.POOL_MANAGER)).toString(), "0");
   assert.equal(provider.tokenAllowances.get(E.USDG.toLowerCase()).toString(), "0");
-  assert.match(element("revoke-status").textContent, /^USDG allowances revoked: V3 Router 0x.* · Permit2 0x/);
+  assert.match(element("revoke-status").textContent, /^PONS: nothing to revoke · USDG: ✓ revoked \(V3 Router 0x[0-9a-f]+, PoolManager 0x[0-9a-f]+, Permit2 0x[0-9a-f]+\)$/);
+  assert.equal(element("revoke-status").className, "success");
   assert.match(element("activity").textContent, /USDG revoke V3 Router allowance confirmed:/);
+  assert.match(element("activity").textContent, /USDG revoke PoolManager allowance confirmed:/);
   assert.match(element("activity").textContent, /USDG revoke Permit2 allowance confirmed:/);
+  assert.match(element("activity").textContent, /PONS allowance to Permit2 is already 0; skipped/);
+  assert.match(element("status").textContent, /REVOKE ALL finished for PONS and USDG/);
   await element("revoke-all").click();
-  assert.equal(provider.sent.length, 2, "already zero: nothing sent");
-  assert.match(element("revoke-status").textContent, /already 0; nothing sent/);
+  assert.equal(provider.sent.length, 3, "already zero: nothing sent");
+  assert.equal(element("revoke-status").textContent, "PONS: nothing to revoke · USDG: nothing to revoke");
+  // Both tokens with allowances: Token A (PONS) is revoked first; a refused signature on Token B leaves its line marked ✗.
+  provider.tokenAllowances.set(E.PONS.toLowerCase(), ethers.BigNumber.from(5));
+  provider.setAllowance(E.USDG, 9);
+  provider.rejectSend = provider.sent.length + 2;
+  await element("revoke-all").click();
+  await page.flush();
+  assert.equal(provider.sent.length, 4, "PONS → Permit2 revoked, USDG → V3 Router refused");
+  assert.equal(provider.sent[3].to.toLowerCase(), E.PONS.toLowerCase());
+  assert.match(element("revoke-status").textContent, /^PONS: ✓ revoked \(Permit2 0x[0-9a-f]+\) · USDG: ✗ not revoked \(Wallet request rejected\. |^PONS: ✓ revoked \(Permit2 0x[0-9a-f]+\) · USDG: ✗ not revoked \(/);
+  assert.equal(element("revoke-status").className, "error");
+  assert.equal(provider.allowance(E.USDG).toString(), "9", "the refused revocation changed nothing");
 });
 
 test("Manual mode marks a pool with liquidity() = 0 EMPTY and refuses to select it", async () => {
@@ -1248,4 +1272,226 @@ test("Manual mode marks a pool with liquidity() = 0 EMPTY and refuses to select 
   assert.equal(page.timers.length, 0, "one-shot: no poll scheduled");
   element("auto-mode").change(true);
   assert.equal(provider.calls.length, 0, "auto mode never executes an EMPTY manual row");
+});
+
+// ------------------------------------------------------------------ Job 8: audit fixes, display, Permit2, UX
+
+const PERMIT2_INLINE = /⚠️ Approve (USDG|PONS) for Permit2 in MetaMask \(Contract tab → Permit2 → increaseAllowance\) before this route will work\./;
+
+/** The coloured value span of the quote line (job 8 fix 7). */
+function quoteValueSpan(page) {
+  return page.element("quote-info").children.find((child) => child.className === "green" || child.className === "red");
+}
+
+test("fix 7: the quote line colours the return value itself, green when it beats the input (V3 route)", async () => {
+  const page = await readyPage(withV3Pools()), { element, flush } = page;
+  await chooseProtocol(page, "V3");
+  await element("spreads-body").children[0].click(); await flush();
+  assert.match(element("quote-info").textContent, /Return quote: 0\.011 USDG for 0\.01 USDG \(return > input\)/);
+  const value = quoteValueSpan(page);
+  assert.equal(value.textContent, "0.011 USDG");
+  assert.equal(value.className, "green");
+  assert.equal(element("quote-info").className, "", "the line itself carries no colour; the value does");
+  assert.equal(element("status").className, "success");
+});
+
+/** Three V4 pools where the dearest (30000/600) sells back less than the input: a losing round trip. */
+function losingPools() {
+  const provider = withActivePools();
+  // amountOut = amountIn × price / 1e36: selling ~0.052 PONS at this price returns ~0.0052 USDG for a 0.01 USDG input.
+  provider.quotes.set(E.poolId({ currency0: E.PONS, currency1: E.USDG, fee: 30000, tickSpacing: 600, hooks: E.NO_HOOKS }), ethers.BigNumber.from("100000000000000000000000"));
+  return provider;
+}
+
+test("fix 7 + fix 2: a V4/V4 route now quotes its sell leg too; a return at or below the input is red, with min return still 0", async () => {
+  const page = await readyPage(losingPools()), { element, poll, flush } = page;
+  await poll();
+  await element("spreads-body").children[0].click(); await flush();
+  assert.match(element("quote-info").textContent, /^Swap 1 quote: 0\.01 USDG → 0\.052358673121064015 PONS on pool 3000 \/ 60\. Bridge amount after 0\.5% slippage: 0\.052096879755458694 PONS, sold on pool 30000 \/ 600\. Return quote: 0\.005209 USDG for 0\.01 USDG \(return ≤ input: a loss before gas\)\./);
+  assert.match(element("quote-info").textContent, /V4\/V4: the minimum return stays at the field's value \(default 0\)/);
+  const value = quoteValueSpan(page);
+  assert.equal(value.textContent, "0.005209 USDG");
+  assert.equal(value.className, "red");
+  assert.equal(element("min-out").value, "0", "default minimum return is 0");
+  assert.match(element("status").textContent, /return is at or below the input\. Auto mode would abort this route/);
+  assert.equal(element("status").className, "error");
+  assert.notEqual(element("bridge-amount").value, "", "a manual dry run is still possible: the guard is auto mode's");
+  assert.match(element("gas-info").textContent, /Expected return 0\.005209 USDG for 0\.01 USDG \(-0\.004791 USDG\)/, "the gas line reuses the sell quote");
+});
+
+test("fix 1 (HIGH): auto mode quotes, finds return ≤ input, shows the red ABORTED line and sends nothing; it resumes when the return beats the input", async () => {
+  const page = await readyPage(losingPools()), { provider, element, poll, flush, until } = page;
+  await poll();
+  await element("connect").click();
+  await element("spreads-body").children[0].click(); await flush();
+  await element("approve-permit2").click();
+  assert.equal(provider.sent.length, 2, "two Permit2 approvals only");
+  await element("auto-mode").change(true);
+  await until(() => /^ABORTED: return ≤ input/.test(element("status").textContent), "the ABORTED line");
+  assert.equal(element("status").textContent, "ABORTED: return ≤ input (0.005209 ≤ 0.01 USDG). Nothing sent.");
+  assert.equal(element("status").className, "error", "red");
+  assert.equal(provider.sent.length, 2, "no swap was sent");
+  assert.equal(element("auto-mode").checked, true, "an abort is a guard, not a failure: auto mode stays on");
+  assert.match(element("activity").textContent, /Auto mode: ABORTED: return ≤ input \(0\.005209 ≤ 0\.01 USDG\) for 3000 \/ 60 → 30000 \/ 600; nothing sent\./);
+  await poll(); await flush();
+  await until(() => !busyText(page), "the second auto attempt");
+  assert.equal(provider.sent.length, 2, "still nothing after another poll");
+  assert.equal((element("activity").textContent.match(/ABORTED/g) || []).length, 1, "the abort is logged once per route");
+  assert.equal(element("calldata").textContent, "Not built yet.", "no dry run was built");
+  // Liquidity returns: the sell leg now pays more than the input and the next poll sends.
+  provider.quotes.set(E.poolId({ currency0: E.PONS, currency1: E.USDG, fee: 30000, tickSpacing: 600, hooks: E.NO_HOOKS }),
+    ethers.BigNumber.from("5000000000000000000000000000000000000000000000000"));
+  await poll();
+  await until(() => provider.sent.length === 3, "the auto-mode swap once the return beats the input");
+  await until(() => /Swap confirmed/.test(element("status").textContent), "its receipt");
+  assert.equal(provider.sent[2].to, E.ROUTER);
+  await element("auto-mode").change(false);
+});
+
+function busyText(page) { return /^Quoting|Building calldata|Rechecking/.test(page.element("status").textContent); }
+
+/** Two V4 pools; the dearer 30000/600 exists but its quote is 0 (the mock's live fixture: no liquidity). */
+function zeroSellPools() {
+  const provider = new MockWallet();
+  provider.addSwap(3000, 60, -292916);
+  provider.addSwap(30000, 600, -292000);
+  return provider;
+}
+
+test("fix 2: a V4/V4 sell leg quoting 0 marks the route RED, disables execution, and auto mode never sends it", async () => {
+  const page = await readyPage(zeroSellPools()), { provider, element, poll, flush, until } = page;
+  await poll();
+  const row = element("spreads-body").children[0];
+  assert.equal(row.children[1].textContent, "30000 / 600", "the empty pool is the sell leg");
+  assert.equal(row.children[5].textContent, "GREEN", "tick arithmetic alone calls it GREEN");
+  await row.click(); await flush();
+  assert.match(element("quote-info").textContent, /^Warning: Sell leg quotes 0: no liquidity in the tick range\. Route invalid \(RED\); nothing will be sent\. Sell pool 30000 \/ 600 returned 0 USDG for 0\.052096879755458694 PONS\. Sending is disabled\.$/);
+  assert.equal(element("quote-info").className, "error");
+  assert.match(element("status").textContent, /^Sell leg quotes 0/);
+  assert.equal(element("bridge-amount").value, "");
+  await element("connect").click();
+  assert.equal(element("dry-run").disabled, true);
+  assert.equal(element("approve-permit2").disabled, true);
+  assert.equal(element("send").disabled, true);
+  const rerendered = element("spreads-body").children[0];
+  assert.equal(rerendered.children[5].textContent, "RED · sell quote 0", "the row is RED now");
+  assert.equal(rerendered.children[5].className, "red");
+  // Auto mode skips the marked route without quoting it again, logs the skip once, and stays on.
+  const rpcBefore = provider.rpcCalls.length;
+  await element("auto-mode").change(true);
+  await flush();
+  await poll(); await flush();
+  assert.equal(provider.sent.length, 0);
+  assert.equal(element("auto-mode").checked, true);
+  assert.equal((element("activity").textContent.match(/skipped: Sell leg quotes 0/g) || []).length, 1);
+  assert.equal(provider.rpcCalls.slice(rpcBefore).filter((c) => c.method === "eth_call" && c.params[0].to && c.params[0].to.toLowerCase() === E.ROUTER.toLowerCase()).length, 0, "no router quote or simulation");
+  await element("auto-mode").change(false);
+});
+
+test("fix 2: auto mode that discovers the zero sell quote itself aborts in red, sends nothing and stays on", async () => {
+  const page = await readyPage(zeroSellPools()), { provider, element, poll, flush, until } = page;
+  await poll();
+  await element("connect").click();
+  await element("auto-mode").change(true);
+  await until(() => /^ABORTED: return ≤ input · Sell leg quotes 0/.test(element("status").textContent), "the abort");
+  assert.equal(element("status").className, "error");
+  assert.equal(provider.sent.length, 0);
+  assert.equal(element("auto-mode").checked, true);
+  assert.match(element("activity").textContent, /Auto mode: ABORTED: return ≤ input \(sell leg quoted 0\); nothing sent\./);
+  await flush();
+  assert.equal(element("spreads-body").children[0].children[5].textContent, "RED · sell quote 0");
+  await poll(); await flush();
+  assert.equal(provider.sent.length, 0);
+  assert.equal((element("activity").textContent.match(/sell leg quoted 0/g) || []).length, 1, "the abort is logged once");
+  assert.doesNotMatch(element("activity").textContent, /skipped: Sell leg quotes 0/, "the later skip of the same route is not logged again");
+  // Changing the pair clears the mark (a new watch re-quotes from scratch).
+  await element("auto-mode").change(false);
+  await element("apply-pair").click();
+  await until(() => page.timers.length > 0, "restart"); await flush();
+  await poll();
+  assert.equal(element("spreads-body").children[0].children[5].textContent, "GREEN");
+});
+
+test("fix 5: 3-LEG rows show no percentage at all, only a green live dot and the 3-LEG tag", async () => {
+  const page = await readyPage(allPairsProvider()), { element } = page;
+  await chooseMode(page, "All pairs");
+  const spreads = element("allpairs-spreads-body").children;
+  const cross = spreads.filter((row) => row.children[5].textContent.startsWith("3-LEG"));
+  const same = spreads.filter((row) => row.children[5].textContent.startsWith("2-LEG"));
+  assert.equal(cross.length, 3);
+  for (const row of cross) {
+    assert.deepEqual([row.children[1].textContent, row.children[2].textContent, row.children[3].textContent], ["", "", ""], "no Spread%, Fee% or Net%");
+    assert.equal(row.children[4].textContent, "● 3-LEG");
+    assert.equal(row.children[4].className, "green", "both pools exist: live");
+    assert.equal(row.children[5].textContent, "3-LEG · watch-only");
+    assert.equal(row.listeners.click, undefined);
+  }
+  assert.ok(same.every((row) => /^-?\d+\.\d{3}$/.test(row.children[3].textContent) && ["GREEN", "RED"].includes(row.children[4].textContent)), "executable rows keep their numbers");
+  assert.equal(spreads.findIndex((row) => row.children[5].textContent.startsWith("3-LEG")), same.length, "3-LEG rows come after the executable rows");
+});
+
+test("fix 6: the Token B list never wraps an address: pre + horizontal scroll on the textarea", async () => {
+  const { html } = loadPage();
+  assert.match(html, /#token-b-list\s*\{[^}]*white-space:\s*pre;[^}]*overflow-x:\s*auto;/);
+  assert.doesNotMatch(html, /#token-b-list\s*\{[^}]*white-space:\s*nowrap/, "nowrap would collapse the one-address-per-line breaks");
+});
+
+test("fix 9: the Auto checkbox is a standalone input with a plain span; no <label> wraps it", async () => {
+  const { html, element } = await readyPage();
+  assert.doesNotMatch(html, /<label>\s*<input id="auto-mode"/, "no label wrapper");
+  assert.match(html, /<input id="auto-mode" type="checkbox" aria-labelledby="auto-mode-text">\s*<span id="auto-mode-text">Auto mode: execute when Net% is above the threshold<\/span>/);
+  assert.equal(element("auto-mode").tagName, "input");
+  assert.equal(element("auto-mode-text").tagName, "span");
+  assert.equal(element("auto-mode-text").listeners.click, undefined, "the text toggles nothing");
+  // The checkbox itself still drives auto mode.
+  await element("auto-mode").change(true);
+  assert.match(element("auto-status").textContent, /^Auto mode ON/);
+  await element("auto-mode").change(false);
+  assert.match(element("auto-status").textContent, /^Auto mode OFF/);
+});
+
+test("fix 8: a mixed route whose V4 token lacks the layer-1 Permit2 allowance shows the exact instruction inline and sends nothing", async () => {
+  const provider = mixedPools(false); // V4 buy (sells USDG) → V3 sell
+  provider.tokenAllowances.set(E.USDG.toLowerCase(), ethers.BigNumber.from(0));
+  const page = await readyPage(provider), { element, flush } = page;
+  await element("connect").click();
+  await element("spreads-body").children[0].click(); await flush();
+  assert.match(element("route-warning").textContent, /2 transactions required/);
+  assert.match(element("route-warning").textContent, /⚠️ Approve USDG for Permit2 in MetaMask \(Contract tab → Permit2 → increaseAllowance\) before this route will work\.$/, "appended to the mixed-route notice");
+  assert.equal(element("route-warning").hidden, false);
+  assert.match(element("status").textContent, PERMIT2_INLINE);
+  assert.equal(element("status").className, "error");
+  assert.match(element("activity").textContent, PERMIT2_INLINE);
+  // The approval and the dry run stop with the same message; nothing reaches the wallet's send.
+  await element("approve-permit2").click();
+  assert.match(element("status").textContent, PERMIT2_INLINE);
+  await element("dry-run").click();
+  assert.match(element("status").textContent, PERMIT2_INLINE);
+  assert.equal(element("send").disabled, true);
+  assert.equal(provider.sent.length, 0);
+  // Once the token is approved to Permit2 the same clicks go through.
+  provider.tokenAllowances.set(E.USDG.toLowerCase(), E.MAX_UINT256);
+  await element("approve-v3-router").click();
+  await element("approve-permit2").click();
+  assert.match(element("status").textContent, /V4 leg Permit2 allowance is ready/);
+  await element("dry-run").click();
+  assert.match(element("status").textContent, /First leg dry run succeeded/);
+});
+
+test("fix 8: a spread quoted before connecting is checked when the wallet connects; a V3/V3 route is never warned", async () => {
+  const provider = mixedPools(true); // V3 buy → V4 sell (sells PONS)
+  provider.tokenAllowances.set(E.PONS.toLowerCase(), ethers.BigNumber.from(0));
+  const page = await readyPage(provider), { element, flush } = page;
+  await element("spreads-body").children[0].click(); await flush();
+  assert.doesNotMatch(element("route-warning").textContent, /⚠️/, "no account yet: nothing to check");
+  await element("connect").click();
+  assert.match(element("route-warning").textContent, /⚠️ Approve PONS for Permit2/);
+  assert.match(element("status").textContent, /⚠️ Approve PONS for Permit2/);
+  const v3 = await readyPage(withV3Pools());
+  v3.provider.tokenAllowances.set(E.USDG.toLowerCase(), ethers.BigNumber.from(0));
+  await chooseProtocol(v3, "V3");
+  await v3.element("connect").click();
+  await v3.element("spreads-body").children[0].click(); await v3.flush();
+  assert.equal(v3.element("route-warning").hidden, true);
+  assert.doesNotMatch(v3.element("status").textContent, /Permit2/);
 });

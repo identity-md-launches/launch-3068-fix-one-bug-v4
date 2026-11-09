@@ -43,6 +43,12 @@
     .bar div { min-width: 180px; }
     textarea { box-sizing: border-box; width: 100%; margin-top: 6px; padding: 10px; background: #101721; color: inherit;
       border: 1px solid #687e98; border-radius: 6px; font: inherit; min-height: 72px; }
+    /* Job 8 fix 6: one address per line, never wrapped. `pre` keeps the line breaks of the list (nowrap would
+       collapse them) and refuses to wrap a long address; the field scrolls horizontally instead. */
+    #token-b-list { white-space: pre; overflow-x: auto; overflow-wrap: normal; word-break: normal; }
+    /* Job 8 fix 9: the Auto checkbox is a standalone input; only its square toggles it. */
+    .checkbox-row { display: flex; align-items: center; gap: 8px; }
+    .checkbox-row input[type=checkbox] { width: 14px; height: 14px; margin: 0; flex: 0 0 auto; }
     .banner { border: 2px solid #ff8a7a; background: #3a1f1c; border-radius: 12px; padding: 14px 18px; margin-top: 20px; font-weight: 700; }
     .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; background: #344356; font-size: .8rem; font-weight: 700; }
   </style>
@@ -110,8 +116,9 @@
       public RPC and need no wallet.</small>
     <div id="revoke-controls" hidden>
       <button id="revoke-all" class="warn" type="button" disabled>REVOKE ALL</button>
-      <small>Sets the input token's (currency1, sold in swap 1) ERC20 allowance to SwapRouter02 and to Permit2 to 0, one
-        transaction after the other, each confirmed before the next. Allowances already at 0 are skipped.</small>
+      <small>For Token A, then Token B: sets the ERC20 allowance to SwapRouter02, to the V4 PoolManager and to Permit2 to 0, one
+        transaction after the other, each confirmed before the next. Allowances already at 0 are skipped; each token reports
+        ✓ revoked or nothing to revoke.</small>
       <p id="revoke-status" class="muted" role="status" aria-live="polite"></p>
     </div>
   </section>
@@ -154,7 +161,7 @@
     <p id="allpairs-note" class="muted">No pools discovered yet.</p>
     </div>
     <div class="fields">
-      <label><input id="auto-mode" type="checkbox"> Auto mode: execute when Net% is above the threshold</label>
+      <div class="checkbox-row"><input id="auto-mode" type="checkbox" aria-labelledby="auto-mode-text"><span id="auto-mode-text">Auto mode: execute when Net% is above the threshold</span></div>
       <label>Net% threshold<input id="threshold" type="text" value="0.5" inputmode="decimal" autocomplete="off"></label>
       <label>Max staleness (seconds)<input id="max-staleness" type="number" value="7200" min="0" step="1" inputmode="numeric" autocomplete="off"></label>
     </div>
@@ -162,7 +169,9 @@
       send without a click; your wallet still asks for the signature. One transaction at a time: nothing is submitted
       while another is waiting for its receipt. Auto mode turns itself off after any failed attempt. Pools marked
       STALE, EMPTY or UNKNOWN are left out of the spreads and of auto mode.</p>
-    <p class="muted">Auto mode only executes V3/V3 or V4/V4 routes. Mixed spreads are manual-only.</p>
+    <p class="muted">Auto mode only executes V3/V3 or V4/V4 routes. Mixed spreads are manual-only. Before every automatic send the
+      quoted return is compared with the input: a return at or below the input is <span class="red">ABORTED</span> and nothing is sent.
+      A sell leg that quotes 0 marks its route RED and is never sent.</p>
   </section>
 
   <section aria-labelledby="swap-heading">
@@ -243,6 +252,8 @@
     let maxStaleness = E.MAX_STALENESS_SECONDS;  // last valid field value; a typo never loosens the guard
     let autoSkipsLogged = new Map();             // poolId → status already in the activity log
     let tabLocked = false;                       // another tab sent a transaction less than 5 min ago
+    const zeroSellPools = new Set();             // job 8 fix 2: sell pools whose quote returned 0 (route RED, never sent)
+    let autoAbortLogged = null;                  // job 8 fix 1: the last ABORTED route already in the activity log
     const activity = [];
     // Primary RPC first; an HTTP 429 / 5xx retries the same payload once against the fallback (follow-up 6).
     const rpc = E.createRpcClient(E.RPC_URL, typeof fetch === "function" ? fetch.bind(window) : undefined, { fallbackUrl: E.RPC_FALLBACK_URL });
@@ -338,7 +349,8 @@
       render();
     }
 
-    function clearSelection() {
+    function clearSelection(restart) {
+      if (restart) { zeroSellPools.clear(); autoAbortLogged = null; }
       selected = null;
       element("selected-pools").textContent = "No spread selected.";
       element("bridge-amount").value = "";
@@ -482,6 +494,53 @@
       return E.protocolOf(pool) === "V3" ? "V3 " + E.formatV3Fee(pool.fee) : pool.fee + " / " + pool.tickSpacing;
     }
 
+    /** Job 8 fix 2: a spread whose sell pool last quoted 0 is RED whatever its tick arithmetic says. */
+    function sellQuoteZero(spread) { return zeroSellPools.has(spread.sell.poolId); }
+
+    function verdictCell(row, spread, forced) {
+      const zero = sellQuoteZero(spread);
+      const text = zero ? "RED · sell quote 0" : forced || spread.verdict;
+      return cell(row, text, !zero && text === "GREEN" ? "green" : "red");
+    }
+
+    /** Job 8 fix 7: the quote line in spans, so the return value carries its own colour (green > input, red otherwise). */
+    function renderQuoteLine(parts, lineClass) {
+      const line = element("quote-info");
+      line.textContent = "";
+      line.className = lineClass || "";
+      parts.forEach((part) => {
+        const span = document.createElement("span");
+        span.textContent = typeof part === "string" ? part : part.text;
+        if (typeof part !== "string" && part.className) span.className = part.className;
+        line.appendChild(span);
+      });
+    }
+
+    /**
+     * Job 8 fix 8 (preferred path): with a wallet connected, read the layer-1 ERC20 allowance of every V4
+     * leg's input token to Permit2 through the public RPC. A zero allowance shows the exact instruction
+     * inline, before any dry run or send is attempted. Read-only; never throws.
+     */
+    async function warnPermit2LayerOne(spread, meta) {
+      if (!account || !spread || !meta) return [];
+      const missing = [];
+      for (const entry of E.permit2LayerOneTokens(spread.buy, spread.sell, meta)) {
+        try {
+          const allowed = await E.readErc20Allowance(rpc.request, entry.token, account, E.PERMIT2);
+          if (allowed.isZero()) missing.push(entry.symbol);
+        } catch (error) { log("Permit2 layer-1 check failed for " + entry.symbol + ": " + error.message); }
+      }
+      if (missing.length) {
+        const warning = element("route-warning");
+        const text = missing.map((symbol) => E.permit2LayerOneMessage(symbol)).join(" ");
+        warning.textContent = (warning.hidden ? "" : warning.textContent + " ") + text;
+        warning.hidden = false;
+        showStatus(text, true);
+        log(text);
+      }
+      return missing;
+    }
+
     /** Re-render the spread rows of the current mode (selection highlight follows the quote). */
     function refreshSpreads() {
       if (isManual()) renderManual(manualMonitor.getState());
@@ -518,13 +577,19 @@
         const isSelected = selected && selected.buy.poolId === spread.buy.poolId && selected.sell.poolId === spread.sell.poolId;
         row.className = (spread.crossPair ? "" : "selectable") + (isSelected ? " selected" : "");
         cell(row, spread.path);
-        cell(row, spread.spreadPercent.toFixed(3));
-        cell(row, spread.feeCostPercent.toFixed(3));
-        cell(row, spread.netPercent.toFixed(3));
-        cell(row, spread.verdict, spread.verdict === "GREEN" ? "green" : "red");
         if (spread.crossPair) {
+          // Job 8 fix 5: a 3-LEG row is a binary indicator. No percentage of any kind: the ratio of Token A's
+          // price in two different quote tokens is not a spread. Green dot = both pools exist and are tradeable.
+          cell(row, "");
+          cell(row, "");
+          cell(row, "");
+          cell(row, (spread.live ? "● " : "○ ") + "3-LEG", spread.live ? "green" : "muted");
           cell(row, "3-LEG · watch-only", "tag");
         } else {
+          cell(row, spread.spreadPercent.toFixed(3));
+          cell(row, spread.feeCostPercent.toFixed(3));
+          cell(row, spread.netPercent.toFixed(3));
+          verdictCell(row, spread);
           cell(row, "2-LEG · " + E.protocolOf(spread.buy) + " → " + E.protocolOf(spread.sell) + " · click to quote");
           row.tabIndex = 0;
           row.addEventListener("click", () => selectSpread(spread));
@@ -572,7 +637,7 @@
     function startAllPairs() {
       monitor.stop();
       manualMonitor.stop();
-      clearSelection();
+      clearSelection(true);
       renderAllPairsPools({ pools: [] });
       renderAllPairsSpreads({ pools: [], pairs: null, discovered: null });
       try {
@@ -622,7 +687,7 @@
         cell(row, spread.spreadPercent.toFixed(3));
         cell(row, spread.feeCostPercent.toFixed(3));
         cell(row, spread.netPercent.toFixed(3));
-        cell(row, spread.verdict, spread.verdict === "GREEN" ? "green" : "red");
+        verdictCell(row, spread);
         cell(row, E.protocolOf(spread.buy) + " → " + E.protocolOf(spread.sell));
         row.addEventListener("click", () => selectSpread(spread));
         row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") selectSpread(spread); });
@@ -689,7 +754,7 @@
         cell(row, spread.spreadPercent.toFixed(3));
         cell(row, spread.feeCostPercent.toFixed(3));
         cell(row, spread.netPercent.toFixed(3));
-        cell(row, empty ? "EMPTY" : spread.verdict, !empty && spread.verdict === "GREEN" ? "green" : "red");
+        verdictCell(row, spread, empty ? "EMPTY" : undefined);
         if (!empty) {
           row.tabIndex = 0;
           row.addEventListener("click", () => selectSpread(spread));
@@ -723,7 +788,7 @@
     function startManual() {
       monitor.stop();
       allPairsMonitor.stop();
-      clearSelection();
+      clearSelection(true);
       element("manual-body").replaceChildren();
       element("manual-last-read").textContent = "";
       try {
@@ -750,7 +815,7 @@
     function startMonitor() {
       manualMonitor.stop();
       allPairsMonitor.stop();
-      clearSelection();
+      clearSelection(true);
       // Remove selectable rows from the previous pair/protocol while discovery is in flight.
       renderPools({ pools: [] });
       renderSpreads({ pools: [], protocol: element("protocol").value });
@@ -826,35 +891,56 @@
         " sell after confirmation. Manual-only. Leg 2 can fail after leg 1 succeeds, leaving the bridge token in your wallet. Leg 2 is simulated only after leg 1 confirms.";
       element("quote-info").textContent = "Quoting swap 1 on pool " + poolLabel(spread.buy) + "…";
       const quote = await E.quotePool(rpc.request, spread.buy, false, amountIn, account || undefined);
-      selected = { buy: spread.buy, sell: spread.sell, amountIn, quote, bridgeAmount: null, mixed };
+      selected = { buy: spread.buy, sell: spread.sell, amountIn, quote, bridgeAmount: null, mixed, sellQuoteZero: false };
       if (quote.isZero()) {
-        element("quote-info").textContent = "Warning: no liquidity. Swap 1 on pool " + poolLabel(spread.buy) + " returns 0 " + meta.symbol0 + " for " +
-          format(amountIn, meta.decimals1) + " " + meta.symbol1 + ". Sending is disabled.";
-        element("quote-info").className = "error";
+        renderQuoteLine([{ text: "Warning: no liquidity. Swap 1 on pool " + poolLabel(spread.buy) + " returns 0 " + meta.symbol0 + " for " +
+          format(amountIn, meta.decimals1) + " " + meta.symbol1 + ". Sending is disabled.", className: "red" }], "error");
         showStatus("No liquidity in the selected buy pool; choose another spread.", true);
         return selected;
       }
       selected.bridgeAmount = E.applySlippage(quote, E.SLIPPAGE_BPS);
       if (selected.bridgeAmount.isZero()) { selected.bridgeAmount = null; throw new Error("Quote rounds to zero after slippage; choose another amount."); }
-      if (E.protocolOf(spread.buy) === "V3" || E.protocolOf(spread.sell) === "V3") {
-        try {
-          const sellInput = mixed ? selected.bridgeAmount : quote;
-          selected.finalQuote = await E.quotePool(rpc.request, spread.sell, true, sellInput, account || undefined);
-          selected.minimumReturn = E.applySlippage(selected.finalQuote);
-          if (selected.minimumReturn.isZero()) throw new Error("Warning: no liquidity on the sell leg, or output rounds to zero. Sending is disabled.");
-        } catch (error) { selected.bridgeAmount = null; throw error; }
+      // Job 8 fix 2: the sell leg is quoted for EVERY route, V4/V4 included. The V3 atomic path sells the whole
+      // first-hop output; every other route sells the bridge amount (quote − 0.5%), as the transaction does.
+      const v3Route = E.protocolOf(spread.buy) === "V3" || E.protocolOf(spread.sell) === "V3";
+      const sellInput = !mixed && E.protocolOf(spread.buy) === "V3" ? quote : selected.bridgeAmount;
+      try {
+        selected.finalQuote = await E.quotePool(rpc.request, spread.sell, true, sellInput, account || undefined);
+      } catch (error) { selected.bridgeAmount = null; throw error; }
+      if (!E.sellQuoteValid(selected.finalQuote)) {
+        // No liquidity in the sell pool's tick range: the route is invalid, RED in the table, never sent.
+        selected.bridgeAmount = null;
+        selected.sellQuoteZero = true;
+        zeroSellPools.add(spread.sell.poolId);
+        renderQuoteLine([{ text: "Warning: " + E.SELL_QUOTE_ZERO_MESSAGE + " Sell pool " + poolLabel(spread.sell) + " returned 0 " + meta.symbol1 +
+          " for " + format(sellInput, meta.decimals0) + " " + meta.symbol0 + ". Sending is disabled.", className: "red" }], "error");
+        showStatus(E.SELL_QUOTE_ZERO_MESSAGE, true);
+        return selected;
+      }
+      zeroSellPools.delete(spread.sell.poolId);
+      if (v3Route) {
+        selected.minimumReturn = E.applySlippage(selected.finalQuote);
+        if (selected.minimumReturn.isZero()) { selected.bridgeAmount = null; throw new Error("Warning: no liquidity on the sell leg, or output rounds to zero. Sending is disabled."); }
       }
       element("bridge-amount").value = ethers.utils.formatUnits(selected.bridgeAmount, meta.decimals0);
-      element("quote-info").textContent = "Swap 1 quote: " + format(amountIn, meta.decimals1) + " " + meta.symbol1 + " → " + format(quote, meta.decimals0) + " " +
-        meta.symbol0 + " on pool " + poolLabel(spread.buy) + ". Bridge amount after 0.5% slippage: " + format(selected.bridgeAmount, meta.decimals0) + " " + meta.symbol0 +
-        (selected.minimumReturn && !mixed ? ". Atomic V3 route through " : ", sold on pool ") + poolLabel(spread.sell) + ".";
-      if (selected.minimumReturn) element("quote-info").textContent += " Return quote: " + format(selected.finalQuote, meta.decimals1) + " " + meta.symbol1 +
-        "; minimum after 0.5%: " + format(selected.minimumReturn, meta.decimals1) + "." +
-        (!mixed ? " The atomic V3 path sells the entire first-hop output." : "");
-      element("quote-info").className = "success";
+      // Job 8 fix 7: the return value is coloured on its own, green when return > input and red otherwise.
+      const profit = E.autoSendAllowed(amountIn, selected.finalQuote);
+      renderQuoteLine([
+        "Swap 1 quote: " + format(amountIn, meta.decimals1) + " " + meta.symbol1 + " → " + format(quote, meta.decimals0) + " " + meta.symbol0 + " on pool " +
+          poolLabel(spread.buy) + ". Bridge amount after 0.5% slippage: " + format(selected.bridgeAmount, meta.decimals0) + " " + meta.symbol0 +
+          (selected.minimumReturn && !mixed ? ". Atomic V3 route through " : ", sold on pool ") + poolLabel(spread.sell) + ". Return quote: ",
+        { text: format(selected.finalQuote, meta.decimals1) + " " + meta.symbol1, className: E.returnColor(amountIn, selected.finalQuote) },
+        " for " + format(amountIn, meta.decimals1) + " " + meta.symbol1 + (profit ? " (return > input)" : " (return ≤ input: a loss before gas)") +
+          (selected.minimumReturn ? "; minimum after 0.5%: " + format(selected.minimumReturn, meta.decimals1) + "." : ".") +
+          (v3Route && !mixed ? " The atomic V3 path sells the entire first-hop output." : "") +
+          (!v3Route ? " V4/V4: the minimum return stays at the field's value (default 0); the return quote is the guard." : ""),
+      ]);
       updateLimits();
       await showGasEstimate(spread, meta);
-      showStatus("Spread selected and quoted. Approve the required router if needed, then dry run.");
+      showStatus(profit ? "Spread selected and quoted. Approve the required router if needed, then dry run."
+        : "Spread quoted, but the return is at or below the input. Auto mode would abort this route; sending it by hand is a loss before gas.", !profit);
+      // Job 8 fix 8: with a wallet connected, a missing layer-1 Permit2 allowance is reported now, inline.
+      await warnPermit2LayerOne(spread, meta);
       return selected;
     }
 
@@ -909,10 +995,33 @@
       const best = decision.spread;
       if (!best || !account || !wallet || pendingHash) return;
       if (best.verdict !== "GREEN" || !(best.netPercent > thresholdOrDefault())) return;
+      const routeKey = best.buy.poolId + ">" + best.sell.poolId;
+      // Job 8 fix 2: a sell pool that quoted 0 is not tradeable; the route stays RED until a click re-quotes it.
+      if (sellQuoteZero(best)) {
+        if (autoAbortLogged !== "zero:" + routeKey) log("Auto mode: " + poolLabel(best.buy) + " → " + poolLabel(best.sell) + " skipped: " + E.SELL_QUOTE_ZERO_MESSAGE);
+        autoAbortLogged = "zero:" + routeKey;
+        return;
+      }
       log("Auto mode: best spread " + poolLabel(best.buy) + " → " + poolLabel(best.sell) + " net " + best.netPercent.toFixed(3) + "% is above the threshold; executing.");
       runAction(async () => {
         const quoted = await quoteSpread(best);
+        if (quoted.sellQuoteZero) {
+          showStatus(E.AUTO_ABORT_MESSAGE + " · " + E.SELL_QUOTE_ZERO_MESSAGE, true);
+          log("Auto mode: " + E.AUTO_ABORT_MESSAGE + " (sell leg quoted 0); nothing sent.");
+          autoAbortLogged = "zero:" + routeKey;
+          return;
+        }
         if (!quoted.bridgeAmount) throw new Error("Auto mode: the buy pool has no liquidity; nothing sent.");
+        // Job 8 fix 1 (HIGH): the quoted return must be STRICTLY greater than the input, or nothing is sent.
+        if (!E.autoSendAllowed(quoted.amountIn, quoted.finalQuote)) {
+          const meta = pair();
+          const detail = meta && quoted.finalQuote ? " (" + format(quoted.finalQuote, meta.decimals1) + " ≤ " + format(quoted.amountIn, meta.decimals1) + " " + meta.symbol1 + ")" : "";
+          showStatus(E.AUTO_ABORT_MESSAGE + detail + ". Nothing sent.", true);
+          if (autoAbortLogged !== "abort:" + routeKey) log("Auto mode: " + E.AUTO_ABORT_MESSAGE + detail + " for " + poolLabel(best.buy) + " → " + poolLabel(best.sell) + "; nothing sent.");
+          autoAbortLogged = "abort:" + routeKey;
+          return;
+        }
+        autoAbortLogged = null;
         await dryRun();
         await send();
       }, { auto: true }).then(refreshSpreads);
@@ -934,6 +1043,8 @@
       element("account").textContent = account;
       await refreshBalances();
       showStatus("Connected on Robinhood Chain. Select a spread, approve Permit2 if needed, then dry run.");
+      // Job 8 fix 8: a spread quoted before connecting gets its layer-1 Permit2 check now.
+      if (selected && selected.bridgeAmount) await warnPermit2LayerOne({ buy: selected.buy, sell: selected.sell }, pair());
     }));
 
     function startCurrentMode() {
@@ -952,20 +1063,36 @@
       startCurrentMode();
     });
 
-    // Follow-up 6 REVOKE ALL: approve(SwapRouter02, 0) then approve(Permit2, 0) for the input token (currency1).
+    // Follow-up 6 REVOKE ALL, job 8 fix 3: BOTH tokens (Token A, then Token B), every known spender (V3 Router,
+    // PoolManager, Permit2) per token, each transaction confirmed before the next, with a status line per token.
+    function spenderName(spender) {
+      const entry = E.REVOKE_SPENDERS.find((item) => item[0].toLowerCase() === String(spender).toLowerCase());
+      return entry ? entry[1] : spender;
+    }
+
     element("revoke-all").addEventListener("click", () => runAction(async () => {
       clearPrepared();
       const meta = pair();
       if (!meta) throw new Error("Wait for the pair's symbols and decimals to load.");
-      element("revoke-status").textContent = "Revoking " + meta.symbol1 + " allowances: V3 Router first, then Permit2. Confirm each in your wallet…";
-      element("revoke-status").className = "muted";
-      const done = await wallet.revokeAll(meta.currency1, meta.symbol1);
-      element("revoke-status").textContent = done.length ? meta.symbol1 + " allowances revoked: " + done.map((entry) => (entry.spender === E.V3_ROUTER ? "V3 Router " : "Permit2 ") + entry.hash).join(" · ")
-        : meta.symbol1 + " allowances to V3 Router and Permit2 were already 0; nothing sent.";
-      element("revoke-status").className = "success";
-      showStatus("REVOKE ALL finished for " + meta.symbol1 + ". Approvals are needed again before the next swap.");
+      const tokens = [[meta.tokenA || meta.currency0, meta.symbolA || meta.symbol0], [meta.tokenB || meta.currency1, meta.symbolB || meta.symbol1]];
+      const lines = [];
+      const show = (className) => { element("revoke-status").textContent = lines.join(" · "); element("revoke-status").className = className; };
+      for (const [token, symbol] of tokens) {
+        lines.push(symbol + ": revoking V3 Router, PoolManager and Permit2 allowances… confirm each in your wallet");
+        show("muted");
+        try {
+          const done = await wallet.revokeAll(token, symbol);
+          lines[lines.length - 1] = symbol + ": " + (done.length ? "✓ revoked (" + done.map((entry) => spenderName(entry.spender) + " " + entry.hash).join(", ") + ")" : "nothing to revoke");
+        } catch (error) {
+          lines[lines.length - 1] = symbol + ": ✗ not revoked (" + error.message + ")";
+          show("error");
+          throw error;
+        }
+      }
+      show("success");
+      showStatus("REVOKE ALL finished for " + tokens.map((entry) => entry[1]).join(" and ") + ". Approvals are needed again before the next swap.");
       clearSelection();
-    }).then((ok) => { if (!ok) { element("revoke-status").textContent = "Revoke failed: " + element("status").textContent; element("revoke-status").className = "error"; } }));
+    }).then((ok) => { if (!ok && !/✗/.test(element("revoke-status").textContent)) { element("revoke-status").textContent = "Revoke failed: " + element("status").textContent; element("revoke-status").className = "error"; } }));
     // The "Last read: Xs ago" line ticks every second in a browser; nothing is requested by the tick.
     if (typeof setInterval === "function") {
       setInterval(() => { if (isManual()) renderLastRead(manualMonitor.getState()); }, 1000);
