@@ -225,6 +225,8 @@ class MockWallet extends EventEmitter {
         this.routerCall(tx);
         return "0x";
       }
+      // Job 9: tests register extra contracts (the cross-DEX factories and pools) by address.
+      if (this.contracts && this.contracts.has(lower(tx.to))) return this.contracts.get(lower(tx.to))(tx);
       throw new Error("execution reverted"); // no code / not a token
     }
     if (method === "eth_sendTransaction") {

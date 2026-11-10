@@ -46,9 +46,6 @@
     /* Job 8 fix 6: one address per line, never wrapped. `pre` keeps the line breaks of the list (nowrap would
        collapse them) and refuses to wrap a long address; the field scrolls horizontally instead. */
     #token-b-list { white-space: pre; overflow-x: auto; overflow-wrap: normal; word-break: normal; }
-    /* Job 8 fix 9: the Auto checkbox is a standalone input; only its square toggles it. */
-    .checkbox-row { display: flex; align-items: center; gap: 8px; }
-    .checkbox-row input[type=checkbox] { width: 14px; height: 14px; margin: 0; flex: 0 0 auto; }
     .banner { border: 2px solid #ff8a7a; background: #3a1f1c; border-radius: 12px; padding: 14px 18px; margin-top: 20px; font-weight: 700; }
     .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; background: #344356; font-size: .8rem; font-weight: 700; }
   </style>
@@ -104,8 +101,8 @@
     <p id="allpairs-notes" class="muted" hidden>All pairs watches Token A against every Token B in the list. Once per list change the
       page discovers the V3 pools (factory.getPool for 0.01%, 0.05%, 0.30%, 1.00%) and the V4 pools with liquidity (getLiquidity through
       extsload for the seven fee tiers) of every pair. Every 30 s it sends ONE eth_getLogs over all V3 pools and ONE over the PoolManager,
-      filtered to our pool ids, in a single batch, then the usual health batch. Spreads between pools of different Token Bs are tagged
-      3-LEG and are watch-only; same-pair spreads execute exactly as in Auto-scan.</p>
+      filtered to our pool ids, in a single batch, then the usual health batch. Only same-pair spreads are listed (cross-pair
+      combinations are not displayed); they execute exactly as in Auto-scan.</p>
   </section>
 
   <section aria-labelledby="wallet-heading">
@@ -160,18 +157,25 @@
     </table>
     <p id="allpairs-note" class="muted">No pools discovered yet.</p>
     </div>
+    <h3 id="cross-dex-heading">Cross-DEX Prices</h3>
+    <table aria-describedby="cross-dex-heading">
+      <thead><tr><th>DEX</th><th>Fee</th><th>Price</th><th>Liquidity</th><th>Spread vs Uni</th><th>Status</th></tr></thead>
+      <tbody id="cross-dex-body"></tbody>
+    </table>
+    <p id="cross-dex-note" class="muted" role="status" aria-live="polite">Not started.</p>
+    <p class="muted">Read-only (job 9). Every 30 s — once per READ PRICES in Manual mode — the page asks each configured DEX factory for the
+      pools of the active Token A / Token B pair and reads slot0() and liquidity() of each pool (eth_call only; nothing is sent or signed).
+      Price = 1.0001^tick, token1 per token0 after decimals, like the Uniswap rows above. Liquidity is the raw liquidity() value.
+      Spread vs Uni = (DEX price − best Uniswap V3 price of the same pair) / best Uni price × 100, the best Uni V3 pool being the priced,
+      tradeable one with the most liquidity; "—" when no Uni V3 pool is priced. A fee tier without a pool is skipped; a failed read shows
+      "error" and keeps the last good values. Ramses pools are keyed by tick spacing (ts) and report their own fee.</p>
     <div class="fields">
-      <div class="checkbox-row"><input id="auto-mode" type="checkbox" aria-labelledby="auto-mode-text"><span id="auto-mode-text">Auto mode: execute when Net% is above the threshold</span></div>
       <label>Net% threshold<input id="threshold" type="text" value="0.5" inputmode="decimal" autocomplete="off"></label>
       <label>Max staleness (seconds)<input id="max-staleness" type="number" value="7200" min="0" step="1" inputmode="numeric" autocomplete="off"></label>
     </div>
-    <p id="auto-status" class="muted">Auto mode OFF. With it ON, each poll with a GREEN best spread runs quote → dry run →
-      send without a click; your wallet still asks for the signature. One transaction at a time: nothing is submitted
-      while another is waiting for its receipt. Auto mode turns itself off after any failed attempt. Pools marked
-      STALE, EMPTY or UNKNOWN are left out of the spreads and of auto mode.</p>
-    <p class="muted">Auto mode only executes V3/V3 or V4/V4 routes. Mixed spreads are manual-only. Before every automatic send the
-      quoted return is compared with the input: a return at or below the input is <span class="red">ABORTED</span> and nothing is sent.
-      A sell leg that quotes 0 marks its route RED and is never sent.</p>
+    <p id="field-status" class="muted" role="status" aria-live="polite"></p>
+    <p class="muted">Sending always needs a click. Pools marked STALE, EMPTY or UNKNOWN are left out of the spreads. A sell leg that
+      quotes 0 marks its route RED and cannot be sent.</p>
   </section>
 
   <section aria-labelledby="swap-heading">
@@ -209,6 +213,8 @@
         <dt>Router</dt><dd><code id="router-address"></code></dd>
         <dt>V3 Factory</dt><dd><code id="v3-factory-address"></code></dd>
         <dt>V3 Router</dt><dd><code id="v3-router-address"></code></dd>
+        <dt>SushiSwap V3 Factory</dt><dd><code id="sushi-factory-address"></code></dd>
+        <dt>Ramses CL Factory</dt><dd><code id="ramses-factory-address"></code></dd>
         <dt>PoolManager</dt><dd><code id="pool-manager-address"></code></dd>
         <dt>RPC</dt><dd><code id="rpc-url"></code></dd>
         <dt>RPC fallback</dt><dd><code id="rpc-fallback-url"></code></dd>
@@ -236,9 +242,11 @@
   <noscript><p>JavaScript and an EIP-1193 wallet are required.</p></noscript>
   <script src="js/vendor/ethers-5.7.2.umd.min.js"></script>
   <script src="js/v4-arb-encoder.js"></script>
+  <script src="js/cross-dex-reader.js"></script>
   <script>
     "use strict";
     const E = V4ArbEncoder;
+    const X = CrossDexReader; // job 9: read-only cross-DEX price + LP depth reader
     const element = (id) => document.getElementById(id);
     let wallet = null;
     let account = null;
@@ -330,7 +338,6 @@
       element("approve-v3-router").disabled = !ready || !quoted || (E.protocolOf(selected.buy) === "V4" && E.protocolOf(selected.sell) === "V4");
       element("dry-run").disabled = !ready || !quoted || tabLocked;
       element("send").disabled = !ready || !prepared || tabLocked;
-      element("auto-mode").disabled = tabLocked;
       element("revoke-controls").hidden = !account;
       element("revoke-all").disabled = !ready || !pair();
       element("amount-in").disabled = busy;
@@ -459,8 +466,6 @@
         }
         if (options.auto && auto) {
           auto = false;
-          element("auto-mode").checked = false;
-          element("auto-status").textContent = "Auto mode turned OFF after a failed attempt: " + error.message;
           log("Auto mode turned off after a failed attempt.");
         }
         return false;
@@ -544,7 +549,7 @@
     /** Re-render the spread rows of the current mode (selection highlight follows the quote). */
     function refreshSpreads() {
       if (isManual()) renderManual(manualMonitor.getState());
-      else if (isAllPairs()) renderAllPairsSpreads(allPairsMonitor.getState());
+      else if (isAllPairs()) { renderAllPairsSpreads(allPairsMonitor.getState()); syncCrossDexPair("poll"); }
       else renderSpreads(monitor.getState());
     }
 
@@ -571,38 +576,28 @@
     function renderAllPairsSpreads(state) {
       const body = element("allpairs-spreads-body");
       body.replaceChildren();
-      const spreads = state.pools.length ? E.allPairsSpreads(state.pools, thresholdOrDefault()) : [];
+      // Job 9: cross-pair (3-LEG) combinations are not displayed; only executable same-pair spreads are listed.
+      const spreads = state.pools.length ? E.allPairsSpreads(state.pools, thresholdOrDefault()).filter((spread) => !spread.crossPair) : [];
       spreads.forEach((spread) => {
         const row = document.createElement("tr");
         const isSelected = selected && selected.buy.poolId === spread.buy.poolId && selected.sell.poolId === spread.sell.poolId;
-        row.className = (spread.crossPair ? "" : "selectable") + (isSelected ? " selected" : "");
+        row.className = "selectable" + (isSelected ? " selected" : "");
         cell(row, spread.path);
-        if (spread.crossPair) {
-          // Job 8 fix 5: a 3-LEG row is a binary indicator. No percentage of any kind: the ratio of Token A's
-          // price in two different quote tokens is not a spread. Green dot = both pools exist and are tradeable.
-          cell(row, "");
-          cell(row, "");
-          cell(row, "");
-          cell(row, (spread.live ? "● " : "○ ") + "3-LEG", spread.live ? "green" : "muted");
-          cell(row, "3-LEG · watch-only", "tag");
-        } else {
-          cell(row, spread.spreadPercent.toFixed(3));
-          cell(row, spread.feeCostPercent.toFixed(3));
-          cell(row, spread.netPercent.toFixed(3));
-          verdictCell(row, spread);
-          cell(row, "2-LEG · " + E.protocolOf(spread.buy) + " → " + E.protocolOf(spread.sell) + " · click to quote");
-          row.tabIndex = 0;
-          row.addEventListener("click", () => selectSpread(spread));
-          row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") selectSpread(spread); });
-        }
+        cell(row, spread.spreadPercent.toFixed(3));
+        cell(row, spread.feeCostPercent.toFixed(3));
+        cell(row, spread.netPercent.toFixed(3));
+        verdictCell(row, spread);
+        cell(row, "2-LEG · " + E.protocolOf(spread.buy) + " → " + E.protocolOf(spread.sell) + " · click to quote");
+        row.tabIndex = 0;
+        row.addEventListener("click", () => selectSpread(spread));
+        row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") selectSpread(spread); });
         body.appendChild(row);
       });
       const active = state.pools.filter((pool) => pool.active).length;
       const tradeable = state.pools.filter((pool) => pool.status === "OK").length;
-      const cross = spreads.filter((spread) => spread.crossPair).length;
       element("allpairs-note").textContent = spreads.length
-        ? spreads.length + " spread(s) from " + tradeable + " tradeable pool(s) across " + (state.pairs ? state.pairs.length : 0) + " pair(s): " +
-          (spreads.length - cross) + " executable same-pair, " + cross + " cross-pair 3-LEG (watch-only). Same-pair rows buy currency0 where it is cheaper and sell where it is dearer."
+        ? spreads.length + " same-pair spread(s) from " + tradeable + " tradeable pool(s) across " + (state.pairs ? state.pairs.length : 0) +
+          " pair(s). Same-pair rows buy currency0 where it is cheaper and sell where it is dearer. Cross-pair combinations are not listed."
         : "No tradeable spreads. Pools discovered: " + (state.discovered ? state.discovered.v3 + " V3, " + state.discovered.v4 + " V4 (with liquidity)" : "none yet") +
           " · active: " + active + ", tradeable: " + tradeable + ".";
       return spreads;
@@ -627,6 +622,8 @@
       if (state.windowBlocks) element("allpairs-swaps-heading").textContent = "Swaps (" + state.windowBlocks + " blocks)";
       renderAllPairsPools(state);
       renderAllPairsSpreads(state);
+      syncCrossDexPair("poll"); // the selected pair may have changed
+      renderCrossDex(crossDex.getState());
       if (!state.lastError) maybeAutoExecute(state);
     }
 
@@ -647,8 +644,10 @@
           element("poll-status").textContent = error.message;
           element("poll-status").className = "error";
         });
+        syncCrossDexPair("poll");
       } catch (error) {
         allPairsMonitor.stop();
+        stopCrossDex();
         element("poll-status").textContent = error.message;
         element("poll-status").className = "error";
         element("pair-info").textContent = "Not watching. Fix Token A or the Token B list and click WATCH.";
@@ -719,6 +718,7 @@
       if (state.windowBlocks) element("swaps-heading").textContent = "Swaps (" + state.windowBlocks + " blocks)";
       renderPools(state);
       renderSpreads(state);
+      renderCrossDex(crossDex.getState());
       if (!state.lastError) maybeAutoExecute(state);
     }
 
@@ -779,6 +779,8 @@
         element("poll-status").className = "success";
       }
       renderLastRead(state);
+      if (state.pair && state.lastRead && !state.lastError) syncCrossDexPair("once");
+      renderCrossDex(crossDex.getState());
       if (!state.lastError && !state.pools.some((pool) => pool.status === "EMPTY")) maybeAutoExecute(state);
     }
 
@@ -788,6 +790,7 @@
     function startManual() {
       monitor.stop();
       allPairsMonitor.stop();
+      stopCrossDex(); // Manual mode reads the cross-DEX pools once per READ PRICES, after the pair is known
       clearSelection(true);
       element("manual-body").replaceChildren();
       element("manual-last-read").textContent = "";
@@ -828,8 +831,10 @@
           element("poll-status").textContent = error.message;
           element("poll-status").className = "error";
         });
+        syncCrossDexPair("poll");
       } catch (error) {
         monitor.stop();
+        stopCrossDex();
         element("poll-status").textContent = error.message;
         element("poll-status").className = "error";
         element("pair-info").textContent = "Pair not watched. Fix the token addresses and click WATCH PAIR.";
@@ -1027,6 +1032,110 @@
       }, { auto: true }).then(refreshSpreads);
     }
 
+    // ------------------------------------------------------------------ cross-DEX prices (job 9, read-only)
+
+    /** The monitor's Uniswap V3 pools of the cross-DEX pair: the reference for "Spread vs Uni". */
+    function uniReferencePools(pair) {
+      if (!pair) return [];
+      return (activeState().pools || []).filter((pool) => E.protocolOf(pool) === "V3" && pool.currency0 && pool.currency1 &&
+        pool.currency0.toLowerCase() === pair.token0.toLowerCase() && pool.currency1.toLowerCase() === pair.token1.toLowerCase());
+    }
+
+    /** 10^(decimals0 − decimals1) when the active pair's metadata matches the cross-DEX pair, else raw base units. */
+    function crossDexScale(pair) {
+      const meta = activeState().pair;
+      if (!pair || !meta || !meta.currency0 || !meta.currency1 || meta.currency0.toLowerCase() !== pair.token0.toLowerCase() ||
+        meta.currency1.toLowerCase() !== pair.token1.toLowerCase()) return 1;
+      return Math.pow(10, meta.decimals0 - meta.decimals1);
+    }
+
+    function renderCrossDex(state) {
+      const body = element("cross-dex-body");
+      body.replaceChildren();
+      const uni = X.bestUniPool(uniReferencePools(state.pair), state.pair);
+      const scale = crossDexScale(state.pair);
+      state.rows.forEach((row) => {
+        const tr = document.createElement("tr");
+        cell(tr, row.dex);
+        cell(tr, row.tier === null ? "—" : X.formatFee(row.fee) + (row.type === "cl" ? " (ts " + row.tickSpacing + ")" : ""), row.tier === null ? "muted" : "");
+        cell(tr, row.price === null ? "—" : (row.price * scale).toPrecision(6) + " (tick " + row.tick + ")", row.price === null ? "muted" : "");
+        cell(tr, X.formatLiquidity(row.liquidity), row.liquidity === null ? "muted" : "");
+        const spread = X.spreadVsUni(row.price, uni ? uni.price : null);
+        cell(tr, X.formatSpread(spread), spread === null ? "muted" : "");
+        cell(tr, row.status + (row.status === X.STATUS_ERROR && row.error ? " · " + row.error : ""),
+          row.status === X.STATUS_OK ? "green" : row.status === X.STATUS_ERROR ? "red" : "muted");
+        body.appendChild(tr);
+      });
+      const note = element("cross-dex-note");
+      if (!state.pair) {
+        note.textContent = "Not started.";
+        note.className = "muted";
+        return;
+      }
+      const when = (ms) => new Date(ms).toISOString().replace("T", " ").slice(0, 19) + " UTC";
+      const pools = state.rows.filter((row) => row.address).length;
+      note.textContent = pools + " pool(s) on " + X.DEXES.map((dex) => dex.name).join(" and ") + " for " + E.truncateAddress(state.pair.token0) + " / " +
+        E.truncateAddress(state.pair.token1) +
+        (state.lastError ? " · RPC error: " + state.lastError + " · last good data kept" : state.lastPoll ? " · last read " + when(state.lastPoll) : " · reading…") +
+        (state.polls && !state.lastError && !pools ? " · no pools on either DEX" : "") +
+        " · Uni reference: " + (uni ? "V3 " + X.formatFee(uni.pool.fee) + " pool at " + (uni.price * scale).toPrecision(6) : "none (no priced Uni V3 pool, Spread shows —)") +
+        (isManual() ? " · reads with READ PRICES" : " · next read in " + Math.round(X.POLL_INTERVAL_MS / 1000) + "s");
+      note.className = state.lastError ? "error" : "muted";
+    }
+
+    // Manual mode never batches (follow-up 5): there the reader sends one request per call, like READ PRICES.
+    const crossDexBatch = (calls) => isManual()
+      ? Promise.all(calls.map((call) => rpc.request(call.method, call.params).then((result) => result, (error) => ({ error }))))
+      : rpc.batchRequest(calls);
+    const crossDex = X.createCrossDexReader({ request: rpc.request, batchRequest: crossDexBatch, onUpdate: renderCrossDex });
+    let crossDexKey = null; // mode + pair currently read, so a re-render never restarts an unchanged pair
+
+    /** The Token A / Token B pair the cross-DEX reader follows in each mode. */
+    function crossDexTokens() {
+      if (isManual()) {
+        const meta = manualMonitor.getState().pair;
+        return meta ? [meta.currency0, meta.currency1] : null;
+      }
+      if (isAllPairs()) {
+        const current = pair();
+        const firstB = element("token-b-list").value.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+        return [element("token-a").value.trim(), current ? current.tokenB : firstB || ""];
+      }
+      return [element("token-a").value.trim(), element("token-b").value.trim()];
+    }
+
+    function stopCrossDex() {
+      crossDex.stop();
+      crossDexKey = null;
+      element("cross-dex-body").replaceChildren();
+      element("cross-dex-note").textContent = "Not started.";
+      element("cross-dex-note").className = "muted";
+    }
+
+    /** Read the cross-DEX pools of the active pair: polling, or once (Manual mode). Restarts only when the pair changes. */
+    function syncCrossDexPair(mode) {
+      const tokens = crossDexTokens();
+      if (!tokens) return;
+      let sorted;
+      try { sorted = X.sortTokens(tokens[0], tokens[1]); } catch (error) {
+        stopCrossDex();
+        element("cross-dex-note").textContent = "Cross-DEX: " + error.message;
+        element("cross-dex-note").className = "error";
+        return;
+      }
+      const key = mode + ":" + sorted.token0 + "/" + sorted.token1;
+      if (key === crossDexKey) return;
+      crossDexKey = key;
+      element("cross-dex-body").replaceChildren();
+      element("cross-dex-note").textContent = "Reading " + X.DEXES.map((dex) => dex.name).join(" and ") + "…";
+      element("cross-dex-note").className = "muted";
+      const run = mode === "once" ? crossDex.readOnce(sorted.token0, sorted.token1) : crossDex.start(sorted.token0, sorted.token1);
+      run.catch((error) => {
+        element("cross-dex-note").textContent = "Cross-DEX: " + error.message;
+        element("cross-dex-note").className = "error";
+      });
+    }
+
     // ------------------------------------------------------------------ wiring
 
     element("connect").addEventListener("click", () => runAction(async () => {
@@ -1137,10 +1246,10 @@
     element("threshold").addEventListener("input", () => {
       try {
         threshold();
-        element("auto-status").className = "muted";
+        element("field-status").className = "muted";
       } catch (error) {
-        element("auto-status").textContent = error.message + " Using 0.5% until fixed.";
-        element("auto-status").className = "error";
+        element("field-status").textContent = error.message + " Using 0.5% until fixed.";
+        element("field-status").className = "error";
       }
       refreshSpreads();
     });
@@ -1155,12 +1264,12 @@
     element("max-staleness").addEventListener("input", () => {
       const parsed = E.parseMaxStaleness(element("max-staleness").value);
       if (parsed === null) {
-        element("auto-status").textContent = "Enter Max staleness as whole seconds. Using " + maxStaleness + " until fixed.";
-        element("auto-status").className = "error";
+        element("field-status").textContent = "Enter Max staleness as whole seconds. Using " + maxStaleness + " until fixed.";
+        element("field-status").className = "error";
         return;
       }
       maxStaleness = parsed;
-      element("auto-status").className = "muted";
+      element("field-status").className = "muted";
       const state = monitor.getState();
       E.annotatePools(state.pools, maxStaleness);
       renderPools(state);
@@ -1169,22 +1278,6 @@
       E.annotatePools(all.pools, maxStaleness);
       renderAllPairsPools(all);
       renderAllPairsSpreads(all);
-    });
-
-    element("auto-mode").addEventListener("change", () => {
-      auto = element("auto-mode").checked;
-      if (auto) {
-        pendingHash = null;
-        autoSkipsLogged = new Map();
-        element("auto-status").textContent = "Auto mode ON: the next poll with a GREEN best spread above " + thresholdOrDefault() + "% executes automatically when both legs use the same protocol.";
-        element("auto-status").className = "success";
-        log("Auto mode ON (threshold " + thresholdOrDefault() + "%).");
-        maybeAutoExecute(activeState());
-      } else {
-        element("auto-status").textContent = "Auto mode OFF. Sending needs a click.";
-        element("auto-status").className = "muted";
-        log("Auto mode OFF.");
-      }
     });
 
     ["transfer-to", "transfer-ack"].forEach((id) => element(id).addEventListener("input", render));
@@ -1213,7 +1306,8 @@
     element("transfer-eth").addEventListener("click", () => transfer("ETH transfer", (to) => wallet.transferAllEth(to)));
 
     [["permit2-address", E.PERMIT2], ["router-address", E.ROUTER], ["pool-manager-address", E.POOL_MANAGER], ["rpc-url", E.RPC_URL],
-      ["rpc-fallback-url", E.RPC_FALLBACK_URL], ["v3-factory-address", E.V3_FACTORY], ["v3-router-address", E.V3_ROUTER]]
+      ["rpc-fallback-url", E.RPC_FALLBACK_URL], ["v3-factory-address", E.V3_FACTORY], ["v3-router-address", E.V3_ROUTER],
+      ["sushi-factory-address", X.DEXES[0].factory], ["ramses-factory-address", X.DEXES[1].factory]]
       .forEach(([id, value]) => { element(id).textContent = value; });
     // Follow-up 6 multi-tab lock: a send from another tab less than 5 minutes ago disables execution here.
     tabLocked = tabLock.heldElsewhere();

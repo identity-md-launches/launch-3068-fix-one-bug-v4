@@ -7,6 +7,137 @@ on chain 4663, with the evidence for the fix.
 The deliverables are [`index.html`](index.html) and [`js/v4-arb-encoder.js`](js/v4-arb-encoder.js):
 plain JavaScript and the existing vendored ethers v5, with no install or CDN required.
 
+## Job 9: Cross-DEX price reader + LP depth
+
+A new, read-only section **"Cross-DEX Prices"** below the spreads tables reads the pools of the active
+Token A / Token B pair on the non-Uniswap DEXes of Robinhood Chain (4663) and shows price, raw LP depth
+and the spread against the best Uniswap V3 price, with a status per row. No execution, no swaps, no
+approvals, no wallet: the module sends `eth_call` only. No new dependency, no build step. All new code is
+in `js/cross-dex-reader.js`; `index.html` gains the section, the wiring and the removals below. The
+existing V3/V4 execution code, quote logic and wallet flow are untouched.
+
+### What changed
+
+1. **DEX configuration** (`DEXES` in `js/cross-dex-reader.js`), the brief's array with one correction:
+
+   | DEX | Factory | Key | Tiers read |
+   | --- | --- | --- | --- |
+   | SushiSwap V3 | `0xE51960f1B45f1C9FB6D166E6a884F866fC70433B` | `getPool(token0, token1, uint24 fee)` (type `v3`) | fees 100, 500, 3000 |
+   | Ramses V3 | `0xE0c4ceb92d08CA985bB70fe0a22fEb121A9854A8` | `getPool(token0, token1, int24 tickSpacing)` (type `cl`) | tick spacings 1, 5, 10, 50, 100, 200, 500 |
+
+   The brief lists Ramses as type `v3` with fees `[100, 500, 3000]`. The contract at that address is a
+   Ramses CL (Slipstream-shaped) factory: its 3 423-byte runtime contains the tick-spacing-keyed selector
+   `0x28af8d0b` and not the fee-keyed `0x1698ee82`; every fee-keyed `getPool` reverts, while
+   `getPool(WETH, USDG, ts)` answers pools for spacings 1, 5, 10 and 50 and `tickSpacingInitialFee(ts)` is
+   non-zero exactly for the seven spacings above (all read live, `docs/cross-dex-live.json`). Read
+   literally, the brief's configuration would show one permanent **error** row for Ramses and no prices.
+   The reader therefore has two factory types: `v3` exactly as the brief specifies, and `cl` for the Ramses
+   factory, keyed by tick spacing. CL pools carry their own `fee()`, which can change (the ts=1 WETH/USDG
+   pool charges 0.10 % today, initial fee 0.01 %), so the Fee column of a CL row is read from the pool and
+   shown as `0.10% (ts 1)`. Everything else is identical for both types.
+2. **Per read, per DEX**: one `getPool` per tier, sent together with the other DEX's in **one JSON-RPC
+   batch** (10 calls); then `slot0()` and `liquidity()` of every non-zero pool (plus `fee()` for CL pools) in
+   a second batch. A zero address is skipped silently. Price = `1.0001^tick` of `slot0`, the same math as
+   the V3 reads, shown as token1 per token0 after decimals like the Uniswap rows (`2034.13 (tick -200142)`
+   for WETH/USDG); the raw `1.0001^tick` is used for the spread, so decimals cancel. Liquidity is the raw
+   `liquidity()` value with thousands separators, no $ conversion. Token sorting is the page's BigInt
+   comparison; the factories are always asked with the sorted pair.
+3. **Spread vs Uni** = (DEX price − best Uni V3 price of the same pair) / best Uni price × 100, shown as
+   `+0.05%`. The *best* Uniswap V3 pool is the priced, tradeable (status OK, liquidity > 0) V3 pool of the
+   pair in the monitor's current state with the greatest active liquidity (ties: the lower fee tier); its
+   tier and price are named in the note under the table. With no priced Uni V3 pool (V4-only pair, no
+   V3 pool, V3 pools all STALE/EMPTY/UNKNOWN, or Protocol = V4) the column shows **—**. The spread is
+   recomputed on every Uniswap update as well as on every cross-DEX read.
+4. **Status**: `OK` (priced), `no pool` (a pool created but never initialised, `sqrtPriceX96 = 0`, or a tier
+   whose pool was shown before and now answers 0x0), `error` (a read failed; the row keeps its last good
+   price and liquidity and shows the reason). A DEX whose factory cannot be read and has nothing else to
+   show gets one `error` row so the failure is visible; a transport failure marks every row `error`, keeps
+   the data and turns the note red with "last good data kept". Both DEXes without pools: an empty table and
+   a plain note, no error.
+5. **Cadence and pair**: every 30 s (`POLL_INTERVAL_MS`, the monitor's), on its own timer, for the
+   currently active pair only. Auto-scan: the Token A / Token B fields. All pairs: Token A with the first
+   Token B of the list until a spread is selected, then that spread's pair (the reader restarts only when
+   the pair changes). Manual mode never polls and never batches (follow-up 5's promise): the pools' token0
+   / token1 are read **once per READ PRICES**, after the pool read, with single `eth_call`s. Changing pair,
+   protocol or mode restarts the reader with an empty table; a bad address shows "Cross-DEX: …" in the
+   note and requests nothing.
+6. **Removed**: the 3-LEG (cross-pair) rows of the All Pairs spreads table are not displayed any more
+   (`E.allPairsSpreads` still computes them; the page filters them out, and the note counts same-pair
+   spreads only); the Auto mode checkbox, its label and its CSS; the two "Auto mode …" paragraphs below
+   the spreads table. The threshold / Max staleness validation messages that used the Auto mode status
+   line now use `#field-status` under the fields, next to a one-line reminder that sending needs a click.
+   `maybeAutoExecute` and the `auto` flag remain in the script but can no longer be switched on, so the page
+   never sends without a click; the activity-log test checks that.
+7. **Contract addresses** panel lists both factories.
+
+### Job 9 verification
+
+- **Live, read-only** (`node scripts/verify-cross-dex-live.js [--rpc=URL] [--tokenA= --tokenB=] [--write=…]`),
+  recorded in `docs/cross-dex-live.json` at block 111 015 213 (2026-11-10), WETH / USDG, every read
+  pinned to that block, through the page's primary RPC: both factories have code; the fee-keyed
+  `getPool(WETH, USDG, 500)` **answers** `0x9B05…9c3C` on SushiSwap and **reverts** on Ramses; the reader
+  finds and reads six pools, all `OK`:
+
+  | DEX | Fee | Price (USDG/WETH) | Liquidity | Spread vs Uni | Status |
+  | --- | --- | --- | --- | --- | --- |
+  | SushiSwap V3 | 0.05% | 2034.13 (tick -200142) | 136,670,994,770,876,940 | 0.00% | OK |
+  | SushiSwap V3 | 0.30% | 2027.22 (tick -200176) | 116,103,576,639,324 | -0.34% | OK |
+  | Ramses V3 | 0.10% (ts 1) | 2033.52 (tick -200145) | 16,040,895,949,584,771 | -0.03% | OK |
+  | Ramses V3 | 0.05% (ts 5) | 2056.21 (tick -200034) | 26,475,813,299 | +1.09% | OK |
+  | Ramses V3 | 0.05% (ts 10) | 2601.67 (tick -197681) | 0 | +27.90% | OK |
+  | Ramses V3 | 0.30% (ts 50) | 2063.01 (tick -200001) | 78,637,632,689 | +1.42% | OK |
+
+  The Uni reference at that block was the Uniswap V3 0.05% pool (the deepest of the four), 2034.13. The
+  ts=10 Ramses pool has liquidity 0 and a stale tick: the table shows it as read (the brief asks for raw
+  liquidity, the depth column is the warning). SushiSwap's 0.01% tier has no pool and is skipped.
+- `node --test js/test/*.test.js`: **238 cases**. New `cross-dex.test.js` (18: configuration, sorting,
+  price, formatting, the Uni reference rule, the exact live calldata, decoding of the live `slot0` /
+  `liquidity` replies, one full read of a live-like chain with order and call counts, no pools, a reverting
+  factory as the brief's literal Ramses configuration would behave, a failed pool read keeping last good
+  data and recovering, transport failures before and after data, uninitialised and vanished pools, the 30 s
+  timer / `readOnce` / `stop` with a read in flight, single-request mode, bad input, state copies). Page
+  tests (5): the table's rows, prices, liquidity, spreads and note against mock factories; the sorted pair
+  asked of both factories on every poll; "—" without a Uni V3 pool; the one error row of a reverting
+  factory; the empty table; both factories absent; an RPC failure keeping last good values and recovering;
+  one pool failing; a pair change restarting; All pairs following the first Token B and then the selected
+  pair; Manual mode's one-shot single-request read; the removals (no checkbox, label, CSS, Auto mode text
+  or 3-LEG anywhere in the markup; a GREEN spread with a connected wallet polls and sends nothing).
+  Ten earlier tests that exercised the Auto mode checkbox were removed with it; the All pairs, fix 2,
+  Manual and Max staleness tests were adjusted (no 3-LEG rows, `#field-status`, the reader's own timer and
+  its 10 extra `getPool` calls per read). The mock answers registered contracts by address.
+- `forge build`, `forge test` (**174 tests, 7 suites**) with the verifier's fuzz seed and
+  `forge fmt --check` pass on the unchanged pinned solc 0.8.26. `src/CrossDexReader.sol` +
+  `test/CrossDexReader.t.sol` (35 tests, 8 fuzz) pin the rules independently of the page: token sorting,
+  the two factory keys and their exact calldata (the bytes sent live), reply decoding for seven- and
+  six-word `slot0`, the status matrix, keep-last-good, the Uni reference choice, the spread (sign, 0,
+  +100 %, −50 %, the live Sushi / Ramses vs Uniswap values), `UnsupportedFee` / `UnsupportedTickSpacing`
+  / `NoUniReference` / `ShortReply` reverts, and a price-from-`sqrtPriceX96` check against the live ticks.
+
+### Job 9 assumptions and deployment
+
+| Item | Value |
+| --- | --- |
+| Chain / RPC | 4663; the page's existing client: Blockmachine primary, dRPC fallback on 429/5xx, batch with sequential fallback |
+| SushiSwap V3 | factory `0xE51960f1B45f1C9FB6D166E6a884F866fC70433B` (UniswapV3Factory shape, 24 535 bytes), fees 100 / 500 / 3000 as the brief |
+| Ramses | factory `0xE0c4ceb92d08CA985bB70fe0a22fEb121A9854A8` read as a CL factory by tick spacing 1 / 5 / 10 / 50 / 100 / 200 / 500; fee per pool from `fee()` |
+| Why not the brief's `fees` for Ramses | fee-keyed `getPool` is not in the runtime and reverts (live); the literal configuration shows only an error row |
+| Price | `1.0001^tick` of `slot0` (first two words of any layout); displayed × 10^(decimals0 − decimals1) when the pair's metadata is known, raw otherwise |
+| Liquidity | raw `liquidity()` (uint128) with separators; 0 is shown as 0 with status OK |
+| Best Uni V3 price | the monitor's V3 pool of the pair with status OK, price > 0 and the greatest liquidity; ties → lower fee; none → "—" |
+| Spread | (DEX − Uni) / Uni × 100, two decimals, signed; computed from raw prices |
+| Cadence | 30 s (own timer), restarted on pair / protocol / mode change; Manual mode: once per READ PRICES, single requests |
+| Error handling | per-row `error` with the reason, last good price / liquidity kept; DEX-level error row; transport error keeps all rows and turns the note red |
+| Removed | 3-LEG rows (filtered at render), Auto mode checkbox + label + CSS + paragraphs; `#field-status` replaces `#auto-status` for validation messages |
+| Not changed | `js/v4-arb-encoder.js`, the Worker, execution, quotes, approvals, wallet flow, Permit2 |
+| Nothing deployed | no contract is deployed or changed by this job; `src/CrossDexReader.sol` is an internal pure test mirror |
+
+Operators remain responsible for keeping the two factory addresses current (a DEX redeploying its factory
+shows as `error` or an empty table, never as a wrong price), for reading the Liquidity column before
+acting on a spread (a 0-liquidity pool prints a stale tick, like the Ramses ts=10 row above), for widening
+the Worker's `ALLOWED_METHODS` only if the Worker is to carry these reads (they are plain `eth_call`s), and
+for everything listed under "Operational responsibilities". The cross-DEX data is a display and signal
+input only: the page never executes against SushiSwap or Ramses.
+
 ## Job 8: Audit fixes, display, Permit2, UX
 
 Nine fixes to the existing page, Worker and encoder. No new dependency, no build step, no change to
@@ -1087,6 +1218,10 @@ These were visible on chain while testing. None of them is fixed by an encoder.
 | `js/test/manual.test.js` | Manual mode: address rule, the four reads, slot0 layouts, validation messages, monitor schedule, 10 cases |
 | `js/test/manual-mock.js` | pool-shaped eth_call double (token0 / token1 / fee / slot0), including the brief's two pools' live replies |
 | `scripts/verify-manual-live.js` | optional read-only live check of Manual mode; `docs/manual-live.json` is its output of 2026-11-07 |
+| `js/cross-dex-reader.js` | job 9: read-only cross-DEX price + LP depth reader (SushiSwap V3 fee-keyed, Ramses CL tick-spacing keyed), `createCrossDexReader` |
+| `js/test/cross-dex.test.js` | job 9: the reader against a fake chain, 18 cases |
+| `scripts/verify-cross-dex-live.js` | job 9: optional read-only live check of both factories; `docs/cross-dex-live.json` is its output of 2026-11-10 |
+| `src/CrossDexReader.sol`, `test/CrossDexReader.t.sol` | job 9: the reader rules in Solidity (internal pure), 35 Foundry tests |
 | `js/test/encoder.test.js` | offline test of the encoder, 18 cases |
 | `js/test/permit2.test.js` | approval and transaction-flow success/failure tests, 43 cases |
 | `js/test/monitor.test.js` | pool ids, spreads, monitor schedule and errors, window, staleness, slot0, quote, transfers, 34 cases |

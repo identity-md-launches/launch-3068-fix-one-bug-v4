@@ -1,0 +1,266 @@
+{
+  "recordedAt": "2026-11-10T16:18:41.976Z",
+  "chainId": 4663,
+  "block": 111015213,
+  "rpcSource": "the page's primary RPC (https://rpc-robinhood.blockmachine.io), every read pinned to `block`",
+  "readOnly": "eth_chainId, eth_blockNumber, eth_getCode, eth_call only; nothing sent or signed",
+  "pair": {
+    "tokenA": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    "tokenB": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "token0": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    "token1": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "symbol0": "WETH",
+    "decimals0": 18,
+    "symbol1": "USDG",
+    "decimals1": 6,
+    "priceUnit": "USDG per WETH (1.0001^tick × 10^12)"
+  },
+  "factories": {
+    "SushiSwap V3": {
+      "address": "0xE51960f1B45f1C9FB6D166E6a884F866fC70433B",
+      "type": "v3",
+      "codeBytes": 24535,
+      "tiers": [
+        100,
+        500,
+        3000
+      ],
+      "hasFeeKeyedGetPool": true,
+      "hasTickSpacingKeyedGetPool": false,
+      "feeKeyedGetPool500": "answers 0x0000000000000000000000009b050cb1f265094b0977160a2bd7da8c9e529c3c"
+    },
+    "Ramses V3": {
+      "address": "0xE0c4ceb92d08CA985bB70fe0a22fEb121A9854A8",
+      "type": "cl",
+      "codeBytes": 3423,
+      "tiers": [
+        1,
+        5,
+        10,
+        50,
+        100,
+        200,
+        500
+      ],
+      "hasFeeKeyedGetPool": false,
+      "hasTickSpacingKeyedGetPool": true,
+      "feeKeyedGetPool500": "reverts: RPC error: execution reverted"
+    }
+  },
+  "rows": [
+    {
+      "dex": "SushiSwap V3",
+      "type": "v3",
+      "tier": 500,
+      "fee": 500,
+      "tickSpacing": null,
+      "address": "0x9B050cb1F265094b0977160a2BD7dA8C9E529c3C",
+      "tick": -200142,
+      "sqrtPriceX96": "3573319960676753481924608",
+      "price": 2.034126483367843e-9,
+      "liquidity": "136670994770876940",
+      "status": "OK",
+      "error": null,
+      "updatedAt": 1794327521501
+    },
+    {
+      "dex": "SushiSwap V3",
+      "type": "v3",
+      "tier": 3000,
+      "fee": 3000,
+      "tickSpacing": null,
+      "address": "0xC5A01C57b2851202dCF8507a0F2Bd08a8025E2C8",
+      "tick": -200176,
+      "sqrtPriceX96": "3567256391624677309370622",
+      "price": 2.0272225418667304e-9,
+      "liquidity": "116103576639324",
+      "status": "OK",
+      "error": null,
+      "updatedAt": 1794327521501
+    },
+    {
+      "dex": "Ramses V3",
+      "type": "cl",
+      "tier": 1,
+      "fee": 1000,
+      "tickSpacing": 1,
+      "address": "0xFAE65eAa11943f45E83D5B45DC7A7C801C51bfB0",
+      "tick": -200145,
+      "sqrtPriceX96": "3572853312115152654866974",
+      "price": 2.033516367450084e-9,
+      "liquidity": "16040895949584771",
+      "status": "OK",
+      "error": null,
+      "updatedAt": 1794327521501
+    },
+    {
+      "dex": "Ramses V3",
+      "type": "cl",
+      "tier": 5,
+      "fee": 500,
+      "tickSpacing": 5,
+      "address": "0x584Eb229d4130f68D8d323E8E1E787BE47260D70",
+      "tick": -200034,
+      "sqrtPriceX96": "3592697870699959808766653",
+      "price": 2.0562129975879277e-9,
+      "liquidity": "26475813299",
+      "status": "OK",
+      "error": null,
+      "updatedAt": 1794327521501
+    },
+    {
+      "dex": "Ramses V3",
+      "type": "cl",
+      "tier": 10,
+      "fee": 500,
+      "tickSpacing": 10,
+      "address": "0x028779cA5D91C7F016ACB98E0AfA5102F4e436e4",
+      "tick": -197681,
+      "sqrtPriceX96": "4041359999860295136499531",
+      "price": 2.601671637833518e-9,
+      "liquidity": "0",
+      "status": "OK",
+      "error": null,
+      "updatedAt": 1794327521501
+    },
+    {
+      "dex": "Ramses V3",
+      "type": "cl",
+      "tier": 50,
+      "fee": 3000,
+      "tickSpacing": 50,
+      "address": "0x288Eb58ee0F0E9378dEC1e8Fa51c389644c24685",
+      "tick": -200001,
+      "sqrtPriceX96": "3598574715929805708577164",
+      "price": 2.0630093685117116e-9,
+      "liquidity": "78637632689",
+      "status": "OK",
+      "error": null,
+      "updatedAt": 1794327521501
+    }
+  ],
+  "uniswapV3": {
+    "factory": "0x1f7d7550b1b028f7571e69a784071f0205fd2efa",
+    "rows": [
+      {
+        "dex": "Uniswap V3",
+        "type": "v3",
+        "tier": 100,
+        "fee": 100,
+        "tickSpacing": null,
+        "address": "0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca",
+        "tick": -200145,
+        "sqrtPriceX96": "3572871611364745000000000",
+        "price": 2.033516367450084e-9,
+        "liquidity": "350964745223220817",
+        "status": "OK",
+        "error": null,
+        "updatedAt": 1794327521753
+      },
+      {
+        "dex": "Uniswap V3",
+        "type": "v3",
+        "tier": 500,
+        "fee": 500,
+        "tickSpacing": null,
+        "address": "0x69BfaF19C9f377BB306a89aEd9F6B07e2c1a8d9a",
+        "tick": -200142,
+        "sqrtPriceX96": "3573423088512349172137984",
+        "price": 2.034126483367843e-9,
+        "liquidity": "355571720079513634",
+        "status": "OK",
+        "error": null,
+        "updatedAt": 1794327521753
+      },
+      {
+        "dex": "Uniswap V3",
+        "type": "v3",
+        "tier": 3000,
+        "fee": 3000,
+        "tickSpacing": null,
+        "address": "0xa9188730Fe85Be88ad499D7d52B099e800fB0334",
+        "tick": -200157,
+        "sqrtPriceX96": "3570615974526411967529622",
+        "price": 2.031077733211988e-9,
+        "liquidity": "63151641705409478",
+        "status": "OK",
+        "error": null,
+        "updatedAt": 1794327521753
+      },
+      {
+        "dex": "Uniswap V3",
+        "type": "v3",
+        "tier": 10000,
+        "fee": 10000,
+        "tickSpacing": null,
+        "address": "0x5f009E071F07e92B6C624e83F52F17bBDa34680D",
+        "tick": -200191,
+        "sqrtPriceX96": "3564711952061032485093376",
+        "price": 2.0241841393430897e-9,
+        "liquidity": "4670220530455383",
+        "status": "OK",
+        "error": null,
+        "updatedAt": 1794327521753
+      }
+    ],
+    "reference": {
+      "fee": 500,
+      "address": "0x69BfaF19C9f377BB306a89aEd9F6B07e2c1a8d9a",
+      "price": 2.034126483367843e-9,
+      "displayPrice": 2034.126483367843,
+      "liquidity": "355571720079513634",
+      "rule": "priced, tradeable Uni V3 pool with the greatest liquidity"
+    }
+  },
+  "table": [
+    {
+      "dex": "SushiSwap V3",
+      "fee": "0.05%",
+      "price": "2034.13 (tick -200142)",
+      "liquidity": "136,670,994,770,876,940",
+      "spreadVsUni": "0.00%",
+      "status": "OK"
+    },
+    {
+      "dex": "SushiSwap V3",
+      "fee": "0.30%",
+      "price": "2027.22 (tick -200176)",
+      "liquidity": "116,103,576,639,324",
+      "spreadVsUni": "-0.34%",
+      "status": "OK"
+    },
+    {
+      "dex": "Ramses V3",
+      "fee": "0.10% (ts 1)",
+      "price": "2033.52 (tick -200145)",
+      "liquidity": "16,040,895,949,584,771",
+      "spreadVsUni": "-0.03%",
+      "status": "OK"
+    },
+    {
+      "dex": "Ramses V3",
+      "fee": "0.05% (ts 5)",
+      "price": "2056.21 (tick -200034)",
+      "liquidity": "26,475,813,299",
+      "spreadVsUni": "+1.09%",
+      "status": "OK"
+    },
+    {
+      "dex": "Ramses V3",
+      "fee": "0.05% (ts 10)",
+      "price": "2601.67 (tick -197681)",
+      "liquidity": "0",
+      "spreadVsUni": "+27.90%",
+      "status": "OK"
+    },
+    {
+      "dex": "Ramses V3",
+      "fee": "0.30% (ts 50)",
+      "price": "2063.01 (tick -200001)",
+      "liquidity": "78,637,632,689",
+      "spreadVsUni": "+1.42%",
+      "status": "OK"
+    }
+  ],
+  "rpcCallsMade": "3 + 7 getPool (one batch) + 2 or 3 reads per pool (one batch) for the DEXes; 4 getPool + 2 reads per pool for Uniswap; symbol/decimals of both tokens; eth_getCode per factory"
+}
