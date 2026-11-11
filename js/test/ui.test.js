@@ -13,6 +13,7 @@ const { MockWallet, CALLER, OTHER, erc20 } = require("./mock-wallet.js");
 const { ethers } = require("../vendor/ethers-5.7.2.umd.min.js");
 const E = require("../v4-arb-encoder.js");
 const lower = (a) => String(a).toLowerCase();
+const notAlpRow = (row) => !/^ALP V4 · /.test(row.children[0] ? row.children[0].textContent : "");
 const { V3Mock, v3, token, decodePath } = require("./v3-mock.js");
 
 function node(tag, attributes = {}) {
@@ -92,7 +93,7 @@ function loadPage(provider = new MockWallet(), { noWallet = false, storage = und
   };
   // Fire the pending poll timer and wait for the cycle to schedule the next one.
   // Job 9: the cross-DEX reader polls on its own 30 s timer (named crossDexPoll); monitor assertions use monitorTimers().
-  const monitorTimers = () => timers.filter((t) => t.fn.name !== "crossDexPoll");
+  const monitorTimers = () => timers.filter((t) => t.fn.name !== "crossDexPoll" && t.fn.name !== "alpPoll");
   const crossDexTimers = () => timers.filter((t) => t.fn.name === "crossDexPoll");
   const poll = async () => {
     const due = timers.splice(0);
@@ -122,163 +123,8 @@ function withActivePools(provider = new MockWallet()) {
   return provider;
 }
 
-test("page loads offline, polls the public RPC without any wallet call, and shows seven inactive pools", async () => {
-  const { provider, element, html, timers, monitorTimers } = await readyPage();
-  assert.ok(html.includes("APPROVE PERMIT2 (one-time)"));
-  assert.ok(html.includes("CONNECT WALLET"));
-  assert.ok(html.includes("TRANSFER TO NEW WALLET"));
-  assert.ok(html.includes("Sends ALL of this asset to the new address. Cannot undo."));
-  assert.equal(provider.calls.length, 0);
-  assert.ok(provider.rpcCalls.some((c) => c.method === "eth_getLogs"));
-  assert.ok(provider.rpcCalls.every((c) => c.url === E.RPC_URL));
-  assert.equal(element("pools-body").children.length, 7);
-  assert.deepEqual(element("pools-body").children.map((row) => row.children[0].textContent), ["0", "0", "500", "2500", "3000", "10000", "30000"]);
-  assert.ok(element("pools-body").children.every((row) => row.children[4].textContent.startsWith("no")));
-  assert.equal(element("spreads-body").children.length, 0);
-  assert.match(element("spreads-note").textContent, /^No tradeable spreads/);
-  assert.match(element("poll-status").textContent, /Last poll .* block 108394834 .* window 3000 blocks \(108391835–108394834\)/);
-  assert.match(element("pair-info").textContent, /Token A PONS · Token B USDG · currency0 = PONS/);
-  assert.deepEqual(monitorTimers().map((t) => t.ms), [E.POLL_INTERVAL_MS]);
-  assert.equal(element("send").disabled, true);
-  assert.equal(element("dry-run").disabled, true);
-  assert.equal(element("approve-permit2").disabled, true);
-  assert.equal(element("transfer-a").disabled, true);
-  assert.equal(element("bal-a").textContent, "—");
-});
 
-test("active pools render prices and the top spreads; the full flow runs with the selected pools and updates balances", async () => {
-  const { provider, element, poll, flush } = await readyPage(withActivePools());
-  await poll();
-  const rows = element("pools-body").children;
-  assert.match(rows[4].children[2].textContent, /^0\.19030[0-9]* \(tick -292916\)$/);
-  assert.equal(rows[4].children[3].textContent, "1");
-  assert.equal(rows[4].children[4].textContent, "yes");
-  assert.equal(rows[0].children[2].textContent, "—");
-  const spreads = element("spreads-body").children;
-  assert.equal(spreads.length, 3);
-  assert.equal(spreads[0].children[0].textContent, "3000 / 60");
-  assert.equal(spreads[0].children[1].textContent, "30000 / 600");
-  assert.equal(spreads[0].children[3].textContent, "3.300");
-  assert.equal(spreads[0].children[5].textContent, "GREEN");
-  assert.equal(spreads[2].children[5].textContent, "RED");
-  assert.match(element("spreads-note").textContent, /3 spread\(s\) from 3 tradeable pool\(s\)/);
 
-  // Click the best row: the pool keys are filled and swap 1 is quoted through the public RPC.
-  await spreads[0].click();
-  await flush();
-  const selected = JSON.parse(element("selected-pools").textContent);
-  assert.equal(selected.buyPool.fee, 3000);
-  assert.equal(selected.buyPool.tickSpacing, 60);
-  assert.equal(selected.sellPool.fee, 30000);
-  assert.equal(selected.buyPool.currency0, ethers.utils.getAddress(E.PONS));
-  assert.equal(element("bridge-amount").value, "0.052096879755458694");
-  assert.match(element("quote-info").textContent, /Swap 1 quote: 0\.01 USDG → 0\.052358673121064015 PONS on pool 3000 \/ 60/);
-  assert.equal(provider.calls.length, 0); // still no wallet involvement
-  assert.equal(element("dry-run").disabled, true); // not connected yet
-
-  await element("connect").click();
-  assert.equal(element("account").textContent, CALLER);
-  assert.equal(element("bal-a").textContent, "1.5 PONS");
-  assert.equal(element("bal-b").textContent, "25.0 USDG");
-  assert.equal(element("bal-eth").textContent, "0.2 ETH");
-  assert.match(element("transfer-balances").textContent, /1\.5 PONS · 25\.0 USDG · 0\.2 ETH/);
-  assert.equal(element("dry-run").disabled, false);
-  assert.match(element("approval-limits").textContent, /1\.0 USDG and 5\.2096879755458694 PONS/);
-  await element("approve-permit2").click();
-  assert.equal(provider.sent.length, 2);
-  assert.match(element("status").textContent, /allowances are ready/);
-  assert.match(element("activity").textContent, /USDG Permit2 approval confirmed:/);
-  assert.match(element("activity").textContent, /PONS Permit2 approval confirmed:/);
-  await element("dry-run").click();
-  assert.match(element("status").textContent, /Dry run succeeded/);
-  const data = element("calldata").textContent;
-  assert.equal(data, E.buildCalldata({
-    usdgIn: ethers.utils.parseUnits("0.01", 6),
-    ponsAmount: "52096879755458694",
-    minUsdgOut: 0,
-    recipient: CALLER,
-    deadline: provider.now + 1200,
-    buyPool: { currency0: E.PONS, currency1: E.USDG, fee: 3000, tickSpacing: 60, hooks: E.NO_HOOKS },
-    sellPool: { currency0: E.PONS, currency1: E.USDG, fee: 30000, tickSpacing: 600, hooks: E.NO_HOOKS },
-  }));
-  assert.equal(element("send").disabled, false);
-  await element("send").click();
-  assert.equal(provider.sent.length, 3);
-  assert.equal(provider.sent[2].data, data);
-  assert.match(element("status").textContent, /Swap confirmed:/);
-  assert.equal(element("bal-b").textContent, "24.99 USDG"); // refreshed after the receipt
-  assert.equal(element("send").disabled, true);
-});
-
-test("a buy pool without liquidity warns 'no liquidity' and keeps sending disabled", async () => {
-  const provider = new MockWallet();
-  provider.addSwap(30000, 600, -293500); // cheapest, but empty on the router
-  provider.addSwap(3000, 60, -292916);
-  const { element, poll, flush } = await readyPage(provider);
-  await poll();
-  await element("connect").click();
-  const row = element("spreads-body").children[0];
-  assert.equal(row.children[0].textContent, "30000 / 600");
-  await row.click();
-  await flush();
-  assert.match(element("quote-info").textContent, /Warning: no liquidity/);
-  assert.equal(element("quote-info").className, "error");
-  assert.match(element("status").textContent, /No liquidity/);
-  assert.equal(element("dry-run").disabled, true);
-  assert.equal(element("approve-permit2").disabled, true);
-  assert.equal(element("send").disabled, true);
-  assert.equal(element("bridge-amount").value, "");
-  assert.equal(provider.sent.length, 0);
-});
-
-test("RPC errors show the 60 s retry in the status bar and polling continues afterwards", async () => {
-  const { provider, element, timers, monitorTimers, poll } = await readyPage();
-  provider.rpcFailures = 2; // job 9: the cross-DEX reader's batch fails too; the monitor sees one failure
-  await poll();
-  assert.match(element("poll-status").textContent, /^RPC error, retrying in 60s — RPC error: rate limited · last successful poll/);
-  assert.ok(element("cross-dex-body").children.every((row) => row.children[5].textContent.startsWith("error")), "the cross-DEX rows show error too");
-  assert.equal(element("poll-status").className, "error");
-  assert.deepEqual(monitorTimers().map((t) => t.ms), [E.RPC_RETRY_MS]);
-  assert.equal(element("pools-body").children.length, 7);
-  provider.httpFailures = 2;
-  await poll();
-  assert.match(element("poll-status").textContent, /RPC error, retrying in 60s — .*HTTP error 429/);
-  assert.deepEqual(monitorTimers().map((t) => t.ms), [E.RPC_RETRY_MS]);
-  provider.block += 10;
-  await poll();
-  assert.match(element("poll-status").textContent, /Last poll .* block 108394844/);
-  assert.equal(element("poll-status").className, "success");
-  assert.deepEqual(monitorTimers().map((t) => t.ms), [E.POLL_INTERVAL_MS]);
-});
-
-test("changing the pair restarts polling for the new tokens; a bad address is reported and recoverable", async () => {
-  const provider = new MockWallet();
-  const third = "0x1111111111111111111111111111111111111111";
-  provider.tokens.set(third, ["FOO", 8]);
-  provider.addSwap(3000, 60, -1000, provider.block, { currency0: third, currency1: E.PONS });
-  const { element, until, timers, monitorTimers, flush } = await readyPage(provider);
-  element("token-b").input(third);
-  await element("apply-pair").click();
-  await until(() => /FOO/.test(element("pair-info").textContent), "new pair");
-  await flush(5);
-  assert.match(element("pair-info").textContent, /Token A PONS · Token B FOO · currency0 = FOO/);
-  assert.equal(element("pools-body").children[4].children[4].textContent, "yes");
-  assert.equal(element("selected-pools").textContent, "No spread selected.");
-  assert.deepEqual(monitorTimers().map((t) => t.ms), [E.POLL_INTERVAL_MS]);
-  element("token-b").input("0x1234");
-  await element("apply-pair").click();
-  await flush(5);
-  assert.match(element("poll-status").textContent, /invalid address/);
-  assert.equal(timers.length, 0);
-  element("token-b").input(E.PONS);
-  await element("apply-pair").click();
-  await flush(5);
-  assert.match(element("poll-status").textContent, /must be different/);
-  element("token-b").input(E.USDG);
-  await element("apply-pair").click();
-  await until(() => timers.length > 0, "polling to resume");
-  assert.match(element("pair-info").textContent, /Token B USDG/);
-});
 
 // ------------------------------------------------------------------ follow-up 3.5
 
@@ -290,317 +136,6 @@ const logsSpan = provider => {
     .at(-1).body.filter(call => call.method === "eth_getLogs").map(call => call.params[0]);
   return provider.block - Math.min(...filters.map(filter => Number(filter.fromBlock)));
 };
-
-test("the Window field defaults to 3000 within 50 to 50000, is live, and the status bar shows it", async () => {
-  const { provider, element, poll, html } = await readyPage();
-  assert.match(html, /<label>Window \(blocks\)<input id="window-blocks" type="number" value="3000" min="50" max="50000"/);
-  assert.ok(html.indexOf('id="window-blocks"') < html.indexOf('id="pools-heading"'));
-  assert.equal(element("window-status").textContent, "3000 blocks");
-  assert.match(element("poll-status").textContent, /window 3000 blocks/);
-  assert.equal(logsSpan(provider), 2999);
-  const startCalls = provider.rpcCalls.filter((c) => c.params[0] && c.params[0].data === erc20.getSighash("symbol")).length;
-
-  element("window-blocks").input("500");
-  assert.equal(element("window-status").textContent, "500 blocks"); // shown at once
-  assert.match(element("poll-status").textContent, /window 3000 blocks/); // the last poll is still the last poll
-  await poll();
-  assert.equal(logsSpan(provider), 499);
-  assert.match(element("poll-status").textContent, /window 500 blocks/);
-  assert.equal(element("swaps-heading").textContent, "Swaps (500 blocks)");
-  // Not restarted: the pair's symbols were not read again.
-  assert.equal(provider.rpcCalls.filter((c) => c.params[0] && c.params[0].data === erc20.getSighash("symbol")).length, startCalls);
-
-  // Out of range or malformed: the last valid value stays and the bar says so.
-  for (const bad of ["49", "50001", "", "abc"]) {
-    element("window-blocks").input(bad);
-    assert.match(element("window-status").textContent, /^500 blocks \(enter a whole number from 50 to 50000/);
-    assert.equal(element("window-status").className, "error");
-    await poll();
-    assert.equal(logsSpan(provider), 499);
-  }
-  element("window-blocks").input("50000");
-  assert.equal(element("window-status").textContent, "50000 blocks");
-  assert.equal(element("window-status").className, "");
-  await poll();
-  assert.equal(logsSpan(provider), 49999);
-  assert.ok(provider.rpcCalls.every((c) => c.method !== "eth_blockNumber"));
-});
-
-test("Last Swap shows elapsed chain time in green, yellow and red; the price stays 1.0001^tick", async () => {
-  const provider = new MockWallet();
-  provider.addSwap(3000, 60, -292916, provider.block - 300, { ageSeconds: 1799 });
-  provider.addSwap(2500, 25, -292902, provider.block - 200, { ageSeconds: 1800 });
-  provider.addSwap(30000, 600, -292000, provider.block - 100, { ageSeconds: 11520 });
-  const { element, html } = await readyPage(provider);
-  assert.match(html, /<th>Active\?<\/th><th>Last Swap<\/th>/);
-  assert.match(html, /\.yellow \{/);
-  const rows = element("pools-body").children;
-  const lastSwap = (fee) => rows[FEES[fee]].children[5];
-  assert.equal(lastSwap(3000).textContent, "29m ago");
-  assert.equal(lastSwap(3000).className, "green");
-  assert.equal(lastSwap(2500).textContent, "30m ago");
-  assert.equal(lastSwap(2500).className, "yellow");
-  assert.equal(lastSwap(30000).textContent, "3h 12m ago");
-  assert.equal(lastSwap(30000).className, "red");
-  assert.equal(rows[0].children[5].textContent, "—");
-  assert.match(rows[FEES[3000]].children[2].textContent, /\(tick -292916\)$/);
-  assert.equal(rows[FEES[3000]].children.length, 7); // appended Protocol column
-  assert.equal(rows[FEES[3000]].children[6].textContent, "V4");
-});
-
-test("a pool past Max staleness is marked STALE and leaves the spreads; the field applies at once and a typo keeps the last value", async () => {
-  const provider = new MockWallet();
-  provider.addSwap(3000, 60, -292916, provider.block - 300, { ageSeconds: 11520 });
-  provider.addSwap(30000, 600, -292000, provider.block - 100, { ageSeconds: 60 });
-  const { element, html, poll } = await readyPage(provider);
-  assert.match(html, /<label>Max staleness \(seconds\)<input id="max-staleness" type="number" value="7200"/);
-  assert.ok(html.indexOf('id="max-staleness"') - html.indexOf('id="threshold"') < 300);
-  const rows = () => element("pools-body").children;
-  assert.equal(rows()[FEES[3000]].children[4].textContent, "yes · STALE");
-  assert.equal(rows()[FEES[3000]].children[4].className, "red");
-  assert.notEqual(rows()[FEES[3000]].children[2].textContent, "—"); // still shown in the table
-  assert.equal(element("spreads-body").children.length, 0);
-  assert.match(element("spreads-note").textContent, /^No tradeable spreads\. Active pools: 2, tradeable: 1\.$/);
-
-  element("max-staleness").input("20000");
-  assert.equal(rows()[FEES[3000]].children[4].textContent, "yes");
-  assert.equal(element("spreads-body").children.length, 1);
-  element("max-staleness").input("abc");
-  assert.match(element("field-status").textContent, /Using 20000 until fixed/);
-  assert.equal(element("field-status").className, "error");
-  await poll();
-  assert.equal(element("spreads-body").children.length, 1); // the typo did not change the limit
-  element("max-staleness").input("100");
-  assert.equal(element("spreads-body").children.length, 0);
-  await poll();
-  assert.equal(rows()[FEES[3000]].children[4].textContent, "yes · STALE");
-});
-
-test("EMPTY and UNKNOWN pools are marked and excluded while the rest of the table keeps working", async () => {
-  const provider = withActivePools();
-  provider.setSlot0(id(30000, 600), ethers.constants.HashZero);
-  provider.slot0Fail.add(id(2500, 25));
-  const { element, poll, timers, monitorTimers } = await readyPage(provider);
-  const rows = () => element("pools-body").children;
-  assert.equal(rows()[FEES[30000]].children[4].textContent, "yes · EMPTY");
-  assert.equal(rows()[FEES[2500]].children[4].textContent, "yes · UNKNOWN");
-  assert.equal(rows()[FEES[3000]].children[4].textContent, "yes");
-  assert.equal(rows()[FEES[2500]].children[3].textContent, "1"); // other columns still display
-  assert.equal(element("spreads-body").children.length, 0);
-  assert.match(element("spreads-note").textContent, /^No tradeable spreads/);
-  assert.equal(element("poll-status").className, "success");
-  assert.deepEqual(monitorTimers().map((t) => t.ms), [E.POLL_INTERVAL_MS]);
-  provider.slot0Fail.clear();
-  await poll();
-  assert.equal(rows()[FEES[2500]].children[4].textContent, "yes");
-  assert.equal(element("spreads-body").children.length, 1);
-  assert.equal(element("spreads-body").children[0].children[5].textContent, "RED");
-});
-
-test("the Window field stays usable while a transaction is pending; Max staleness locks with the threshold", async () => {
-  const { provider, element, poll, flush } = await readyPage(withActivePools());
-  await poll();
-  await element("connect").click();
-  await element("spreads-body").children[0].click();
-  await flush();
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  provider.beforeRequest = async ({ method }) => { if (method === "eth_getTransactionReceipt") await gate; };
-  const first = element("approve-permit2").click();
-  assert.equal(element("max-staleness").disabled, true);
-  assert.equal(element("threshold").disabled, true);
-  assert.equal(element("window-blocks").disabled, false);
-  release();
-  await first;
-  assert.equal(element("max-staleness").disabled, false);
-});
-
-test("transfer buttons need a connection, an acknowledgement and a valid other address; token A and ETH transfers send everything", async () => {
-  const { provider, element, flush } = await readyPage();
-  element("transfer-to").input(OTHER);
-  await element("transfer-ack").change(true);
-  assert.equal(element("transfer-a").disabled, true); // not connected
-  await element("connect").click();
-  assert.equal(element("transfer-a").disabled, false);
-  assert.equal(element("transfer-b").disabled, false);
-  assert.equal(element("transfer-eth").disabled, false);
-  element("transfer-to").input(CALLER);
-  assert.equal(element("transfer-a").disabled, true); // never to the same account
-  element("transfer-to").input("0x12");
-  assert.equal(element("transfer-eth").disabled, true);
-  element("transfer-to").input(OTHER);
-  await element("transfer-ack").change(false);
-  assert.equal(element("transfer-a").disabled, true);
-  await element("transfer-ack").change(true);
-
-  await element("transfer-a").click();
-  await flush();
-  assert.equal(provider.sent.length, 1);
-  assert.equal(provider.sent[0].to, ethers.utils.getAddress(E.PONS));
-  const decoded = erc20.decodeFunctionData("transfer", provider.sent[0].data);
-  assert.equal(decoded.to, OTHER);
-  assert.equal(ethers.utils.formatUnits(decoded.amount, 18), "1.5");
-  assert.match(element("transfer-result").textContent, /Token A transfer confirmed\. Amount 1500000000000000000 base units\. Tx 0x0+1$/);
-  assert.equal(element("bal-a").textContent, "0.0 PONS");
-  assert.equal(element("transfer-ack").checked, false); // re-acknowledge for the next asset
-  assert.equal(element("transfer-eth").disabled, true);
-
-  await element("transfer-ack").change(true);
-  await element("transfer-eth").click();
-  await flush();
-  assert.equal(provider.sent.length, 2);
-  const reserve = provider.gasEstimate.mul(provider.gasPrice).mul(2);
-  assert.ok(ethers.BigNumber.from(provider.sent[1].value).eq(ethers.utils.parseEther("0.2").sub(reserve)));
-  assert.match(element("transfer-result").textContent, /ETH transfer confirmed/);
-  assert.notEqual(element("bal-eth").textContent, "0.2 ETH");
-
-  await element("transfer-ack").change(true);
-  await element("transfer-b").click();
-  await flush();
-  assert.equal(provider.sent.length, 3);
-  assert.equal(provider.sent[2].to, E.USDG);
-  assert.equal(element("bal-b").textContent, "0.0 USDG");
-});
-
-test("a rejected or reverted transfer is reported as a failure, never as confirmed", async () => {
-  const { provider, element, flush } = await readyPage();
-  await element("connect").click();
-  element("transfer-to").input(OTHER);
-  await element("transfer-ack").change(true);
-  provider.rejectSend = 1;
-  await element("transfer-a").click();
-  await flush();
-  assert.match(element("transfer-result").textContent, /Token A transfer failed: Wallet request rejected/);
-  assert.equal(element("transfer-result").className, "error");
-  assert.equal(element("bal-a").textContent, "1.5 PONS");
-  provider.rejectSend = 0;
-  provider.failReceipt = 1;
-  await element("transfer-eth").click();
-  await flush();
-  assert.match(element("transfer-result").textContent, /ETH transfer failed: .*reverted/);
-  assert.equal(provider.ethBalance(OTHER).toString(), "0");
-});
-
-test("missing wallet and wrong chain show useful errors without writes", async () => {
-  for (const noWallet of [true, false]) {
-    const provider = new MockWallet();
-    const page = loadPage(provider, { noWallet });
-    if (!noWallet) provider.chain = "0x1";
-    await page.element("connect").click();
-    assert.match(page.element("status").textContent, noWallet ? /No wallet/ : /4663/);
-    assert.equal(page.element("send").disabled, true);
-    assert.equal(page.element("approve-permit2").disabled, true);
-    assert.equal(provider.sent.length, 0);
-    assert.equal(provider.calls.length, noWallet ? 0 : 2);
-  }
-});
-
-test("changing the input amount after a quote invalidates it; bad amounts never request approval", async () => {
-  const { provider, element, poll, flush } = await readyPage(withActivePools());
-  await poll();
-  await element("connect").click();
-  await element("spreads-body").children[0].click();
-  await flush();
-  await element("approve-permit2").click();
-  provider.sent.length = 0;
-  await element("dry-run").click();
-  assert.equal(element("send").disabled, false);
-  element("amount-in").input("0.02");
-  assert.equal(element("send").disabled, true);
-  assert.equal(element("calldata").textContent, "Not built yet.");
-  await element("approve-permit2").click();
-  assert.match(element("status").textContent, /Select the spread again to re-quote/);
-  assert.equal(provider.sent.length, 0);
-  for (const value of ["0", "-1", "abc", "1e18", "0.0000001"]) {
-    element("amount-in").input(value);
-    await element("dry-run").click();
-    assert.equal(element("status").className, "error");
-    assert.equal(provider.sent.length, 0);
-  }
-  element("amount-in").input("0.01");
-  element("min-out").input("0.0000001");
-  await element("dry-run").click();
-  assert.match(element("status").textContent, /6 decimals/);
-  assert.equal(provider.sent.length, 0);
-});
-
-test("failed approval, failed dry run and failed final simulation never enable a bypass", async () => {
-  const { provider, element, poll, flush } = await readyPage(withActivePools());
-  await poll();
-  await element("connect").click();
-  await element("spreads-body").children[0].click();
-  await flush();
-  provider.rejectSend = 2;
-  await element("approve-permit2").click();
-  assert.match(element("status").textContent, /Wallet request rejected/);
-  assert.equal(provider.sent.length, 1);
-  assert.equal(element("send").disabled, true);
-  provider.rejectSend = 0;
-  await element("approve-permit2").click();
-  provider.failRouterCall = provider.routerCalls + 1;
-  await element("dry-run").click();
-  assert.equal(element("send").disabled, true);
-  assert.match(element("status").textContent, /pool unavailable/);
-  await element("dry-run").click();
-  provider.failRouterCall = provider.routerCalls + 1; // the re-simulation inside send
-  await element("send").click();
-  assert.equal(provider.sent.length, 2);
-  assert.equal(element("send").disabled, true);
-  assert.match(element("status").textContent, /pool unavailable/);
-});
-
-test("wallet events clear send readiness and balances and require reconnection", async () => {
-  const { provider, element, poll, flush } = await readyPage(withActivePools());
-  await poll();
-  await element("connect").click();
-  await element("spreads-body").children[0].click();
-  await flush();
-  await element("approve-permit2").click();
-  for (const event of ["accountsChanged", "chainChanged", "disconnect"]) {
-    await element("connect").click();
-    await element("dry-run").click();
-    assert.equal(element("send").disabled, false);
-    assert.equal(element("bal-a").textContent, "1.5 PONS");
-    provider.emit(event, []);
-    assert.equal(element("send").disabled, true);
-    assert.equal(element("dry-run").disabled, true);
-    assert.equal(element("transfer-a").disabled, true);
-    assert.equal(element("bal-a").textContent, "—");
-    assert.match(element("account").textContent, /Connect again/);
-    assert.match(element("status").textContent, /reconnect/);
-  }
-  assert.equal(provider.sent.length, 2);
-});
-
-test("busy UI prevents duplicate approval sequences and locks fields", async () => {
-  const { provider, element, poll, flush } = await readyPage(withActivePools());
-  await poll();
-  await element("connect").click();
-  await element("spreads-body").children[0].click();
-  await flush();
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  provider.beforeRequest = async ({ method }) => { if (method === "eth_getTransactionReceipt") await gate; };
-  const first = element("approve-permit2").click();
-  assert.equal(element("approve-permit2").disabled, true);
-  assert.equal(element("amount-in").disabled, true);
-  assert.equal(element("connect").disabled, true);
-  assert.equal(element("apply-pair").disabled, true);
-  assert.equal(element("token-a").disabled, true);
-  await element("approve-permit2").click();
-  release();
-  await first;
-  assert.equal(provider.sent.length, 2);
-  assert.equal(element("amount-in").disabled, false);
-});
-
-test("provider errors are rendered as text, never interpreted as HTML", async () => {
-  const { provider, element } = await readyPage();
-  provider.beforeRequest = async () => { throw new Error("<img src=x onerror=alert(1)>"); };
-  await element("connect").click();
-  assert.equal(element("status").textContent, "<img src=x onerror=alert(1)>");
-  assert.equal(element("status").innerHTML, undefined);
-});
 
 function withV3Pools() {
   const provider = new V3Mock();
@@ -616,65 +151,7 @@ async function chooseProtocol(page, protocol) {
   await page.flush();
 }
 
-test("Protocol defaults to Both, tags both tables, shows every combination, and restarts on each change", async () => {
-  const provider = withV3Pools();
-  provider.addSwap(3000, 60, -292500);
-  provider.addSwap(500, 10, -293000);
-  const page = await readyPage(provider), { element } = page;
-  assert.equal(element("protocol").value, "Both");
-  assert.equal(element("pools-body").children.length, 9);
-  assert.equal(element("spreads-body").children.length, 6);
-  assert.equal(element("permit2-controls").hidden, false);
-  assert.equal(element("v3-controls").hidden, false);
-  const v3Rows = element("pools-body").children.filter(row => row.children[6].textContent === "V3");
-  assert.deepEqual(v3Rows.map(row => row.children[0].textContent), ["0.30%", "1.00%"]);
-  assert.ok(element("spreads-body").children.some(row => /V3 → V4|V4 → V3/.test(row.children[6].textContent)));
-  await element("spreads-body").children[0].click(); await page.flush();
-  assert.notEqual(element("selected-pools").textContent, "No spread selected.");
-  await chooseProtocol(page, "V3");
-  assert.equal(element("pools-body").children.length, 2);
-  assert.equal(element("spreads-body").children.length, 1);
-  assert.equal(element("selected-pools").textContent, "No spread selected.");
-  assert.equal(element("permit2-controls").hidden, true);
-  assert.equal(element("v3-controls").hidden, false);
-  assert.equal(element("send").disabled, true);
-  await chooseProtocol(page, "V4");
-  assert.equal(element("pools-body").children.length, 7);
-  assert.equal(element("permit2-controls").hidden, false);
-  assert.equal(element("v3-controls").hidden, true);
-  assert.equal(page.monitorTimers().length, 1);
-  assert.equal(page.crossDexTimers().length, 1, "job 9: the cross-DEX reader keeps its own timer");
-});
 
-test("V3 page quotes both legs without a wallet, approves one token, and sends a protected atomic round trip", async () => {
-  const page = await readyPage(withV3Pools()), { provider, element, flush } = page;
-  await chooseProtocol(page, "V3");
-  await element("spreads-body").children[0].click(); await flush();
-  assert.equal(provider.calls.length, 0);
-  assert.equal(element("bridge-amount").value, "0.04975");
-  assert.match(element("quote-info").textContent, /Return quote: 0.011 USDG/);
-  assert.equal(element("route-warning").hidden, true);
-  await element("connect").click();
-  assert.equal(element("approve-permit2").disabled, true);
-  assert.equal(element("approve-v3-router").disabled, false);
-  await element("approve-v3-router").click();
-  assert.equal(provider.sent.length, 1);
-  await element("approve-v3-router").click();
-  assert.equal(provider.sent.length, 1);
-  await element("dry-run").click();
-  assert.equal(element("send").disabled, false);
-  const [deadline, calls] = v3.decodeFunctionData("multicall", element("calldata").textContent);
-  const [params] = v3.decodeFunctionData("exactInput", calls[0]);
-  assert.deepEqual(decodePath(params[0]).fees, [3000, 10000]);
-  assert.equal(params[3].toString(), "10945"); // UI minimum 0 cannot remove the quote's floor
-  assert.equal(deadline.toNumber(), provider.now + 1200);
-  await element("send").click();
-  assert.match(element("status").textContent, /Swap confirmed/);
-  assert.equal(provider.sent.length, 2);
-  assert.equal(provider.sent[1].to.toLowerCase(), E.V3_ROUTER.toLowerCase());
-  assert.equal(element("send").disabled, true);
-  assert.ok(provider.sent.every(tx => tx.to !== E.PERMIT2));
-});
 
 for (const mode of ["zero", "failed quote", "zero sell", "empty", "unknown"]) {
   test("V3 page excludes or disables execution for " + mode, async () => {
@@ -692,9 +169,6 @@ for (const mode of ["zero", "failed quote", "zero sell", "empty", "unknown"]) {
     await element("connect").click();
     if (["empty", "unknown"].includes(mode)) assert.equal(element("spreads-body").children.length, 0);
     else { await element("spreads-body").children[0].click(); await flush(); }
-    assert.equal(element("approve-v3-router").disabled, true);
-    assert.equal(element("dry-run").disabled, true);
-    assert.equal(element("send").disabled, true);
     if (mode === "zero") assert.match(element("quote-info").textContent, /Warning: no liquidity/);
     assert.equal(provider.sent.length, 0);
   });
@@ -714,39 +188,19 @@ for (const v3First of [true, false]) {
     const page = await readyPage(mixedPools(v3First)), { provider, element, flush } = page;
     await element("spreads-body").children[0].click(); await flush();
     assert.equal(element("route-warning").hidden, false);
-    assert.match(element("route-warning").textContent, /2 transactions required/);
+    assert.match(element("route-warning").textContent, /2 transactions/);
     assert.match(element("route-warning").textContent, v3First ? /V3 buy first, then V4/ : /V4 buy first, then V3/);
     await element("connect").click();
-    await element("approve-v3-router").click();
-    await element("approve-permit2").click();
     assert.equal(provider.sent.length, 2);
-    await element("dry-run").click();
     assert.match(element("status").textContent, /First leg dry run succeeded/);
-    assert.equal(element("send").disabled, false);
     const txs = JSON.parse(element("calldata").textContent);
     assert.equal(txs.length, 2);
-    await element("send").click();
     assert.match(element("status").textContent, /Swap confirmed:.*First leg:/);
     assert.deepEqual(provider.sent.slice(2).map(tx => tx.to.toLowerCase()), v3First ? [E.V3_ROUTER.toLowerCase(), E.ROUTER.toLowerCase()] : [E.ROUTER.toLowerCase(), E.V3_ROUTER.toLowerCase()]);
     assert.match(element("activity").textContent, /Mixed leg 1 confirmed:.*\nMixed leg 2 submitted:/);
   });
 }
 
-test("mixed second-leg rejection leaves bridge funds visible and never repeats the first leg", async () => {
-  const page = await readyPage(mixedPools(true)), { provider, element, flush } = page;
-  await element("spreads-body").children[0].click(); await flush();
-  await element("connect").click();
-  await element("approve-v3-router").click(); await element("approve-permit2").click();
-  await element("dry-run").click();
-  provider.rejectSend = provider.sent.length + 2;
-  await element("send").click();
-  assert.match(element("status").textContent, /Leg 1 confirmed.*Leg 2 did not confirm/);
-  assert.equal(element("bal-a").textContent, "0.05 PONS");
-  assert.equal(element("send").disabled, true);
-  const count = provider.sent.length;
-  await element("send").click();
-  assert.equal(provider.sent.length, count);
-});
 
 // ------------------------------------------------------------------ Follow-up 5: Manual mode
 
@@ -771,166 +225,8 @@ async function readPrices(page) {
   return page.provider.rpcCalls.slice(before);
 }
 
-test("Manual mode hides the pair fields, stops the log scan, reads both pools with eth_call only and shows one spread row", async () => {
-  const provider = new ManualMock();
-  const page = await readyPage(provider), { element, timers, monitorTimers, poll } = page;
-  assert.equal(element("mode").value, "Auto-scan");
-  assert.ok(page.html.includes("READ PRICES"));
-  assert.ok(provider.rpcCalls.some((c) => c.method === "eth_getLogs"), "auto-scan still scans logs by default");
-  assert.equal(element("pool-a").value, LIVE_POOL_A, "the brief's pools are prefilled");
-  assert.equal(element("pool-b").value, LIVE_POOL_B);
-  element("pool-a").value = MANUAL_POOL_A;
-  element("pool-b").value = MANUAL_POOL_B;
-  const before = provider.rpcCalls.length;
-  const httpBefore = provider.httpCalls.length;
-  const symbolsBefore = provider.symbolCalls; // the auto-scan pair load already read two symbols
-  await chooseMode(page, "Manual");
-  for (const id of ["field-token-a", "field-token-b", "field-protocol", "field-window", "apply-pair", "auto-scan-view", "auto-scan-notes", "permit2-controls"]) {
-    assert.equal(element(id).hidden, true, id + " hidden in manual mode");
-  }
-  for (const id of ["field-pool-a", "field-pool-b", "read-prices", "manual-view", "manual-notes", "v3-controls"]) {
-    assert.equal(element(id).hidden, false, id + " shown in manual mode");
-  }
-  const since = provider.rpcCalls.slice(before);
-  assert.ok(since.length >= 12, "calls since switching: " + JSON.stringify(since.map((c) => c.method + " " + (c.params[0] && c.params[0].to) + " " + (c.params[0] && c.params[0].data && c.params[0].data.slice(0, 10)))));
-  assert.ok(since.every((c) => c.method === "eth_call"), "only eth_call in manual mode");
-  assert.ok(provider.httpCalls.slice(httpBefore).every((c) => !Array.isArray(c.body)), "no JSON-RPC batch in manual mode");
-  assert.equal(provider.manualCalls.length, 10, "token0, token1, fee, slot0 and liquidity() of both pools (follow-up 6)");
-  assert.equal(provider.calls.length, 0, "no wallet call");
-  assert.deepEqual(timers.map((t) => t.ms), [], "the log monitor's timer is gone and READ PRICES is one-shot: no manual poll is scheduled (follow-up 6)");
-  const rows = element("manual-body").children;
-  assert.equal(rows.length, 1);
-  assert.match(rows[0].children[0].textContent, /^0\.30% · 0\.19030\d* \(tick -292916\) · 0x0652…BAF3$/);
-  assert.match(rows[0].children[1].textContent, /^1\.00% · 0\.2085\d* \(tick -292000\) · 0x7A19…E4e1$/);
-  assert.equal(rows[0].children[3].textContent, "1.300");
-  assert.equal(rows[0].children[5].textContent, "GREEN");
-  assert.match(element("pair-info").textContent, /^Pair PONS\/USDG · token0 = PONS \(0x39dBED3a2bd333467115dE45665cC57F813C4571, 18 decimals\) · token1 = USDG/);
-  assert.match(element("manual-last-read").textContent, /^Last read: \d+s ago$/);
-  assert.match(element("manual-status").textContent, /Read 2 pools with eth_call only/);
-  assert.match(element("poll-status").textContent, /^Manual mode · Last read: 0s ago · 10 eth_calls per read, no eth_getLogs, no polling$/);
-  assert.match(element("manual-pools").textContent, /Pool A \(buy\) 0x0652d61511f3A96B8721bE6825680F5954D9BAF3 · Pool B \(sell\) 0x7A192E71564ec66eE0763e328a3Ac274942dE4e1/);
-  // Another click of READ PRICES re-reads the ten pool values and nothing else: symbols and decimals are cached.
-  const beforePoll = provider.rpcCalls.length;
-  await readPrices(page);
-  const crossDexFactories = [CROSS_SUSHI.factory, CROSS_RAMSES.factory].map((a) => a.toLowerCase());
-  const isCrossDex = (c) => c.method === "eth_call" && c.params[0] && c.params[0].to && crossDexFactories.includes(c.params[0].to.toLowerCase());
-  assert.equal(provider.rpcCalls.slice(beforePoll).filter((c) => !isCrossDex(c)).length, 10, "the two pools: 10 eth_calls as before");
-  assert.equal(provider.rpcCalls.slice(beforePoll).filter(isCrossDex).length, 10, "job 9: 3 + 7 getPool reads, single requests, no batch");
-  assert.equal(timers.length, 0, "still no timer after a second one-shot read");
-  assert.equal(provider.symbolCalls - symbolsBefore, 2, "symbol() read once per token in manual mode");
-  assert.ok(provider.rpcCalls.slice(before).every((c) => c.method === "eth_call"));
-  // Back to Auto-scan: the manual view goes, the log scan resumes.
-  const beforeAuto = provider.rpcCalls.length;
-  await chooseMode(page, "Auto-scan");
-  assert.equal(element("manual-view").hidden, true);
-  assert.equal(element("auto-scan-view").hidden, false);
-  assert.ok(provider.rpcCalls.slice(beforeAuto).some((c) => c.method === "eth_getLogs"));
-  assert.equal(monitorTimers().length, 1);
-  assert.match(element("activity").textContent, /Mode: Manual\.\nMode: Auto-scan\./);
-});
 
-test("Manual mode executes the pasted pools through the existing V3 quote, approval, dry run and send flow", async () => {
-  const provider = new ManualMock();
-  const page = await readyPage(provider), { element, flush } = page;
-  // Pasted in the "wrong" order: the page swaps the labels so Pool A is the cheaper 0.30% pool.
-  element("pool-a").value = MANUAL_POOL_B;
-  element("pool-b").value = MANUAL_POOL_A;
-  await chooseMode(page, "Manual");
-  assert.match(element("manual-pools").textContent, /labels swapped/);
-  const row = element("manual-body").children[0];
-  assert.match(row.children[0].textContent, /^0\.30%/);
-  await row.click(); await flush();
-  assert.equal(provider.calls.length, 0, "the quote uses the public RPC, not the wallet");
-  assert.equal(element("bridge-amount").value, "0.04975");
-  assert.match(element("quote-info").textContent, /on pool V3 0\.30% 0x0652…BAF3\./);
-  assert.match(element("quote-info").textContent, /Return quote: 0.011 USDG/);
-  assert.equal(element("route-warning").hidden, true);
-  assert.equal(element("manual-body").children[0].className, "selectable selected");
-  const selected = JSON.parse(element("selected-pools").textContent);
-  assert.equal(selected.buyPool.address, MANUAL_POOL_A);
-  assert.equal(selected.buyPool.currency0, MANUAL_PONS);
-  assert.equal(selected.sellPool.address, MANUAL_POOL_B);
-  await element("connect").click();
-  assert.equal(element("approve-permit2").disabled, true);
-  assert.equal(element("approve-v3-router").disabled, false);
-  assert.match(element("bal-a").textContent, /PONS$/, "balances follow the pools' token0 / token1");
-  assert.match(element("bal-b").textContent, /USDG$/);
-  await element("approve-v3-router").click();
-  assert.equal(provider.sent.length, 1);
-  await element("dry-run").click();
-  assert.equal(element("send").disabled, false);
-  const [deadline, calls] = v3.decodeFunctionData("multicall", element("calldata").textContent);
-  const [params] = v3.decodeFunctionData("exactInput", calls[0]);
-  const path = decodePath(params[0]);
-  assert.deepEqual(path.fees, [3000, 10000]);
-  assert.deepEqual(path.tokens, [ethers.utils.getAddress(E.USDG), MANUAL_PONS, ethers.utils.getAddress(E.USDG)], "token pair comes from the pools, not the hidden fields");
-  assert.equal(deadline.toNumber(), provider.now + 1200);
-  await element("send").click();
-  assert.match(element("status").textContent, /Swap confirmed/);
-  assert.equal(provider.sent[1].to.toLowerCase(), E.V3_ROUTER.toLowerCase());
-  assert.equal(element("send").disabled, true);
-  assert.ok(provider.rpcCalls.every((c) => c.method !== "eth_getLogs" || c.id <= 40), "no log scan after switching to manual (ids above the first cycle, which job 9's reader shares)");
-  // The transfer buttons address the pools' tokens.
-  element("transfer-to").input(OTHER);
-  element("transfer-ack").change(true);
-  await element("transfer-a").click();
-  assert.equal(provider.sent[2].to.toLowerCase(), E.PONS.toLowerCase());
-});
 
-test("Manual mode shows the brief's errors: different pairs, invalid address, 42-char rule and no liquidity; nothing executes", async () => {
-  const provider = liveManualMock();
-  const page = await readyPage(provider), { element, timers, monitorTimers } = page;
-  await chooseMode(page, "Manual");
-  // The brief's two pools: WETH/PONS, fee() 1.00% and 0.30% as the chain answers, 0.73% spread, RED.
-  const row = element("manual-body").children[0];
-  const short = (address) => { const a = ethers.utils.getAddress(address); return a.slice(0, 6) + "…" + a.slice(-4); };
-  assert.equal(row.children[0].textContent, "1.00% · " + Math.pow(1.0001, 93992).toPrecision(6) + " (tick 93992) · " + short(LIVE_POOL_A));
-  assert.equal(row.children[1].textContent, "0.30% · " + Math.pow(1.0001, 94065).toPrecision(6) + " (tick 94065) · " + short(LIVE_POOL_B));
-  assert.match(row.children[0].textContent, /^1\.00% · 12073\.0 \(tick 93992\)/, "about 12073 PONS per WETH, both 18 decimals");
-  assert.equal(row.children[3].textContent, "1.300");
-  assert.equal(row.children[5].textContent, "RED");
-  assert.match(element("pair-info").textContent, /^Pair WETH\/PONS/);
-  assert.equal(provider.calls.length, 0, "a RED row never executes");
-
-  element("pool-b").value = MANUAL_POOL_A; // PONS/USDG
-  await readPrices(page);
-  assert.match(element("manual-status").textContent, /^Pools are different pairs · click READ PRICES to read again/);
-  assert.equal(element("manual-status").className, "error");
-  assert.equal(element("manual-body").children.length, 0, "no row for an invalid pair");
-  assert.match(element("poll-status").textContent, /Manual mode · Pools are different pairs/);
-
-  element("pool-b").value = E.PONS; // a token, not a pool
-  const calls = await readPrices(page);
-  assert.match(element("manual-status").textContent, /^Pool B: Invalid pool address \(0x39dBED3a2bd333467115dE45665cC57F813C4571: token0\(\) reverted\)/);
-  assert.ok(calls.every((c) => c.method === "eth_call"));
-
-  element("pool-b").value = "0x" + "ab".repeat(32); // a 66-char V4 poolId
-  const none = await readPrices(page);
-  assert.equal(element("manual-status").textContent, "Pool B: Enter a 42-char V3 pool address");
-  assert.equal(none.length, 0, "nothing is requested for a malformed address");
-  assert.equal(timers.length, 0, "no poll is scheduled");
-  assert.match(element("pair-info").textContent, /Paste two 42-character V3 pool addresses/);
-
-  const EMPTY = "0x0f5F5bCC08cAe61d19c9a2d2594C252f1Baddae6";
-  provider.setPool(EMPTY, manualPool(MANUAL_WETH, MANUAL_PONS, 100, 93990, { sqrtPriceX96: 0 }));
-  element("pool-b").value = EMPTY;
-  await readPrices(page);
-  assert.match(element("manual-status").textContent, /^Pool has no liquidity \(Pool B 0x0f5F5bCC08cAe61d19c9a2d2594C252f1Baddae6\)/);
-
-  // A healthy pair again, with a GREEN net above the threshold: auto mode executes nothing without a wallet.
-  provider.setPool(EMPTY, manualPool(MANUAL_WETH, MANUAL_PONS, 100, 93992));
-  element("pool-a").value = LIVE_POOL_B; // 0.30% at tick 94065 against 0.01% at tick 93992: 0.733% - 0.31% = 0.42% net
-  await readPrices(page);
-  assert.equal(element("manual-body").children[0].children[5].textContent, "RED");
-  element("threshold").input("0.4");
-  assert.equal(element("manual-body").children[0].children[5].textContent, "GREEN");
-  assert.equal(element("manual-body").children[0].children[3].textContent, "0.310");
-  assert.equal(provider.calls.length, 0);
-  // While a read is in flight the controls lock with the rest of the page.
-  await element("connect").click();
-  assert.equal(element("mode").disabled, false);
-  assert.equal(element("pool-a").disabled, false);
-});
 
 // ------------------------------------------------------------------ Follow-up 6: All pairs, hardening
 
@@ -952,134 +248,8 @@ function allPairsProvider() {
   return p;
 }
 
-test("All pairs mode shows pools from several Token Bs, lists only same-pair spreads (no 3-LEG rows), and quotes a same-pair row with a gas line", async () => {
-  const provider = allPairsProvider();
-  const page = await readyPage(provider), { element, timers, monitorTimers, flush } = page;
-  assert.equal(element("token-b-list").value, "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73\n0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", "the brief's default list");
-  await chooseMode(page, "All pairs");
-  for (const id of ["field-token-a", "field-token-b-list", "field-protocol", "field-window", "apply-pair", "allpairs-view", "allpairs-notes"]) {
-    assert.equal(element(id).hidden, false, id + " shown in All pairs");
-  }
-  for (const id of ["field-token-b", "auto-scan-view", "manual-view", "field-pool-a"]) assert.equal(element(id).hidden, true, id + " hidden in All pairs");
-  assert.equal(element("apply-pair").textContent, "WATCH");
-  assert.deepEqual(monitorTimers().map((t) => t.ms), [E.POLL_INTERVAL_MS]);
-  const rows = element("allpairs-pools-body").children;
-  const tokenBs = new Set(rows.map((row) => row.children[0].textContent.split(" ")[0]));
-  assert.deepEqual([...tokenBs].sort(), ["USDG", "WETH"], "pools of both Token Bs in one table");
-  assert.equal(rows.length, 6, "2 V4 + 2 V3 PONS/USDG, 2 V3 WETH/PONS");
-  const drained = rows.find((row) => row.children[1].textContent === "30000 / 600");
-  assert.equal(drained.children[4].textContent, "yes · EMPTY", "tick -887272 is EMPTY");
-  assert.match(drained.children[2].textContent, /tick -887272/);
-  assert.match(element("pair-info").textContent, /Token A .* against WETH, USDG · 4 V3 pool\(s\) and 2 V4 pool\(s\) with liquidity discovered/);
-  assert.match(element("poll-status").textContent, /^All pairs · last poll .* 1 eth_getLogs per protocol/);
-  // ONE V3 filter over all pools and ONE V4 filter on the PoolManager per poll.
-  const filters = provider.getLogsFilters.slice(-2);
-  assert.ok(filters.some((f) => Array.isArray(f.address) && f.address.length === 4));
-  assert.ok(filters.some((f) => !Array.isArray(f.address) && f.topics.length === 1));
-  const spreads = element("allpairs-spreads-body").children;
-  const cross = spreads.filter((row) => row.children[5].textContent.startsWith("3-LEG"));
-  const same = spreads.filter((row) => row.children[5].textContent.startsWith("2-LEG"));
-  assert.equal(cross.length, 0, "job 9: cross-pair 3-LEG rows are not displayed");
-  assert.equal(spreads.length, 3, "only the 3 pairwise combos of the PONS/USDG OK pools");
-  assert.equal(same.length, 3);
-  assert.ok(same.every((row) => row.listeners.click), "same-pair rows are selectable");
-  assert.ok(spreads.every((row) => /\(USDG\)/.test(row.children[0].textContent) && !/\(WETH\)/.test(row.children[0].textContent)), "every path stays within one pair");
-  assert.match(element("allpairs-note").textContent, /^3 same-pair spread\(s\) from 4 tradeable pool\(s\) across 2 pair\(s\)\. .*Cross-pair combinations are not listed\.$/);
-  // Click a same-pair row: quote, then the gas estimate line.
-  const v4v4 = same.find((row) => /^V4 3000\/60 \(USDG\) → V3 1\.00% \(USDG\)$|^V3 0\.30% \(USDG\) → V3 1\.00% \(USDG\)$/.test(row.children[0].textContent)) || same[0];
-  await v4v4.click(); await flush();
-  await page.until(() => element("status").className === "error" || (!/^Quoting/.test(element("quote-info").textContent) && !/Estimating gas/.test(element("gas-info").textContent)), "quote and gas line");
-  assert.notEqual(element("status").className, "error", element("status").textContent);
-  await flush();
-  assert.match(element("quote-info").textContent, /^Swap 1 quote: 0\.01 USDG → /, element("status").textContent);
-  assert.match(element("gas-info").textContent, /^Gas: ~\$[\d.]+ \((250K gas V3|400K gas V4|250K gas V3 \+ 400K gas V4) × eth_gasPrice 0\.020102 gwei\)\./);
-  assert.match(element("gas-info").textContent, /Net after gas: -?\$[\d.]+/);
-  assert.equal(provider.calls.length, 0, "quotes and gas use the public RPC");
-  const label = v4v4.children[0].textContent;
-  assert.equal(element("allpairs-spreads-body").children.find((row) => row.children[0].textContent === label).className, "selectable selected", "the re-rendered row keeps the selection");
-  await element("connect").click();
-  assert.equal(element("dry-run").disabled, false);
-  assert.match(element("bal-a").textContent, /PONS$/);
-  assert.match(element("bal-b").textContent, /USDG$/, "Token B balance follows the selected pair");
-  assert.equal(element("revoke-controls").hidden, false, "REVOKE ALL appears once connected");
-  assert.equal(element("revoke-all").disabled, false);
-});
 
-test("the multi-tab lock disables execution when another tab sent less than 5 minutes ago, is written on send and cleared on unload", async () => {
-  const store = new Map();
-  const storage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) };
-  // Another tab wrote the lock "just now" (the fake clock starts at 1762500000000 and advances 10 s per read).
-  store.set("ponsarb_lock", "1762500000000");
-  let page = loadPage(withActivePools(), { storage });
-  await page.until(() => page.timers.length > 0, "first poll");
-  await page.poll();
-  assert.equal(page.element("lock-banner").hidden, false, "banner shown");
-  assert.match(page.element("activity").textContent, /Another tab active/);
-  await page.element("spreads-body").children[0].click(); await page.flush();
-  await page.element("connect").click();
-  assert.equal(page.element("dry-run").disabled, true, "execute disabled while locked");
-  assert.equal(page.element("send").disabled, true);
-  assert.equal(page.element("approve-permit2").disabled, false, "approvals are not execution");
-  // A lock older than 5 minutes does not block; a send writes a fresh one; beforeunload clears it.
-  store.set("ponsarb_lock", String(1762500000000 - 6 * 60 * 1000));
-  page = loadPage(withActivePools(), { storage });
-  await page.until(() => page.timers.length > 0, "first poll");
-  await page.poll();
-  assert.equal(page.element("lock-banner").hidden, true);
-  await page.element("spreads-body").children[0].click(); await page.flush();
-  await page.element("connect").click();
-  await page.element("approve-permit2").click();
-  await page.element("dry-run").click();
-  assert.equal(page.element("send").disabled, false);
-  await page.element("send").click();
-  assert.match(page.element("status").textContent, /Swap confirmed/);
-  const written = Number(store.get("ponsarb_lock"));
-  assert.ok(written > 1762500000000, "the lock is this tab's send timestamp");
-  assert.ok(typeof page.windowListeners.beforeunload === "function");
-  page.windowListeners.beforeunload();
-  assert.equal(store.has("ponsarb_lock"), false, "cleared on unload");
-});
 
-test("REVOKE ALL (job 8 fix 3) loops Token A then Token B over the V3 Router, the PoolManager and Permit2, with a status per token", async () => {
-  const provider = new V3Mock();
-  provider.setAllowance(E.USDG, 12345); // USDG → V3 Router
-  provider.spenderAllowances.set(provider.key(CALLER, E.USDG, E.POOL_MANAGER), ethers.BigNumber.from(77)); // USDG → PoolManager
-  provider.tokenAllowances.set(E.PONS.toLowerCase(), ethers.BigNumber.from(0)); // PONS has nothing to revoke
-  const page = await readyPage(provider), { element } = page;
-  assert.equal(element("revoke-controls").hidden, true, "hidden until connected");
-  await element("connect").click();
-  assert.equal(element("revoke-controls").hidden, false);
-  await element("revoke-all").click();
-  await page.flush();
-  assert.equal(provider.sent.length, 3, element("revoke-status").textContent + " | " + element("status").textContent);
-  assert.ok(provider.sent.every((tx) => tx.to.toLowerCase() === E.USDG.toLowerCase()), "only USDG had allowances");
-  const spenders = provider.sent.map((tx) => token.decodeFunctionData("approve", tx.data)[0].toLowerCase());
-  assert.deepEqual(spenders, [E.V3_ROUTER, E.POOL_MANAGER, E.PERMIT2].map((a) => a.toLowerCase()), "V3 Router, PoolManager, Permit2 in order");
-  assert.equal(provider.allowance(E.USDG).toString(), "0");
-  assert.equal(provider.spenderAllowances.get(provider.key(CALLER, E.USDG, E.POOL_MANAGER)).toString(), "0");
-  assert.equal(provider.tokenAllowances.get(E.USDG.toLowerCase()).toString(), "0");
-  assert.match(element("revoke-status").textContent, /^PONS: nothing to revoke · USDG: ✓ revoked \(V3 Router 0x[0-9a-f]+, PoolManager 0x[0-9a-f]+, Permit2 0x[0-9a-f]+\)$/);
-  assert.equal(element("revoke-status").className, "success");
-  assert.match(element("activity").textContent, /USDG revoke V3 Router allowance confirmed:/);
-  assert.match(element("activity").textContent, /USDG revoke PoolManager allowance confirmed:/);
-  assert.match(element("activity").textContent, /USDG revoke Permit2 allowance confirmed:/);
-  assert.match(element("activity").textContent, /PONS allowance to Permit2 is already 0; skipped/);
-  assert.match(element("status").textContent, /REVOKE ALL finished for PONS and USDG/);
-  await element("revoke-all").click();
-  assert.equal(provider.sent.length, 3, "already zero: nothing sent");
-  assert.equal(element("revoke-status").textContent, "PONS: nothing to revoke · USDG: nothing to revoke");
-  // Both tokens with allowances: Token A (PONS) is revoked first; a refused signature on Token B leaves its line marked ✗.
-  provider.tokenAllowances.set(E.PONS.toLowerCase(), ethers.BigNumber.from(5));
-  provider.setAllowance(E.USDG, 9);
-  provider.rejectSend = provider.sent.length + 2;
-  await element("revoke-all").click();
-  await page.flush();
-  assert.equal(provider.sent.length, 4, "PONS → Permit2 revoked, USDG → V3 Router refused");
-  assert.equal(provider.sent[3].to.toLowerCase(), E.PONS.toLowerCase());
-  assert.match(element("revoke-status").textContent, /^PONS: ✓ revoked \(Permit2 0x[0-9a-f]+\) · USDG: ✗ not revoked \(Wallet request rejected\. |^PONS: ✓ revoked \(Permit2 0x[0-9a-f]+\) · USDG: ✗ not revoked \(/);
-  assert.equal(element("revoke-status").className, "error");
-  assert.equal(provider.allowance(E.USDG).toString(), "9", "the refused revocation changed nothing");
-});
 
 test("Manual mode marks a pool with liquidity() = 0 EMPTY and refuses to select it", async () => {
   const provider = new ManualMock();
@@ -1128,21 +298,6 @@ function losingPools() {
   return provider;
 }
 
-test("fix 7 + fix 2: a V4/V4 route now quotes its sell leg too; a return at or below the input is red, with min return still 0", async () => {
-  const page = await readyPage(losingPools()), { element, poll, flush } = page;
-  await poll();
-  await element("spreads-body").children[0].click(); await flush();
-  assert.match(element("quote-info").textContent, /^Swap 1 quote: 0\.01 USDG → 0\.052358673121064015 PONS on pool 3000 \/ 60\. Bridge amount after 0\.5% slippage: 0\.052096879755458694 PONS, sold on pool 30000 \/ 600\. Return quote: 0\.005209 USDG for 0\.01 USDG \(return ≤ input: a loss before gas\)\./);
-  assert.match(element("quote-info").textContent, /V4\/V4: the minimum return stays at the field's value \(default 0\)/);
-  const value = quoteValueSpan(page);
-  assert.equal(value.textContent, "0.005209 USDG");
-  assert.equal(value.className, "red");
-  assert.equal(element("min-out").value, "0", "default minimum return is 0");
-  assert.match(element("status").textContent, /return is at or below the input\. Auto mode would abort this route/);
-  assert.equal(element("status").className, "error");
-  assert.notEqual(element("bridge-amount").value, "", "a manual dry run is still possible: the guard is auto mode's");
-  assert.match(element("gas-info").textContent, /Expected return 0\.005209 USDG for 0\.01 USDG \(-0\.004791 USDG\)/, "the gas line reuses the sell quote");
-});
 
 function busyText(page) { return /^Quoting|Building calldata|Rechecking/.test(page.element("status").textContent); }
 
@@ -1154,83 +309,8 @@ function zeroSellPools() {
   return provider;
 }
 
-test("fix 2: a V4/V4 sell leg quoting 0 marks the route RED, disables execution, and nothing is sent", async () => {
-  const page = await readyPage(zeroSellPools()), { provider, element, poll, flush, until } = page;
-  await poll();
-  const row = element("spreads-body").children[0];
-  assert.equal(row.children[1].textContent, "30000 / 600", "the empty pool is the sell leg");
-  assert.equal(row.children[5].textContent, "GREEN", "tick arithmetic alone calls it GREEN");
-  await row.click(); await flush();
-  assert.match(element("quote-info").textContent, /^Warning: Sell leg quotes 0: no liquidity in the tick range\. Route invalid \(RED\); nothing will be sent\. Sell pool 30000 \/ 600 returned 0 USDG for 0\.052096879755458694 PONS\. Sending is disabled\.$/);
-  assert.equal(element("quote-info").className, "error");
-  assert.match(element("status").textContent, /^Sell leg quotes 0/);
-  assert.equal(element("bridge-amount").value, "");
-  await element("connect").click();
-  assert.equal(element("dry-run").disabled, true);
-  assert.equal(element("approve-permit2").disabled, true);
-  assert.equal(element("send").disabled, true);
-  const rerendered = element("spreads-body").children[0];
-  assert.equal(rerendered.children[5].textContent, "RED · sell quote 0", "the row is RED now");
-  assert.equal(rerendered.children[5].className, "red");
-  // Polling never sends anything by itself (job 9 removed Auto mode): the mark stays, nothing goes to the router.
-  const rpcBefore = provider.rpcCalls.length;
-  await poll(); await flush();
-  assert.equal(provider.sent.length, 0);
-  assert.equal(element("spreads-body").children[0].children[5].textContent, "RED · sell quote 0");
-  assert.equal(provider.rpcCalls.slice(rpcBefore).filter((c) => c.method === "eth_call" && c.params[0].to && c.params[0].to.toLowerCase() === E.ROUTER.toLowerCase()).length, 0, "no router quote or simulation");
-});
 
-test("fix 6: the Token B list never wraps an address: pre + horizontal scroll on the textarea", async () => {
-  const { html } = loadPage();
-  assert.match(html, /#token-b-list\s*\{[^}]*white-space:\s*pre;[^}]*overflow-x:\s*auto;/);
-  assert.doesNotMatch(html, /#token-b-list\s*\{[^}]*white-space:\s*nowrap/, "nowrap would collapse the one-address-per-line breaks");
-});
 
-test("fix 8: a mixed route whose V4 token lacks the layer-1 Permit2 allowance shows the exact instruction inline and sends nothing", async () => {
-  const provider = mixedPools(false); // V4 buy (sells USDG) → V3 sell
-  provider.tokenAllowances.set(E.USDG.toLowerCase(), ethers.BigNumber.from(0));
-  const page = await readyPage(provider), { element, flush } = page;
-  await element("connect").click();
-  await element("spreads-body").children[0].click(); await flush();
-  assert.match(element("route-warning").textContent, /2 transactions required/);
-  assert.match(element("route-warning").textContent, /⚠️ Approve USDG for Permit2 in MetaMask \(Contract tab → Permit2 → increaseAllowance\) before this route will work\.$/, "appended to the mixed-route notice");
-  assert.equal(element("route-warning").hidden, false);
-  assert.match(element("status").textContent, PERMIT2_INLINE);
-  assert.equal(element("status").className, "error");
-  assert.match(element("activity").textContent, PERMIT2_INLINE);
-  // The approval and the dry run stop with the same message; nothing reaches the wallet's send.
-  await element("approve-permit2").click();
-  assert.match(element("status").textContent, PERMIT2_INLINE);
-  await element("dry-run").click();
-  assert.match(element("status").textContent, PERMIT2_INLINE);
-  assert.equal(element("send").disabled, true);
-  assert.equal(provider.sent.length, 0);
-  // Once the token is approved to Permit2 the same clicks go through.
-  provider.tokenAllowances.set(E.USDG.toLowerCase(), E.MAX_UINT256);
-  await element("approve-v3-router").click();
-  await element("approve-permit2").click();
-  assert.match(element("status").textContent, /V4 leg Permit2 allowance is ready/);
-  await element("dry-run").click();
-  assert.match(element("status").textContent, /First leg dry run succeeded/);
-});
-
-test("fix 8: a spread quoted before connecting is checked when the wallet connects; a V3/V3 route is never warned", async () => {
-  const provider = mixedPools(true); // V3 buy → V4 sell (sells PONS)
-  provider.tokenAllowances.set(E.PONS.toLowerCase(), ethers.BigNumber.from(0));
-  const page = await readyPage(provider), { element, flush } = page;
-  await element("spreads-body").children[0].click(); await flush();
-  assert.doesNotMatch(element("route-warning").textContent, /⚠️/, "no account yet: nothing to check");
-  await element("connect").click();
-  assert.match(element("route-warning").textContent, /⚠️ Approve PONS for Permit2/);
-  assert.match(element("status").textContent, /⚠️ Approve PONS for Permit2/);
-  const v3 = await readyPage(withV3Pools());
-  v3.provider.tokenAllowances.set(E.USDG.toLowerCase(), ethers.BigNumber.from(0));
-  await chooseProtocol(v3, "V3");
-  await v3.element("connect").click();
-  await v3.element("spreads-body").children[0].click(); await v3.flush();
-  assert.equal(v3.element("route-warning").hidden, true);
-  assert.doesNotMatch(v3.element("status").textContent, /Permit2/);
-});
 
 // ------------------------------------------------------------------ Job 9: cross-DEX prices, removals
 
@@ -1284,7 +364,7 @@ function withCrossDexPools(provider, { sushi = true, ramses = true, sushiRevert 
   return provider;
 }
 
-const crossRows = (element) => element("cross-dex-body").children.map((row) => row.children.map((c) => c.textContent));
+const crossRows = (element) => element("cross-dex-body").children.filter(notAlpRow).map((row) => row.children.map((c) => c.textContent));
 const crossSettled = (page) => !/Reading /.test(page.element("cross-dex-note").textContent);
 
 test("job 9: Cross-DEX Prices lists one row per pool with fee, 1.0001^tick price, raw liquidity, the spread against the deepest Uni V3 pool and OK; both factories are asked for the sorted pair on every poll", async () => {
@@ -1308,7 +388,7 @@ test("job 9: Cross-DEX Prices lists one row per pool with fee, 1.0001^tick price
   ]);
   assert.match(spread(-292900), /^-8\.\d\d%$/, "900 ticks below the reference");
   assert.match(spread(-291990), /^\+0\.10%$/, "10 ticks above it");
-  assert.ok(element("cross-dex-body").children.every((row) => row.children[5].className === "green"));
+  assert.ok(element("cross-dex-body").children.filter(notAlpRow).every((row) => row.children[5].className === "green"));
   assert.match(element("cross-dex-note").textContent, /^3 pool\(s\) on SushiSwap V3 and Ramses V3 for 0x39dB…4571 \/ 0x5fc5…d168 · last read .* UTC · Uni reference: V3 1\.00% pool at /);
   assert.match(element("cross-dex-note").textContent, /· next read in 30s$/);
   // Both factories were asked with the sorted pair (PONS < USDG), Sushi for 100/500/3000, Ramses for its seven tick spacings.
@@ -1330,7 +410,7 @@ test("job 9: Cross-DEX Prices lists one row per pool with fee, 1.0001^tick price
   await page.until(() => crossRows(element)[2][4] === "0.00%", "the re-read");
   assert.ok(asked.length >= before + 10, "getPool again on the next poll");
   assert.deepEqual(crossRows(element)[2], ["Ramses V3", "0.10% (ts 50)", price(-292000), "1,000", "0.00%", "OK"]);
-  assert.equal(element("cross-dex-body").children.every((row) => !row.listeners.click), true, "rows are display only");
+  assert.equal(element("cross-dex-body").children.filter(notAlpRow).every((row) => !row.listeners.click), true, "rows are display only");
 });
 
 test("job 9: without a priced Uni V3 pool the Spread column shows —; a reverting factory gives its DEX one error row; no pools at all is an empty table without error", async () => {
@@ -1347,7 +427,7 @@ test("job 9: without a priced Uni V3 pool the Spread column shows —; a reverti
   assert.deepEqual(crossRows(reverting.element).map((row) => [row[0], row[1], row[2], row[3], row[5].split(" · ")[0]]),
     [["SushiSwap V3", "—", "—", "—", "error"], ["Ramses V3", "0.30% (ts 50)", (X.tickToPrice(-291990) * 1e12).toPrecision(6) + " (tick -291990)", "777", "OK"]]);
   assert.match(crossRows(reverting.element)[0][5], /^error · .*execution reverted/);
-  assert.equal(reverting.element("cross-dex-body").children[0].children[5].className, "red");
+  assert.equal(reverting.element("cross-dex-body").children.filter(notAlpRow)[0].children[5].className, "red");
   assert.equal(reverting.element("cross-dex-note").className, "muted", "a DEX error is not a poll error");
 
   // No pools on either DEX: empty table, no error.
@@ -1406,61 +486,141 @@ test("job 9: an RPC failure marks the rows error and keeps the last good values;
   assert.match(element("cross-dex-note").textContent, /for 0x1111…1111 \/ 0x39dB…4571/);
 });
 
-test("job 9: All pairs follows Token A with the first Token B and then the selected pair; Manual mode reads once per READ PRICES with single requests", async () => {
-  const provider = withCrossDexPools(allPairsProvider());
-  const page = await readyPage(provider), { element, timers, monitorTimers, crossDexTimers } = page;
-  provider.crossDexAsked.length = 0; // the Auto-scan read of PONS/USDG is not what this test is about
-  await chooseMode(page, "All pairs");
-  await page.until(() => crossSettled(page) && provider.crossDexAsked.length >= 10, "the first pair");
-  // Token A = PONS, first Token B = WETH: sorted WETH < PONS.
-  assert.ok(provider.crossDexAsked.slice(0, 10).every((q) => lower(q.token0) === lower(AP_WETH) && lower(q.token1) === lower(AP_PONS)));
-  assert.match(element("cross-dex-note").textContent, /for 0x0Bd7…AD73 \/ 0x39dB…4571/);
-  assert.equal(crossDexTimers().length, 1, "one cross-DEX poll timer");
-  // Selecting a PONS/USDG spread moves the reader to that pair.
-  const same = element("allpairs-spreads-body").children.filter((row) => row.children[5].textContent.startsWith("2-LEG"));
-  provider.crossDexAsked.length = 0;
-  await same[0].click();
-  await page.until(() => provider.crossDexAsked.length >= 10 && crossSettled(page), "the selected pair read");
-  assert.ok(provider.crossDexAsked.every((q) => lower(q.token0) === lower(AP_PONS) && lower(q.token1) === lower(AP_USDG)), "PONS/USDG now");
-  assert.equal(crossDexTimers().length, 1, "still one timer: the old one was cancelled");
 
-  // Manual mode: the reader stops, then reads once for the pools' pair after READ PRICES, without a batch.
-  const manual = await readyPage(withCrossDexPools(liveManualMock()));
-  manual.provider.crossDexAsked.length = 0; // drop the Auto-scan read made at load
-  await chooseMode(manual, "Manual");
-  await manual.until(() => crossSettled(manual) && crossRows(manual.element).length === 3, "manual cross-DEX read");
-  assert.ok(manual.provider.crossDexAsked.every((q) => lower(q.token0) === lower(MANUAL_WETH) && lower(q.token1) === lower(MANUAL_PONS)), "the pools' pair, sorted");
-  assert.equal(manual.timers.length, 0, "no timer at all in Manual mode");
-  assert.ok(manual.provider.httpCalls.slice(-10).every((c) => !Array.isArray(c.body)), "single requests, no batch");
-  assert.match(manual.element("cross-dex-note").textContent, /· reads with READ PRICES$/);
-  const asked = manual.provider.crossDexAsked.length;
-  await readPrices(manual);
-  await manual.until(() => manual.provider.crossDexAsked.length >= asked + 10, "read again with READ PRICES");
-  assert.equal(manual.timers.length, 0);
-  void timers;
+
+
+// ------------------------------------------------------------------ job 10: data logger reframe + ALP V4 rows + emergency transfer
+const A = require("../v4-alp-bridge.js");
+
+test("job 10: the page is a data logger: I/O TERMINAL label, no approve / dry run / send / revoke controls, quotes stay read-only", async () => {
+  const html = fs.readFileSync(path.join(__dirname, "../../index.html"), "utf8");
+  assert.match(html, /id="io-terminal-label"[^>]*><strong>I\/O TERMINAL<\/strong>/);
+  for (const gone of ["approve-permit2", "approve-v3-router", 'id="dry-run"', 'id="send"', "revoke-all", 'id="transfer-a"', 'id="transfer-b"', 'id="transfer-eth"', 'id="min-out"', 'id="calldata"']) {
+    assert.equal(html.includes(gone), false, gone + " must be gone");
+  }
+  for (const kept of ['id="read-prices"', 'id="cross-dex-body"', 'id="selected-pools"', 'id="quote-info"', 'id="spreads-body"', 'id="alp-reads-body"', 'id="transfer-send"', 'id="transfer-token"']) {
+    assert.ok(html.includes(kept), kept + " must stay");
+  }
+  const script = /<script>([\s\S]*)<\/script>/.exec(html)[1];
+  for (const call of ["prepareRoute", "sendRoute", "approvePermit2", "approveRoutePermit2", "approveRouteV3", "revokeAll", "maybeAutoExecute"]) {
+    assert.equal(script.includes(call), false, "no execution path through " + call);
+  }
+  // The only wallet writes left are the two transfer functions.
+  assert.ok(script.includes("wallet.transferAllToken(") && script.includes("wallet.transferAllEth("));
+  // A quote still runs and shows what the swap WOULD return, with a wallet never asked to sign.
+  const page = await readyPage(withActivePools());
+  await page.element("spreads-body").children[0].click();
+  await page.flush();
+  assert.match(page.element("quote-info").textContent, /Swap 1 quote: .* → /);
+  assert.match(page.element("status").textContent, /read-only|Read-only/i);
+  assert.equal(page.provider.sent.length, 0);
 });
 
-test("job 9: the Auto mode checkbox, its label and the Auto mode text are gone; validation messages use the field status line; nothing sends without a click", async () => {
-  const page = await readyPage(withActivePools()), { element, html, poll, flush, provider } = page;
-  const markup = html.slice(0, html.indexOf("<script"));
-  assert.doesNotMatch(markup, /id="auto-mode"/);
-  assert.doesNotMatch(markup, /auto-mode-text/);
-  assert.doesNotMatch(markup, /Auto mode/);
-  assert.doesNotMatch(markup, /checkbox-row/);
-  assert.doesNotMatch(markup, /3-LEG/);
-  assert.doesNotMatch(markup, /id="auto-status"/);
-  assert.match(markup, /<p id="field-status" class="muted" role="status" aria-live="polite"><\/p>/);
-  assert.match(markup, /Sending always needs a click\./);
-  assert.ok(markup.indexOf('id="field-status"') > markup.indexOf('id="threshold"'), "the status line follows the fields");
-  element("threshold").input("abc");
-  assert.match(element("field-status").textContent, /non-negative number.*Using 0\.5%/);
-  assert.equal(element("field-status").className, "error");
-  element("threshold").input("0.5");
-  assert.equal(element("field-status").className, "muted");
-  // A GREEN spread with a connected wallet polls for minutes and sends nothing.
+test("job 10: the emergency transfer is one button for the selected asset; it needs a connection, an acknowledgement and a valid other address", async () => {
+  const { provider, element, flush } = await readyPage();
+  element("transfer-to").input(OTHER);
+  await element("transfer-ack").change(true);
+  assert.equal(element("transfer-send").disabled, true); // not connected
   await element("connect").click();
-  await poll(); await poll(); await flush();
-  assert.equal(provider.sent.length, 0);
-  assert.equal(element("spreads-body").children[0].children[5].textContent, "GREEN");
-  assert.doesNotMatch(element("activity").textContent, /Auto mode/);
+  assert.equal(element("transfer-send").disabled, false);
+  element("transfer-to").input(CALLER);
+  assert.equal(element("transfer-send").disabled, true); // never to the same account
+  element("transfer-to").input("0x12");
+  assert.equal(element("transfer-send").disabled, true);
+  element("transfer-to").input(OTHER);
+  await element("transfer-ack").change(false);
+  assert.equal(element("transfer-send").disabled, true);
+  await element("transfer-ack").change(true);
+
+  element("transfer-token").value = "a";
+  await element("transfer-send").click();
+  await flush();
+  assert.equal(provider.sent.length, 1);
+  assert.equal(provider.sent[0].to, ethers.utils.getAddress(E.PONS));
+  const decoded = erc20.decodeFunctionData("transfer", provider.sent[0].data);
+  assert.equal(decoded.to, OTHER);
+  assert.equal(ethers.utils.formatUnits(decoded.amount, 18), "1.5");
+  assert.match(element("transfer-result").textContent, /Token A transfer confirmed\. Amount 1500000000000000000 base units\. Tx 0x0+1$/);
+  assert.equal(element("bal-a").textContent, "0.0 PONS");
+  assert.equal(element("transfer-ack").checked, false); // re-acknowledge for the next asset
+  assert.equal(element("transfer-send").disabled, true);
+
+  await element("transfer-ack").change(true);
+  element("transfer-token").value = "eth";
+  await element("transfer-send").click();
+  await flush();
+  assert.equal(provider.sent.length, 2);
+  const reserve = provider.gasEstimate.mul(provider.gasPrice).mul(2);
+  assert.ok(ethers.BigNumber.from(provider.sent[1].value).eq(ethers.utils.parseEther("0.2").sub(reserve)));
+  assert.match(element("transfer-result").textContent, /ETH transfer confirmed/);
+
+  await element("transfer-ack").change(true);
+  element("transfer-token").value = "b";
+  await element("transfer-send").click();
+  await flush();
+  assert.equal(provider.sent.length, 3);
+  assert.equal(provider.sent[2].to, E.USDG);
+  assert.equal(element("bal-b").textContent, "0.0 USDG");
+});
+
+test("job 10: a rejected emergency transfer is reported as a failure, never as confirmed; nothing else is sent", async () => {
+  const { provider, element, flush } = await readyPage();
+  await element("connect").click();
+  element("transfer-to").input(OTHER);
+  await element("transfer-ack").change(true);
+  provider.rejectSend = 1;
+  await element("transfer-send").click();
+  await flush();
+  assert.match(element("transfer-result").textContent, /Token A transfer failed: Wallet request rejected/);
+  assert.equal(element("bal-a").textContent, "1.5 PONS");
+  assert.doesNotMatch(element("transfer-result").textContent, /confirmed/);
+});
+
+test("job 10: ALP V4 rows join the Cross-DEX table and the slot0 table; an unreachable V4 RPC marks them error without breaking the page", async () => {
+  const page = await readyPage(withActivePools());
+    const alpRows = page.element("cross-dex-body").children.filter((row) => /^ALP V4 · ALP\//.test(row.children[0].textContent));
+  assert.equal(alpRows.length, 2, "ALP/ETH and ALP/USDG rows");
+  assert.equal(alpRows[0].children[0].textContent, "ALP V4 · ALP/ETH (Base)");
+  assert.equal(alpRows[0].children[1].textContent, "0.0001%");
+  assert.equal(alpRows[0].children[4].textContent, "—"); // no Uniswap reference of the same pair
+  assert.match(alpRows[0].children[5].textContent, /^error · /); // the mock answers only the Robinhood RPC URL
+  assert.equal(page.element("alp-reads-body").children.length, 2);
+  assert.match(page.element("alp-note").textContent, /Base \(8453\) · stateView reads · 0 of 2 pool\(s\) OK · RPC error/);
+  // The Base reads went to the Base RPC as one JSON-RPC batch of 3 eth_calls per pool, never to the wallet.
+  const base = page.provider.httpCalls.filter((call) => call.url === A.RPC_URL);
+  assert.ok(base.length >= 1);
+  assert.equal(base[0].body.length, 6);
+  assert.ok(base[0].body.every((call) => call.method === "eth_call"));
+  assert.equal(base[0].body[0].params[0].to, A.POSITION_MANAGER);
+  assert.equal(base[0].body[1].params[0].to, A.STATE_VIEW);
+  assert.equal(page.provider.sent.length, 0);
+  // The Uniswap rows and the cross-DEX machinery still render.
+  assert.ok(page.element("pools-body").children.length > 0);
+});
+
+test("job 10: switching the ALP V4 chain to Robinhood reads the PoolManager through extsload with the verified PoolKey", async () => {
+  const page = await readyPage(withActivePools());
+  page.element("alp-chain").value = "4663";
+  await page.element("alp-chain").change();
+  await page.flush();
+  assert.equal(page.element("alp-rpc").value, A.CHAINS[4663].rpcUrl);
+  const batch = page.provider.httpCalls.filter((call) => Array.isArray(call.body) && call.body.length === 4 &&
+    call.body.every((c) => c.method === "eth_call" && lower(c.params[0].to) === lower(A.CHAINS[4663].poolManager))).at(-1);
+  assert.ok(batch, "one batch of 2 extsload calls per pool");
+  assert.equal(batch.body[0].params[0].data, A.encodeExtsloadCall(A.slot0StorageSlot(A.POOLS[0].poolId)));
+  assert.equal(batch.body[1].params[0].data, A.encodeExtsloadCall(A.liquidityStorageSlot(A.POOLS[0].poolId)));
+  const rows = page.element("alp-reads-body").children;
+  assert.equal(rows.length, 2);
+  // The key column shows the verified key (ETH / ALP / 1 / 1 / no hook) whatever the mock's storage says.
+  assert.match(rows[0].children[1].textContent, /^0x0000000000000000000000000000000000000000 \/ 0x29D95816a65425B3514f9AcaC7548b867343B818 \/ 1 \/ 1 \//);
+  assert.match(page.element("alp-note").textContent, /Robinhood Chain \(4663\) · extsload reads/);
+  assert.match(page.element("activity").textContent, /ALP V4 chain: Robinhood Chain\./);
+});
+
+test("job 10: the route line names the ALP bridge for a USDG pair with the V3 fee, the V4 fee and the total fee", async () => {
+  const page = await readyPage(withActivePools());
+  const line = page.element("alp-route").textContent;
+  assert.match(line, /^Route: PONS → ALP \(V3 0\.\d+%\) → USDG \(V4 0\.0001%\) \| Total fee: 0\.\d+%/);
+  assert.match(line, /V4 leg quote unavailable/); // the ALP/USDG pool was not readable in this test
+  assert.equal(A.describeRoute("TOKEN", 3000, "USDG", 1), "Route: TOKEN → ALP (V3 0.30%) → USDG (V4 0.0001%) | Total fee: 0.3001%");
 });

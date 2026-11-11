@@ -1,3 +1,83 @@
+# Job 10 — Data logger reframe + V4 ALP bridge (2026-11-11)
+
+## What changed
+
+**Part A — the page is now an I/O terminal / data logger.** `index.html` keeps the cross-DEX price table
+(DEX / Fee / Price / Liquidity / Spread vs Uni / Status), the pool reads, the read-only quote (what swap 1 and the
+sell leg WOULD return, via `eth_call`), the spread tables and READ PRICES. Removed: APPROVE PERMIT2, APPROVE V3
+ROUTER, BUILD CALLDATA & DRY RUN, SEND TRANSACTION, REVOKE ALL, the minimum-return field, the calldata panel, and
+every auto-execution path (`maybeAutoExecute`, `prepareRoute`, `sendRoute` are no longer called from the page).
+Added: the "I/O TERMINAL" header label, and one **EMERGENCY TRANSFER** button that sends the full balance of the
+asset chosen in the selector (Token A / Token B / ETH) to the address in the field. It is the only execution path
+left on the page, it needs a connected wallet, the acknowledgement checkbox and a valid address other than the
+connected account, and the one-tab-per-wallet lock applies to it. No private key is handled: the wallet signs.
+The JavaScript library (`js/v4-arb-encoder.js`) still exports the execution functions for the gauge page.
+
+**Part B — V4 ALP bridge.** New module `js/v4-alp-bridge.js` (UMD, ethers v5 only, mirrored by
+`src/V4AlpBridge.sol`):
+
+- *Read (eth_call only, polled every 30 s with the V3 reads; once per READ PRICES in Manual mode).* The two ALP pools
+  appear as "ALP V4 · ALP/ETH" and "ALP V4 · ALP/USDG" rows in the cross-DEX table (Spread vs Uni is "—": a different
+  pair) and in a new "ALP V4 pool reads (slot0)" table with PoolKey, sqrtPriceX96, tick, liquidity and price =
+  (sqrtPriceX96 / 2^96)^2. A chain selector (Base 8453, the brief's default, or Robinhood Chain 4663) and an RPC field
+  choose where to read.
+- *Swap calldata builder (Universal Router).* `buildV4ExactInCalldata({recipient, deadline, currencyIn, path,
+  amountIn, amountOutMinimum})` encodes `execute(commands, inputs, deadline)` with command `0x10` (V4_SWAP) and
+  actions `0x07` SWAP_EXACT_IN (PathKey per hop, derived from each PoolKey) · `0x0c` SETTLE_ALL · `0x0e` TAKE.
+  `buildBridgeRouteCalldata({recipient, deadline, tokenIn, v3Fee, alpPoolKey, amountIn, amountOutMinimum})` encodes
+  the 2-hop bridge Token → [V3] → ALP → [V4 ALP pool] → out in ONE execute: command `0x00` V3_SWAP_EXACT_IN to the
+  router (ADDRESS_THIS, payer = caller through Permit2) then command `0x10` with `0x0b` SETTLE(ALP, CONTRACT_BALANCE,
+  payerIsUser=false) · `0x06` SWAP_EXACT_IN_SINGLE(amountIn = OPEN_DELTA) · `0x0e` TAKE(out, recipient). The page only
+  displays routes; the builder is for the gauge page.
+- *Routing.* `routeFor(tokenIn, tokenOut, alpPoolKey, v3Fee)` routes through the ALP V4 pool when a side is ALP, and
+  as the bridge when tokenOut is the ALP pool's other currency (USDG). The page shows
+  `Route: TOKEN → ALP (V3 0.30%) → USDG (V4 0.0001%) | Total fee: 0.3001%` (`describeRoute`) plus a spot estimate of
+  the V4 leg from the live slot0 price (no price impact; display only).
+
+## Facts checked on chain (2026-11-11) and how the code follows them
+
+- The four Base addresses of the brief (PoolManager, StateView, Universal Router at 0xd614…9c40, PositionManager)
+  have code on chain 8453. **Neither `PoolManager.getPool(bytes32)` nor `StateView.slot0(bytes32)` exists**: both
+  revert. The deployed interface is `PositionManager.poolKeys(bytes25)` (the poolId → PoolKey map, keyed by the
+  first 25 bytes of the id), `StateView.getSlot0(bytes32) → (sqrtPriceX96, tick, protocolFee, lpFee)` and
+  `StateView.getLiquidity(bytes32)`. The reader uses those; tickSpacing comes from the PoolKey, which is verified by
+  hashing it back to the poolId before any calldata is built (a mismatched tickSpacing is refused).
+- **On Base the ALP token address has no code and both pool ids are uninitialized** (zero slot0, zero poolKeys).
+  The rows read "key not registered" there until pools are created.
+- **The ALP token (symbol ALP) and both pools are live on Robinhood Chain (4663)** in the existing PoolManager
+  0x8366…0951: the brief's pool ids hash exactly from the keys (ETH, ALP, fee 1, tickSpacing 1, no hook) and
+  (ALP, USDG 0x5fc5…d168, fee 1, tickSpacing 1, no hook), and their slot0 words are non-zero. Selecting "Robinhood
+  Chain" in the ALP V4 chain selector reads them through `extsload` with the verified keys.
+- The brief's "V4_SWAP_EXACT_IN (0x04)" is not a Universal Router command: `0x04` is SWEEP in `Commands.sol`. The
+  V4 exact-in path is action `0x07` inside command `0x10`, which is what the builder emits (per the router ABI the
+  brief asks to follow). The Base router's `ExactInputSingleParams` has five fields (no `minHopPriceX36`), unlike the
+  Robinhood Chain router handled by `V4SwapCalldata.sol`.
+
+## Assumptions, deployment parameters, operational responsibilities
+
+- Nothing is deployed; the Solidity is a pure reference encoder with internal functions only. The Base RPC defaults
+  to the public `https://mainnet.base.org` and can be overridden in the page; the Robinhood option uses the
+  project's existing Blockmachine RPC.
+- The Universal Router version (2.1.2) at 0xd614…9c40 is taken from the brief; code is present but the version
+  string was not verified. The V4 leg's quote is a spot estimate from slot0 (no V4 Quoter address was given).
+- Operator responsibilities: before any execution on the gauge page, verify the PoolKey with `verifyPoolKey`/
+  `decodePoolKey`, quote first, keep Permit2 allowances to the router scoped, and never paste a private key into the
+  page. The emergency transfer sends everything of the chosen asset to the typed address and cannot be undone.
+
+## Tests
+
+- `node --test js/test/*.test.js`: ui tests that exercised the removed controls were dropped; `ui.test.js` gained
+  six job 10 cases (data-logger shape, emergency transfer success and rejection, ALP rows on Base with an
+  unreachable RPC, the Robinhood extsload path, the route line). `js/test/v4-alp-bridge.test.js` covers the module.
+- `forge test`: `test/V4AlpBridge.t.sol` (19 cases) checks the pool ids against the keys, the deployed selectors,
+  slot0 decoding from StateView and from the raw word (the live ALP/ETH word), price and spot quotes, fee formatting
+  and the route line, the two calldata builders byte for byte against the JavaScript output
+  (`test/V4AlpBridgeVectors.sol`, generated from `js/v4-alp-bridge.js`), their decoded structure, fuzzed round trips,
+  and the failure paths (zero recipient, OPEN_DELTA input, non-ALP pool, unsupported V3 fee, empty or looping path,
+  currency not in pool, unsorted key, length mismatches). The pre-existing fuzz `testFuzz_SpreadSignFollowsThePrices`
+  was made non-strict for sub-1e-18 differences, which rounded to 0 and failed for one seed.
+
+
 # V3 + V4 pool monitor and arbitrage on Robinhood Chain
 
 Corrected `encodeV4Swap()` and `buildCalldata()` for a two-swap Uniswap V4 round trip

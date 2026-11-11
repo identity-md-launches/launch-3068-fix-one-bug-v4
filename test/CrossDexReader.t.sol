@@ -457,8 +457,9 @@ contract CrossDexReaderTest is Test {
     function testFuzz_SpreadSignFollowsThePrices(uint128 dex, uint128 uni) public pure {
         vm.assume(uni != 0);
         int256 spread = CrossDexReader.spreadVsUniE18(dex, uni);
-        if (dex > uni) assertGt(spread, 0);
-        else if (dex < uni) assertLt(spread, 0);
+        // A difference below 1e-18 of the reference rounds to 0, so the sign check is non-strict.
+        if (dex > uni) assertGe(spread, 0);
+        else if (dex < uni) assertLe(spread, 0);
         else assertEq(spread, 0);
         assertGe(spread, -100e18, "a price can never be more than 100% below the reference");
     }
